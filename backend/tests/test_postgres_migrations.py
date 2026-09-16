@@ -65,3 +65,14 @@ def test_control_plane_migration_round_trips_all_four_tables() -> None:
     command.downgrade(config, "base")
     for table in tables:
         assert not asyncio.run(_table_exists(table)), f"{table} still present after downgrade"
+
+
+def test_refresh_tokens_migration_round_trips() -> None:
+    """Phase 3's refresh_tokens table."""
+    config = _alembic_config()
+
+    command.upgrade(config, "head")
+    assert asyncio.run(_table_exists("refresh_tokens"))
+
+    command.downgrade(config, "base")
+    assert not asyncio.run(_table_exists("refresh_tokens"))

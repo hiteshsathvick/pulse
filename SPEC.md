@@ -298,6 +298,28 @@ leaks the real exception message or traceback to the client; those are logged se
 `request_id`. This is a Phase 1 scope decision: only the **error** shape is standardized here. A generic
 envelope wrapping every *successful* response body is not part of any phase's DoD and is not implemented.
 
+### 6.2 Authentication mechanism (implemented Phase 3)
+
+- **Access token** — a stateless JWT (HS256, 15 min default TTL). Verified by signature and expiry only;
+  never persisted. Sent as `Authorization: Bearer <token>`; a protected route (e.g. `GET /auth/me`) depends
+  on `get_current_user`, which returns `401` uniformly for a missing, malformed, expired, or
+  signature-invalid token, and for a token whose user no longer exists or is inactive.
+- **Refresh token** — deliberately *not* a JWT: an opaque `secrets.token_urlsafe` string, stored **hashed**
+  (SHA-256) in `refresh_tokens` (30 day default TTL), never plaintext. This is what makes rotation and
+  revocation real rather than aspirational — a bare JWT can't be revoked before it expires without a
+  server-side blocklist, but a DB-backed opaque token can be checked, rotated, and revoked directly.
+  - **Rotation:** every `POST /auth/refresh` call immediately marks the presented refresh token revoked and
+    issues a brand new access+refresh pair. Reusing an already-rotated refresh token fails — a stolen
+    refresh token is only useful once.
+  - **Revocation:** `POST /auth/logout` marks the given refresh token revoked. Idempotent: logging out with
+    an already-revoked or unknown token is not an error.
+- **Rate limiting** — `POST /auth/login` only (the DoD's "brute-force limit"; register/refresh/logout have a
+  different abuse profile). A fixed-window counter in Redis, keyed by client IP, default 5 attempts per 5
+  minutes, counting every attempt (not just failures) so the endpoint itself is protected, not only
+  wrong-password floods. Exceeding it returns `429` with `code: "rate_limited"` (§6.1).
+- Register and login are separate calls — register never returns tokens, per the DoD's literal
+  "signup → login → protected route" sequence.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -443,3 +465,6 @@ trace follows an event end to end.
   role RLS would otherwise silently bypass). Added a note to §4 that only `User`/`Organization`/
   `Membership`/`Project` exist so far — the rest of that section's table list is the eventual full shape,
   not what Phase 2 built.
+- 2026-09-16 — Phase 3 — Added §6.2 (the concrete auth mechanism: stateless JWT access tokens vs. opaque
+  DB-backed hashed refresh tokens, rotation, revocation, and the login-only rate limiter). New
+  `refresh_tokens` table (not RLS-protected — no `org_id`, same as `User`).

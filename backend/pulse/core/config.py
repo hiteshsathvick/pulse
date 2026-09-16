@@ -29,6 +29,15 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
 
+    # Dev-only default, like every other credential in this file -- never used
+    # as-is in a real deployment. Signs/verifies access tokens (HS256).
+    jwt_secret: str = "dev-insecure-jwt-secret-change-me"
+    jwt_access_token_ttl_minutes: int = 15
+    jwt_refresh_token_ttl_days: int = 30
+
+    auth_rate_limit_max_attempts: int = 5
+    auth_rate_limit_window_seconds: int = 300
+
 
 @lru_cache
 def get_settings() -> Settings:
