@@ -7,7 +7,10 @@ COPY pulse ./pulse
 COPY tests ./tests
 COPY alembic ./alembic
 
-RUN pip install --no-cache-dir .[dev]
+# setuptools' build step leaves build/ and *.egg-info in the cwd; harmless at
+# runtime, but they duplicate the whole source tree, which confuses
+# `ruff`/`mypy` when run against `.` inside this image.
+RUN pip install --no-cache-dir .[dev] && rm -rf build *.egg-info
 
 EXPOSE 8000
 

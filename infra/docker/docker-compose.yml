@@ -59,7 +59,8 @@ services:
       context: ../../backend
     command: ["uvicorn", "pulse.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse}@postgres:5432/${POSTGRES_DB:-pulse}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-pulse_app}:${POSTGRES_APP_PASSWORD:-pulse_app}@postgres:5432/${POSTGRES_DB:-pulse}
+      DATABASE_BOOTSTRAP_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse}@postgres:5432/${POSTGRES_DB:-pulse}
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: 8123
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-pulse}
@@ -93,7 +94,8 @@ services:
       context: ../../backend
     command: ["python", "-m", "pulse.worker.main"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse}@postgres:5432/${POSTGRES_DB:-pulse}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-pulse_app}:${POSTGRES_APP_PASSWORD:-pulse_app}@postgres:5432/${POSTGRES_DB:-pulse}
+      DATABASE_BOOTSTRAP_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse}@postgres:5432/${POSTGRES_DB:-pulse}
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: 8123
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-pulse}

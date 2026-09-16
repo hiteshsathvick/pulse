@@ -50,3 +50,18 @@ def test_upgrade_then_downgrade_round_trips_the_baseline_table() -> None:
 
     command.downgrade(config, "base")
     assert not asyncio.run(_table_exists("_pulse_schema_baseline"))
+
+
+def test_control_plane_migration_round_trips_all_four_tables() -> None:
+    """Phase 2's DoD: migrations reversible. Covers the control-plane tables
+    added on top of Phase 1's baseline."""
+    config = _alembic_config()
+    tables = ("organizations", "users", "memberships", "projects")
+
+    command.upgrade(config, "head")
+    for table in tables:
+        assert asyncio.run(_table_exists(table)), f"{table} missing after upgrade"
+
+    command.downgrade(config, "base")
+    for table in tables:
+        assert not asyncio.run(_table_exists(table)), f"{table} still present after downgrade"

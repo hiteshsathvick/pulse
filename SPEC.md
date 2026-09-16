@@ -97,7 +97,42 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **AuditLog** — `id, org_id, actor_id, action, target, metadata (JSONB), created_at`.
 - **Billing** — `Subscription`, `UsageRecord (org_id, period, events_ingested, mtu)` (Stripe-linked).
 
-### 4.1 Insight spec shapes (JSONB, versioned)
+> Only `User`, `Organization`, `Membership`, `Project` exist as of Phase 2. The rest of this list is the
+> full eventual shape; each other table is built in the phase that needs it (`ApiKey` Phase 5, schema
+> registry Phase 9, `Insight`/`Dashboard` Phase 15/16, `Alert` Phase 19, `Billing` Phase 20). `AuditLog`
+> has no phase of its own — it lands whenever the first real mutating endpoint does (Phase 4+).
+
+### 4.1 Row-Level Security mechanism (implemented Phase 2)
+
+Of the four Phase 2 tables, only `Membership` and `Project` carry `org_id` and are RLS-protected;
+`User` is a global identity (which orgs it belongs to lives in `Membership`) and `Organization` *is* the
+tenant rather than referencing one, so neither is RLS-scoped itself.
+
+- **Session-scoped GUC, not superuser demotion.** Auth (Phase 3) doesn't exist yet, so tenant scope for a
+  given session is set explicitly: `SELECT set_config('app.current_org_id', :org_id, true)` (parameterized,
+  transaction-local) at the start of an org-scoped session. Every RLS policy is
+  `USING (org_id = current_setting('app.current_org_id', true)::uuid)` with an identical `WITH CHECK` —
+  the latter is what stops a session scoped to org A from *writing* a row claiming org B, not just reading
+  one. An "unscoped" session sets this GUC to the nil UUID (`00000000-...-000000000000`), which can never
+  equal a real `gen_random_uuid()` value — not NULL/unset, because a custom (unregistered) GUC's
+  `SET LOCAL` doesn't reliably read back as NULL after the setting transaction commits on a pooled
+  connection; it can come back as `''`, which fails the policy's `::uuid` cast outright instead of just
+  not matching. The sentinel sidesteps that ambiguity entirely.
+- **`FORCE ROW LEVEL SECURITY` is mandatory, not optional.** Postgres does not apply RLS policies to a
+  table's owning role by default — only `FORCE` makes it apply even to the owner. Since the app connects
+  as the same role that creates the tables, skipping `FORCE` would make every policy a silent no-op for
+  every real query the app makes.
+- **The app never connects as the Postgres bootstrap superuser.** RLS — even with `FORCE` — is
+  unconditionally bypassed for superuser roles, and the official `postgres` image's `POSTGRES_USER` is
+  created as exactly that (the initdb bootstrap role), which Postgres also refuses to ever demote
+  (`ALTER ROLE ... NOSUPERUSER` on it fails: "the bootstrap user must have the SUPERUSER attribute"). So a
+  second, ordinary role (`pulse_app`) is what the app and migrations actually connect as; `alembic/env.py`
+  creates it idempotently, using the bootstrap role, before running any migration. `DATABASE_URL` points at
+  `pulse_app`; `DATABASE_BOOTSTRAP_URL` (superuser) is used only for that one bootstrap step. A practical
+  consequence: `/health`'s Postgres check will report an auth error until `alembic upgrade head` has been
+  run at least once against a given database — see `README.md`.
+
+### 4.2 Insight spec shapes (JSONB, versioned)
 
 ```jsonc
 // trend
@@ -403,3 +438,8 @@ trace follows an event end to end.
 - 2026-09-16 — Phase 1 — Added §6.1 (the standard error envelope's concrete JSON shape and error codes),
   which §6 had referenced as "defined Phase 1" without specifying. Scoped to error responses only, not a
   wrapper for every successful response body — no phase's DoD calls for the latter.
+- 2026-09-16 — Phase 2 — Added §4.1 (the RLS mechanism: session-scoped GUC, `FORCE ROW LEVEL SECURITY`,
+  and why the app connects as a dedicated `pulse_app` role rather than the Postgres bootstrap superuser
+  role RLS would otherwise silently bypass). Added a note to §4 that only `User`/`Organization`/
+  `Membership`/`Project` exist so far — the rest of that section's table list is the eventual full shape,
+  not what Phase 2 built.
