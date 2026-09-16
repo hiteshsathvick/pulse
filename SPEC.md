@@ -240,6 +240,29 @@ GET    /health                                    # checks Postgres + ClickHouse
 Every response uses a standard envelope and standard error shape (defined Phase 1). Every list endpoint is
 paginated. Every mutating action writes an audit log.
 
+### 6.1 Standard error envelope (defined Phase 1)
+
+Every non-2xx response — validation failures, `HTTPException`s raised anywhere in the app, and unhandled
+exceptions alike — has this shape:
+
+```jsonc
+{
+  "error": {
+    "code": "validation_error",       // stable slug; see below
+    "message": "Request validation failed.",
+    "request_id": "5c1c...",          // echoes X-Request-ID; null if somehow unset
+    "fields": [ /* present only for validation_error: pydantic's exc.errors(), jsonable-encoded */ ]
+  }
+}
+```
+
+`code` is derived from the HTTP status for the common cases (`bad_request`, `unauthorized`, `forbidden`,
+`not_found`, `conflict`, `validation_error`, `rate_limited`), falls back to `http_error` for anything else
+raised via `HTTPException`, and is always `internal_error` for the catch-all 500 handler — which never
+leaks the real exception message or traceback to the client; those are logged server-side only, keyed by
+`request_id`. This is a Phase 1 scope decision: only the **error** shape is standardized here. A generic
+envelope wrapping every *successful* response body is not part of any phase's DoD and is not implemented.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -376,3 +399,7 @@ trace follows an event end to end.
 ---
 
 *Change log: keep a running list of spec changes per phase here (date — phase — what changed — why).*
+
+- 2026-09-16 — Phase 1 — Added §6.1 (the standard error envelope's concrete JSON shape and error codes),
+  which §6 had referenced as "defined Phase 1" without specifying. Scoped to error responses only, not a
+  wrapper for every successful response body — no phase's DoD calls for the latter.

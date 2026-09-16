@@ -57,7 +57,7 @@ services:
   api:
     build:
       context: ../../backend
-    command: ["uvicorn", "pulse.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "pulse.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse}@postgres:5432/${POSTGRES_DB:-pulse}
       CLICKHOUSE_HOST: clickhouse
