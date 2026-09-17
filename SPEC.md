@@ -97,16 +97,37 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **AuditLog** — `id, org_id, actor_id, action, target, metadata (JSONB), created_at`.
 - **Billing** — `Subscription`, `UsageRecord (org_id, period, events_ingested, mtu)` (Stripe-linked).
 
-> Only `User`, `Organization`, `Membership`, `Project` exist as of Phase 2. The rest of this list is the
-> full eventual shape; each other table is built in the phase that needs it (`ApiKey` Phase 5, schema
-> registry Phase 9, `Insight`/`Dashboard` Phase 15/16, `Alert` Phase 19, `Billing` Phase 20). `AuditLog`
-> has no phase of its own — it lands whenever the first real mutating endpoint does (Phase 4+).
+> As of Phase 4: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
+> listed above — see §6.2), `Invite` and `AuditLog` (Phase 4, added ahead of the table above's original
+> phase notes — see §4.1). The rest of this list is the full eventual shape; each remaining table is built
+> in the phase that needs it (`ApiKey` Phase 5, schema registry Phase 9, `Insight`/`Dashboard` Phase 15/16,
+> `Alert` Phase 19, `Billing` Phase 20).
 
-### 4.1 Row-Level Security mechanism (implemented Phase 2)
+### 4.1 Row-Level Security mechanism (implemented Phase 2, extended Phase 3/4)
 
 Of the four Phase 2 tables, only `Membership` and `Project` carry `org_id` and are RLS-protected;
 `User` is a global identity (which orgs it belongs to lives in `Membership`) and `Organization` *is* the
 tenant rather than referencing one, so neither is RLS-scoped itself.
+
+**The actual rule, refined by Phase 3/4:** RLS protects tables reached via a *browse-this-org's-data*
+pattern (`Membership`, `Project`, and now `AuditLog`) — it's defense-in-depth against an application bug
+that forgets to filter by `org_id`. It does **not** protect tables reached via *token redemption*
+(`RefreshToken`, `Invite`), even though `Invite` carries `org_id`: accepting an invite (or refreshing a
+session) means looking a row up by an opaque secret *before* the caller has any org context to scope a
+session by — the token itself is the security boundary there, not RLS. Listing invites for management
+(`GET /orgs/{id}/invites`) still explicitly filters by `org_id` in the query, reached only once the
+caller's membership in that org has already been confirmed by `get_org_membership` (§6.2-adjacent, see
+`pulse/api/dependencies.py`).
+
+**Two GUCs, not one, as of Phase 4.** `app.current_org_id` (Phase 2) scopes the common case. A second,
+`app.current_user_id` GUC (migration 0004) exists purely for "which orgs am I in" (`GET /orgs`): normally
+`Membership` is visible only within one org's scope, but that query is inherently cross-org from the
+user's own perspective. A second, **`FOR SELECT`-only** permissive policy on `memberships` allows
+visibility by `user_id` in addition to `org_id` — scoped to `SELECT` specifically so it can never loosen
+the org-scoped `WITH CHECK` that governs INSERT/UPDATE/DELETE, which would otherwise let a user self-grant
+membership in any org just by setting their own `user_id`. `session_scope()` takes both parameters; an
+unset one gets a nil-UUID sentinel exactly like the original `org_id` case, for the same NULL/`''`
+ambiguity reason below.
 
 - **Session-scoped GUC, not superuser demotion.** Auth (Phase 3) doesn't exist yet, so tenant scope for a
   given session is set explicitly: `SELECT set_config('app.current_org_id', :org_id, true)` (parameterized,
@@ -245,8 +266,11 @@ Auth: control-plane endpoints use JWT (user) or read API keys (server). `/ingest
 POST   /api/v1/auth/register | login | refresh | logout
 GET    /api/v1/auth/me
 
-# Orgs / projects / members / keys
-CRUD   /api/v1/orgs, /orgs/{id}/projects, /orgs/{id}/members, /projects/{id}/keys
+# Orgs / projects / members / invites / keys
+CRUD   /api/v1/orgs, /orgs/{id}/projects, /orgs/{id}/members    # Phase 4
+CRUD   /api/v1/orgs/{id}/invites                                # Phase 4
+POST   /api/v1/invites/accept                                   # Phase 4
+CRUD   /api/v1/projects/{id}/keys                                # Phase 5 -- not built yet
 
 # Ingestion (write key)
 POST   /ingest                 # { batch: [ {event_id, event, user_id?, anonymous_id?, timestamp?, properties?} ] } -> 202
@@ -468,3 +492,14 @@ trace follows an event end to end.
 - 2026-09-16 — Phase 3 — Added §6.2 (the concrete auth mechanism: stateless JWT access tokens vs. opaque
   DB-backed hashed refresh tokens, rotation, revocation, and the login-only rate limiter). New
   `refresh_tokens` table (not RLS-protected — no `org_id`, same as `User`).
+- 2026-09-17 — Phase 4 — Extended §4.1 with the actual RLS rule (browse-pattern tables vs. token-redemption
+  tables, regardless of whether the latter carry `org_id`) and the second, `FOR SELECT`-only
+  `app.current_user_id` GUC/policy on `memberships` for "list my orgs". New `Invite` (not RLS-protected,
+  per the refined rule) and `AuditLog` (RLS-protected) tables — the latter closes a gap this spec's own §4
+  note flagged since Phase 2 ("AuditLog... lands whenever the first real mutating endpoint does"). Updated
+  §6's org/project/member/invite endpoint list; `ApiKey`'s endpoints remain Phase 5, not built yet. No
+  email provider exists in §2's tech stack, so `POST /orgs/{id}/invites` returns the raw invite token in
+  the response body as an explicit stand-in for actually emailing it. Member/org/project destructive
+  actions (delete, role change, removal) require an OWNER/ADMIN role via one small helper
+  (`require_elevated_role`) — a deliberately minimal exception to "RBAC is Phase 5," since leaving those
+  specific actions open to any member felt like an obvious gap not worth waiting on.

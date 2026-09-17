@@ -76,3 +76,27 @@ def test_refresh_tokens_migration_round_trips() -> None:
 
     command.downgrade(config, "base")
     assert not asyncio.run(_table_exists("refresh_tokens"))
+
+
+def test_invites_migration_round_trips() -> None:
+    """Phase 4's invites table (and the membership self-visibility policy,
+    which downgrade must also clean up before dropping memberships in an
+    earlier revision -- this only round-trips cleanly if it does)."""
+    config = _alembic_config()
+
+    command.upgrade(config, "head")
+    assert asyncio.run(_table_exists("invites"))
+
+    command.downgrade(config, "base")
+    assert not asyncio.run(_table_exists("invites"))
+
+
+def test_audit_logs_migration_round_trips() -> None:
+    """Phase 4's audit_logs table."""
+    config = _alembic_config()
+
+    command.upgrade(config, "head")
+    assert asyncio.run(_table_exists("audit_logs"))
+
+    command.downgrade(config, "base")
+    assert not asyncio.run(_table_exists("audit_logs"))

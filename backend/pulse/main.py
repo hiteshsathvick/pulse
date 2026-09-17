@@ -7,6 +7,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from pulse.api.auth import router as auth_router
 from pulse.api.health import router as health_router
+from pulse.api.invites import invites_router, org_invites_router
+from pulse.api.orgs import router as orgs_router
+from pulse.api.projects import router as projects_router
 from pulse.core.error_handlers import (
     http_exception_handler,
     unhandled_exception_handler,
@@ -38,3 +41,7 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 app.include_router(health_router)
 app.include_router(auth_router)
+app.include_router(orgs_router)
+app.include_router(projects_router)
+app.include_router(org_invites_router)
+app.include_router(invites_router)
