@@ -814,3 +814,20 @@ trace follows an event end to end.
   and confirmed a `keepalive` `POST /ingest` fired and the worker processed it on its next cycle --
   `button clicked`'s `volume_estimate` incremented, proving the unload path actually delivers, not just
   that it doesn't crash. 25 new tests (18 TS + 7 Python); `ruff`/`mypy`/`tsc` clean across both.
+- 2026-09-17 — CI fix (found while closing out Phase 10, not part of it) — **CI's `test` job had been
+  running the entire backend suite as the Postgres bootstrap/superuser role, not `pulse_app`.**
+  `DATABASE_URL` was set directly to the same `pulse:pulse` credentials as the bootstrap role, with no
+  `DATABASE_BOOTSTRAP_URL` override; §4.1's own invariant is that RLS -- even `FORCE ROW LEVEL
+  SECURITY` -- is unconditionally bypassed for superusers. Confirmed by reproducing the exact CI env
+  locally rather than reasoning about it: `test_tenant_isolation.py`'s two tests, which assert on a
+  bare `select(Project)`/`select(Membership)` with no `WHERE org_id = ...` of their own (deliberately,
+  so they test the database-level boundary and not application-level filtering), both genuinely fail
+  under the old CI env -- cross-org rows leak straight through. Every other test passed anyway, either
+  because it doesn't touch RLS-protected tables or because the service layer it calls already adds its
+  own explicit `org_id` filter as defense-in-depth (see `pulse/services/projects.py`'s `get_project`:
+  "RLS already guarantees a cross-org project_id comes back None; this is belt-and-braces, not the
+  actual boundary") -- which is exactly how this went unnoticed: the belt was silently doing the job
+  the suspenders were supposed to be verified. Fixed by pointing `DATABASE_URL` at `pulse_app` and
+  adding `DATABASE_BOOTSTRAP_URL` (superuser, for `alembic/env.py`'s one-time role-creation step) to
+  the `test` job's env, matching every other environment's convention. Full 78-test suite re-verified
+  green under the corrected role -- nothing else had been quietly depending on the bypass.

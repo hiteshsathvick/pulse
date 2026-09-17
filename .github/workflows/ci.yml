@@ -94,7 +94,15 @@ jobs:
           CLICKHOUSE_DB: pulse
         ports: ["8123:8123", "9000:9000"]
     env:
-      DATABASE_URL: postgresql+asyncpg://pulse:pulse@localhost:5432/pulse
+      # Confirmed by reproducing this exact env locally: with DATABASE_URL
+      # pointing at the bootstrap/superuser role instead of pulse_app, RLS is
+      # unconditionally bypassed (Postgres never applies RLS to superusers,
+      # even with FORCE) and test_tenant_isolation.py's two tests both fail
+      # for real -- cross-org rows leak straight through. DATABASE_URL must
+      # be the app role; DATABASE_BOOTSTRAP_URL (superuser) is only for
+      # alembic/env.py's one-time _ensure_app_role_exists step.
+      DATABASE_URL: postgresql+asyncpg://pulse_app:pulse_app@localhost:5432/pulse
+      DATABASE_BOOTSTRAP_URL: postgresql+asyncpg://pulse:pulse@localhost:5432/pulse
       CLICKHOUSE_HOST: localhost
       CLICKHOUSE_PORT: 8123
       CLICKHOUSE_USER: pulse
