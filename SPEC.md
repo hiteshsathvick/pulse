@@ -533,6 +533,51 @@ RLS can scope the table directly, matching every other RLS-protected table in th
   mutation (`pulse/registry/service.py`, not the router -- matching `pulse/services/api_keys.py`'s
   convention of keeping the mutation and its audit record atomic).
 
+### 6.7 Ingestion SDK mechanism (implemented Phase 10)
+
+`packages/sdk-js` (`@pulse/sdk-js`) and `packages/sdk-python` (`pulse-sdk`) are both standalone
+packages -- no npm workspace links `sdk-js` to `frontend/`, and `sdk-python` is not a dependency of
+`backend/`. Neither is published; both are built/installed locally.
+
+- **A real technical conflict, resolved:** `/ingest` auth is the `X-API-Key` header, but
+  `navigator.sendBeacon` -- named in `PULSE_PROJECT_GUIDE.md` -- cannot send custom headers at all.
+  The unload-time flush uses `fetch(url, { keepalive: true })` instead, which survives page teardown
+  the same way `sendBeacon` does but does support headers, so the write-key auth model stays
+  identical across every call site. Trade-off: `keepalive` requests share a small (~64KB) in-flight
+  body budget per origin, which is why flush batches are kept bounded.
+- **The real "no loss" guarantee is `localStorage`, not the unload-time network call.** Every
+  `track`/`identify`/`page` call is durably queued to `localStorage` *before* any network attempt.
+  The `pagehide`/`beforeunload`-triggered `fetch` is still only best-effort -- if it's cut short by
+  the unload itself, the event is simply still on disk, and the next page load's flush (interval or
+  size trigger) picks it up. This was verified live, not just in a mocked test: tracking an event,
+  then navigating away without ever clicking "flush," produced a real `keepalive` `POST /ingest` that
+  the running worker processed on its very next cycle.
+- **Browser is this phase's real target; Node is architected for, not shipped.** The DoD's four named
+  test categories and its one acceptance line ("dropping the SDK into a demo page") are both
+  browser-shaped. `LocalBuffer`/`sendBatch` are written against small, swappable interfaces so a
+  future Node entry point (in-memory buffer instead of `localStorage`, no `window` event listeners) is
+  a real possibility, but only the browser build is written, tested, and demoed here.
+- **`event_id` is never regenerated across retry attempts** -- a failed flush retries the exact same
+  batch with exponential backoff (1s, capped at 30s); the worker's Phase-8 dedup makes a
+  fails-then-succeeds retry idempotent by design, not by any special-casing in the SDK itself.
+- **Bounded local buffer** (default 1000 events, oldest evicted first with a console warning) -- not
+  in the DoD's literal wording, but necessary so a prolonged API outage can't grow `localStorage`
+  without bound.
+- **`identify(userId, traits?)`** persists `userId` for every subsequent `track`/`page` call and emits
+  a `track("$identify", traits)` event -- the common SDK convention, needing no new server-side
+  concept. **`page(name?, props?)`** is sugar for `track("page viewed", { name, ...props })`, reusing
+  the exact event name Phase 6's own fixture generator already uses.
+- **The Python SDK is genuinely thin: zero runtime dependencies.** `urllib.request` + `json` from the
+  stdlib, not `httpx` -- in-memory buffer only, no local persistence, no retry/backoff. A Python
+  server process restarting is a different failure mode than a browser tab closing, and this is meant
+  to drop into an arbitrary third-party server without adding a dependency footprint.
+- **Fixed a pre-existing CI gap found while touching this file:** the `test` job's service containers
+  never included MinIO, so Phase 8/9's object-storage-archiving tests had been silently unexercised in
+  CI since they were written. GitHub Actions `services:` containers cannot override a command, and the
+  official `minio/minio` image needs `server /data` passed explicitly -- so MinIO is started as a
+  plain `docker run` step instead of a `services:` entry. New `test-sdk-js` and `test-sdk-python` CI
+  jobs (typecheck/test/build for one, ruff/mypy/pytest for the other).
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -576,9 +621,9 @@ no dup**; backpressure behavior. See §6.5.
 **Phase 9 — Schema registry.** ☑ auto-register new events/properties with inferred types; ☑ deprecate/hide;
 ☑ mark PII. Tests: new event auto-registers; type-conflict flagged; unknown events still ingest. See §6.6.
 
-**Phase 10 — SDK.** ☐ TS SDK (`identify`/`track`/`page`) with local buffer, batched flush on
-interval/size/`beforeunload`, backoff retry, `event_id`; ☐ thin Python server SDK. Tests: offline buffering,
-flush triggers, retry/idempotency, no loss on unload.
+**Phase 10 — SDK.** ☑ TS SDK (`identify`/`track`/`page`) with local buffer, batched flush on
+interval/size/`beforeunload`, backoff retry, `event_id`; ☑ thin Python server SDK. Tests: offline buffering,
+flush triggers, retry/idempotency, no loss on unload. See §6.7.
 
 **Phase 11 — Query engine + trends.** ☐ spec→SQL builder with **org/project injected**, caps, timeouts; ☐
 Redis result cache. Tests: spec→SQL correctness; **tenant-leakage tests**; tz-correct bucketing; cache
@@ -751,3 +796,21 @@ trace follows an event end to end.
   decoupling hold under an actual `ForeignKeyViolationError` from a backlog of events whose orgs/projects
   no longer existed (dropped by an intervening `alembic downgrade base` between phases): every one of those
   events still landed in ClickHouse correctly. 78 tests pass (70 -> 78); `ruff`/`mypy` clean.
+- 2026-09-17 — Phase 10 — Added §6.7 (the ingestion SDK mechanism: the sendBeacon-cannot-send-headers
+  conflict resolved with `fetch({keepalive:true})` instead; the real "no loss" guarantee being
+  `localStorage`, not the unload-time network call succeeding; browser scoped as this phase's real
+  target with Node architected-for-but-not-shipped; the bounded-buffer safety valve; and the thin
+  Python SDK's deliberate zero-runtime-dependency choice). New standalone packages `packages/sdk-js`
+  (`@pulse/sdk-js` -- `src/{index,buffer,transport,ids}.ts`, `tsup` build, `vitest`+`jsdom` tests, a
+  `demo/index.html`) and `packages/sdk-python` (`pulse-sdk` -- `pulse_sdk/client.py`, stdlib-only).
+  Also fixed a pre-existing CI gap found while touching `.github/workflows/ci.yml`: the `test` job's
+  service containers never included MinIO, so Phase 8/9's object-storage tests had been silently
+  unexercised in CI since they were written; added new `test-sdk-js`/`test-sdk-python` jobs. Verified
+  live end-to-end through the *actual* running backend, not mocks: opened the built demo page in a
+  real browser, drove it through init/identify/track/page/flush, confirmed a genuine `202` from
+  `/ingest` (including a real CORS preflight), and watched the worker register all three resulting
+  events (`$identify`, `button clicked`, `page viewed`) via the schema registry API. Separately
+  verified "no loss on unload" for real: tracked an event, navigated away without ever clicking flush,
+  and confirmed a `keepalive` `POST /ingest` fired and the worker processed it on its next cycle --
+  `button clicked`'s `volume_estimate` incremented, proving the unload path actually delivers, not just
+  that it doesn't crash. 25 new tests (18 TS + 7 Python); `ruff`/`mypy`/`tsc` clean across both.

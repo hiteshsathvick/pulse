@@ -32,3 +32,12 @@ ClickHouse and Redis still report fine independently.
 cd infra/docker
 docker compose run --rm api pytest -v
 ```
+
+## Ingestion SDKs
+
+Two standalone packages, not linked into the rest of the monorepo via a workspace:
+
+- [`packages/sdk-js`](packages/sdk-js) (`@pulse/sdk-js`) -- the browser SDK (`identify`/`track`/`page`),
+  with a `localStorage`-backed buffer so events survive a closed tab. `npm install && npm run build && npm test`.
+- [`packages/sdk-python`](packages/sdk-python) (`pulse-sdk`) -- a thin, zero-dependency server-side
+  client for `POST /ingest`. `pip install -e .[dev] && pytest`.

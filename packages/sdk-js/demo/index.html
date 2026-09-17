@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Pulse SDK demo</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        max-width: 640px;
+        margin: 3rem auto;
+        padding: 0 1rem;
+        color: #111;
+      }
+      label {
+        display: block;
+        margin-top: 1rem;
+        font-size: 0.85rem;
+        color: #555;
+      }
+      input {
+        width: 100%;
+        padding: 0.5rem;
+        font-size: 1rem;
+        box-sizing: border-box;
+      }
+      button {
+        margin-top: 1rem;
+        margin-right: 0.5rem;
+        padding: 0.5rem 1rem;
+        font-size: 1rem;
+        cursor: pointer;
+      }
+      #log {
+        margin-top: 1.5rem;
+        padding: 1rem;
+        background: #f5f5f5;
+        border-radius: 4px;
+        white-space: pre-wrap;
+        font-family: ui-monospace, monospace;
+        font-size: 0.85rem;
+        max-height: 300px;
+        overflow-y: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Pulse SDK demo</h1>
+    <p>Configure a real project's API host and write key, then send events.</p>
+
+    <label>API host <input id="apiHost" value="http://localhost:8000" /></label>
+    <label>Write key <input id="writeKey" placeholder="pulse_write_..." /></label>
+
+    <div>
+      <button id="btn-init">Init</button>
+      <button id="btn-identify">Identify</button>
+      <button id="btn-track">Track "button clicked"</button>
+      <button id="btn-page">Page view</button>
+      <button id="btn-flush">Flush now</button>
+    </div>
+
+    <div id="log"></div>
+
+    <script type="module">
+      import { init } from "../dist/index.js";
+
+      const logEl = document.getElementById("log");
+      function log(message) {
+        logEl.textContent += `${new Date().toISOString()} ${message}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      let client;
+
+      document.getElementById("btn-init").addEventListener("click", () => {
+        const apiHost = document.getElementById("apiHost").value;
+        const writeKey = document.getElementById("writeKey").value;
+        client = init({ apiHost, writeKey, flushAtSize: 5, flushIntervalMs: 10000 });
+        log(`initialized (apiHost=${apiHost})`);
+      });
+
+      document.getElementById("btn-identify").addEventListener("click", () => {
+        client?.identify("demo_user_1", { plan: "pro" });
+        log("identify(demo_user_1)");
+      });
+
+      document.getElementById("btn-track").addEventListener("click", () => {
+        client?.track("button clicked", { label: "demo" });
+        log("track(button clicked)");
+      });
+
+      document.getElementById("btn-page").addEventListener("click", () => {
+        client?.page("Demo Page");
+        log("page(Demo Page)");
+      });
+
+      document.getElementById("btn-flush").addEventListener("click", async () => {
+        await client?.flush();
+        log("flush() completed");
+      });
+    </script>
+  </body>
+</html>
