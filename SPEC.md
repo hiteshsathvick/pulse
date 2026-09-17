@@ -397,6 +397,47 @@ query endpoint (Phase 11) to attach them to, so the DoD's "write keys can only i
 query" is real and tested (`resolve_api_key` type-checks explicitly) rather than deferred untested to
 whichever phase happens to need it.
 
+### 6.4 Ingest API mechanism (implemented Phase 7)
+
+`POST /ingest` validates lightly and buffers -- it never inserts into ClickHouse synchronously (§3.2).
+`require_write_key` (Phase 5) resolves the caller's `org_id`/`project_id`; the request body carries no
+tenant field at all, so there's nothing client-supplied to distrust.
+
+- **Buffer topology: one global Redis Stream, not one per project.** All events, across every org and
+  project, land in a single stream key (`pulse:ingest:events` by default). This keeps Phase 8's
+  consumer-group workers simple as the number of projects grows -- no fan-out across N streams -- while
+  tenant scope still lives in each entry's own `org_id`/`project_id` fields. One `XADD` per *event*, not
+  per HTTP batch (pipelined so a whole HTTP batch is still one Redis round trip), so a worker's
+  `XREADGROUP` reads a batch of individually-ack-able entries directly, matching
+  `PULSE_PROJECT_GUIDE.md` §6.2's sequence diagram ("consume batch (consumer group)").
+- **Validation is deliberately shallow.** `IngestEvent` (`pulse/ingest/schemas.py`) checks only structural
+  well-formedness: `event_id` is a UUID, `event` is a non-empty string, and at least one of
+  `user_id`/`anonymous_id` is present. It is **not** the `events` table's own column shape -- schema-registry
+  validation and enrichment (geo/device/server timestamp) are Phase 8/9's job, applied once an event leaves
+  the buffer. A structurally invalid event fails the **whole batch** (`422`), not a partial accept/drop --
+  per-event triage into good/bad belongs to Phase 8's DLQ, once enrichment exists to triage against.
+- **Two independent size guards.** A batch-count cap (`ingest_max_batch_size`, default 500) enforced in the
+  router against the parsed body, and a body-byte cap (`ingest_max_body_bytes`, default 512,000) enforced
+  against the `Content-Length` header before that -- either alone would miss a batch that's small in count
+  but huge in property payloads, or vice versa. The `Content-Length` check is a `Depends`, not custom ASGI
+  middleware: FastAPI already reads the full body before resolving dependencies, so this doesn't prevent the
+  initial buffering into memory, but it does stop a huge payload from reaching JSON parsing, validation, or
+  Redis, and (more importantly) it does so through the same registered exception-handler pipeline as every
+  other error in this app -- a hand-rolled ASGI middleware raising `HTTPException` would bypass that
+  pipeline entirely (Starlette's `ExceptionMiddleware` sits *inside* user middleware, not outside it), so it
+  was rejected as strictly worse for a marginal gain.
+- **Rate limiting is keyed by write-key id, not client IP** (`check_ingest_rate_limit`,
+  `pulse/core/rate_limit.py`), reusing Phase 3's fixed-window-counter-in-Redis pattern. Ingestion traffic
+  for many customers can share an IP (CDNs, corporate NAT); the resource actually being protected is a
+  single project's buffer capacity, which the write key identifies precisely.
+- **CORS is applied app-wide** (`CORSMiddleware`, `allow_origins` from `ingest_cors_allow_origins`,
+  default `["*"]`), not scoped to `/ingest` alone, even though `/ingest` (meant to be called from arbitrary
+  customer domains, authenticated by a bearer-style write key) is the only real reason it exists. Starlette's
+  `CORSMiddleware` has no per-route scoping, and every other endpoint in this app authenticates via a JWT
+  bearer token or an API key -- never a cookie -- so there is no ambient credential a cross-origin script
+  could ride on regardless of which endpoint a wide-open policy exposes. Hand-rolling a path-scoped CORS
+  middleware to avoid that was rejected as reinventing preflight handling for no real security gain.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -428,9 +469,9 @@ Tests: invite lifecycle, tenant-context resolution, project scoping.
 **Phase 6 — Event model + ClickHouse schema.** ☐ `events` table per §5.1; ☐ fake-event generator; ☐ typed
 round-trip. Tests: insert/read round-trip; org/project columns always present; partition/order verified.
 
-**Phase 7 — Ingest API.** ☐ `POST /ingest` batch, write-key auth, light validation, enqueue to Redis
-Streams, `202`; ☐ size limits + rate limit; ☐ browser CORS. Tests: batch buffered (nothing hits ClickHouse
-synchronously); oversized/malformed rejected; write-key scoping; p99 latency sanity.
+**Phase 7 — Ingest API.** ☑ `POST /ingest` batch, write-key auth, light validation, enqueue to Redis
+Streams, `202`; ☑ size limits + rate limit; ☑ browser CORS. Tests: batch buffered (nothing hits ClickHouse
+synchronously); oversized/malformed rejected; write-key scoping; p99 latency sanity. See §6.4.
 
 **Phase 8 — Ingestion workers.** ☐ consumer-group workers; ☐ batch by size/time; ☐ registry validation +
 enrichment; ☐ **`event_id` dedup**; ☐ large batched inserts; ☐ **DLQ**; ☐ raw-batch archive to object
@@ -575,3 +616,12 @@ trace follows an event end to end.
   worker-level Redis dedup. Added the ClickHouse migration CLI (`python -m pulse.clickhouse_migrations`,
   documented in `README.md`) -- the runner existed since Phase 1 but had never been given a real product
   migration or a one-line way to invoke it, mirroring `alembic upgrade head` for the other store.
+- 2026-09-17 — Phase 7 — Added §6.4 (the Ingest API mechanism: one global Redis Stream rather than one per
+  project, whole-batch-reject on a malformed event, two independent size guards, write-key-id-keyed rate
+  limiting, and app-wide rather than path-scoped CORS -- each with the alternative considered and why it was
+  rejected). New `pulse/ingest/` module (`schemas.py`, `service.py`, `router.py`); reuses Phase 5's
+  `require_write_key` unchanged. Verified live end-to-end against the real containers, not just the test
+  suite: registered a user, created an org/project/write-key through the real HTTP API, posted a batch to
+  the running `/ingest`, confirmed the event landed in the Redis stream with `org_id`/`project_id` correctly
+  injected from the resolved key (never from the request body), and confirmed ClickHouse's `events` table
+  stayed at zero rows throughout. 64 tests pass (52 -> 64); `ruff`/`mypy` clean.

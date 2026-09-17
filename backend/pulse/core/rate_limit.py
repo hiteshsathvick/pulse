@@ -23,3 +23,21 @@ async def check_login_rate_limit(identifier: str) -> None:
 
     if count > settings.auth_rate_limit_max_attempts:
         raise RateLimitExceeded()
+
+
+async def check_ingest_rate_limit(api_key_id: str) -> None:
+    """Same fixed-window pattern as check_login_rate_limit, but keyed by the
+    write key's id rather than client IP -- ingestion traffic for many
+    customers can share an IP (CDNs, corporate NAT), and the resource being
+    protected is per-project buffer capacity, not a single client's login
+    attempts."""
+    settings = get_settings()
+    client = get_client()
+    key = f"ingest:requests:{api_key_id}"
+
+    count = await client.incr(key)
+    if count == 1:
+        await client.expire(key, settings.ingest_rate_limit_window_seconds)
+
+    if count > settings.ingest_rate_limit_max_requests:
+        raise RateLimitExceeded()

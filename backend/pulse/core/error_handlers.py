@@ -16,6 +16,7 @@ _STATUS_CODE_SLUGS: dict[int, str] = {
     status.HTTP_403_FORBIDDEN: "forbidden",
     status.HTTP_404_NOT_FOUND: "not_found",
     status.HTTP_409_CONFLICT: "conflict",
+    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE: "payload_too_large",
     status.HTTP_422_UNPROCESSABLE_ENTITY: "validation_error",
     status.HTTP_429_TOO_MANY_REQUESTS: "rate_limited",
 }
