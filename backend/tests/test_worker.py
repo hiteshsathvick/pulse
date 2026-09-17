@@ -7,17 +7,55 @@ from pathlib import Path
 import clickhouse_connect
 import pytest
 
+from alembic import command
+from alembic.config import Config
 from pulse.clickhouse_migrations.runner import migrate
 from pulse.core.config import get_settings
 from pulse.events.repository import query_events
+from pulse.models import PropertyType, User
+from pulse.registry.service import list_events, list_properties
 from pulse.repositories import object_storage
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
+from pulse.repositories.postgres import session_scope
 from pulse.repositories.redis import get_client as get_redis_client
+from pulse.services import orgs as orgs_service
+from pulse.services import projects as projects_service
 from pulse.worker.consumer import ensure_consumer_group, read_batch
 from pulse.worker.processing import process_batch
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _MIGRATIONS_DIR = _BACKEND_ROOT / "pulse" / "clickhouse_migrations" / "migrations"
+
+
+def _alembic_config() -> Config:
+    config = Config(str(_BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(_BACKEND_ROOT / "alembic"))
+    return config
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _control_plane_schema():
+    config = _alembic_config()
+    command.upgrade(config, "head")
+    yield
+    command.downgrade(config, "base")
+
+
+async def _create_org_and_project() -> tuple[uuid.UUID, uuid.UUID]:
+    async with session_scope() as session:
+        user = User(
+            email=f"owner-{uuid.uuid4().hex[:8]}@example.com",
+            password_hash="not-a-real-hash",
+            name="Owner",
+        )
+        session.add(user)
+        await session.commit()
+
+    org = await orgs_service.create_organization(
+        "Worker Registry Org", f"worker-registry-{uuid.uuid4().hex[:8]}", user.id
+    )
+    project = await projects_service.create_project(org.id, "Web", "web", "UTC", user.id)
+    return org.id, project.id
 
 
 async def _with_fresh_clickhouse_client(body) -> None:
@@ -276,3 +314,64 @@ async def test_batch_is_archived_to_object_storage() -> None:
 
     assert len(content) == 1
     assert content[0]["event_id"] == str(event_id)
+
+
+async def test_worker_auto_registers_a_new_event_through_the_real_pipeline() -> None:
+    """DoD: new event auto-registers -- exercised through the actual worker
+    path (XADD -> read_batch -> process_batch), not just the registry
+    service directly, against a real org/project so the FK-backed insert
+    genuinely succeeds."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = await _create_org_and_project()
+    await redis_client.xadd(
+        stream_key,
+        _raw_fields(
+            org_id=str(org_id),
+            project_id=str(project_id),
+            event_name="checkout completed",
+            properties=json.dumps({"revenue": 42.5, "platform": "web"}),
+        ),
+    )
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+
+    result = await _process(stream_key, group, entries)
+    assert result.processed == 1
+
+    events = await list_events(org_id, project_id)
+    assert len(events) == 1
+    assert events[0].event_name == "checkout completed"
+
+    properties = {p.key: p.inferred_type for p in await list_properties(org_id, events[0].id)}
+    assert properties["revenue"] == PropertyType.NUMBER
+    assert properties["platform"] == PropertyType.STRING
+
+
+async def test_broken_registry_does_not_block_insert_archive_or_ack() -> None:
+    """The new risk Phase 9 introduces: a registry write failure (here, a
+    genuine Postgres FK violation -- org_id/project_id were never created as
+    real control-plane rows) must never cost the ClickHouse insert, the
+    archive, or the ack. Best-effort is only meaningful if it holds under a
+    real failure, not just in the happy path."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()  # deliberately not real rows
+    await redis_client.xadd(
+        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
+    )
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+
+    result = await _process(stream_key, group, entries)
+    assert result.processed == 1
+    assert result.acked == 1
+
+    ch_client = await get_clickhouse_client()
+    rows = await query_events(ch_client, org_id, project_id)
+    assert len(rows) == 1, "ClickHouse insert must succeed even though the registry write failed"
+
+    pending = await redis_client.xpending(stream_key, group)
+    assert pending["pending"] == 0

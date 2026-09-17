@@ -100,11 +100,11 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **AuditLog** — `id, org_id, actor_id, action, target, metadata (JSONB), created_at`.
 - **Billing** — `Subscription`, `UsageRecord (org_id, period, events_ingested, mtu)` (Stripe-linked).
 
-> As of Phase 5: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
+> As of Phase 9: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
 > listed above — see §6.2), `Invite` and `AuditLog` (Phase 4), `ApiKey` (Phase 5, ahead of this table's
-> original phase note — see §4.1). The rest of this list is the full eventual shape; each remaining table
-> is built in the phase that needs it (schema registry Phase 9, `Insight`/`Dashboard` Phase 15/16, `Alert`
-> Phase 19, `Billing` Phase 20).
+> original phase note — see §4.1), `EventSchema`/`PropertySchema` (Phase 9, see §6.6). The rest of this
+> list is the full eventual shape; each remaining table is built in the phase that needs it (`Insight`/
+> `Dashboard` Phase 15/16, `Alert` Phase 19, `Billing` Phase 20).
 
 ### 4.1 Row-Level Security mechanism (implemented Phase 2, extended Phase 3/4/5)
 
@@ -486,6 +486,53 @@ until something actually runs more than one worker replica.
   `raw/{received_at:%Y/%m/%d}/{ingest_batch}.json`, one object per worker-processed batch (not per event),
   containing the *entire* raw batch as read off the stream.
 
+### 6.6 Schema registry mechanism (implemented Phase 9)
+
+Pure governance metadata layered on top of ingestion -- never a gate on it. `EventSchema`/`PropertySchema`
+are RLS-protected on `org_id` like `Project`/`AuditLog` (a browse-this-project's-taxonomy pattern, not
+token redemption); `PropertySchema.org_id` is denormalized (also derivable via `event_schema_id`) purely so
+RLS can scope the table directly, matching every other RLS-protected table in this codebase.
+
+- **Registration is best-effort and fully decoupled from ingestion correctness.** The worker calls it only
+  *after* a successful ClickHouse insert, wrapped in its own `try`/`except` (`register_events` in
+  `pulse/worker/processing.py`) -- any failure (Postgres down, a stale `org_id`/`project_id` whose control-
+  plane rows no longer exist) is logged and swallowed, never raised, never costs the archive write or the
+  ack. This was verified against a *real* failure during Phase 9's live check, not just in tests: a backlog
+  of events from earlier phases' testing (whose orgs/projects had since been dropped by an intervening
+  `alembic downgrade base`) hit a genuine `ForeignKeyViolationError` registering against `event_schemas` --
+  and every one of those events still landed in ClickHouse correctly, because the two are decoupled.
+- **A process-lifetime in-memory cache** (`(project_id, event_name) -> event_schema_id`,
+  `(event_schema_id, key) -> (property_schema_id, inferred_type)`) avoids a Postgres round trip for every
+  event in a batch of up to 500 -- only a not-yet-seen pair touches the database. Unique constraints on
+  `(project_id, event_name)` and `(event_schema_id, key)` are the real safety net; there's no cross-process
+  race to worry about, since Phase 8 already committed to a single worker process. `volume_estimate` is
+  bumped once per distinct event name *per batch* (grouped), not once per event.
+- **Type inference runs on the pre-stringification values.** `ParsedEvent` gained a `raw_properties` field
+  (Phase 8's `properties` field had already flattened everything to strings for ClickHouse's
+  `Map(String, String)` column, which would make every property look like a "string" to the registry).
+  Inference order matters: `bool` is checked *before* `(int, float)`, since `bool` is a subclass of `int` in
+  Python and would otherwise be misclassified as `number`. A string is tried against
+  `datetime.fromisoformat()` before falling back to `string`.
+- **Type conflicts are flagged, never enforced or silently overwritten.** `inferred_type` is set once at
+  first sighting and never auto-changed by a later observation; a conflicting type instead sets
+  `type_conflict_detected_at` (once -- both in Postgres and via a local `_conflict_flagged` set, so a
+  batch with hundreds of the same conflicting property doesn't re-issue the same `UPDATE` hundreds of
+  times). This is a deliberate, minimal contract: Phase 9 surfaces the conflict for a human to look at, not
+  a type-coercion or rejection system.
+- **`PropertySchema.event_schema_id` stays nullable per its original shape in §4 ("nullable = event-
+  agnostic"), but Phase 9 does not populate that path.** Every property this phase registers is tied to a
+  specific event; a project-wide property catalog entry independent of any one event name is a real future
+  feature, not something this phase's DoD asked for.
+- **Routes nest under `/orgs/{org_id}/projects/{project_id}/schema/...`**, not the bare
+  `/api/v1/projects/{id}/schema/...` this section originally sketched -- the same correction Phase 5 already
+  made for API keys, applied consistently: resolving which org a bare `project_id` belongs to, before
+  there's org context to check membership, is the same problem every other project sub-resource's URL
+  shape already solves. `GET` (list events, list a event's properties) requires Viewer+; `PATCH` (deprecate/
+  hide an event, mark a property PII or change its status) requires Admin+, matching the API-keys precedent
+  for settings-shaped mutations. Both `PATCH` routes write an audit log entry in the same transaction as the
+  mutation (`pulse/registry/service.py`, not the router -- matching `pulse/services/api_keys.py`'s
+  convention of keeping the mutation and its audit record atomic).
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -526,8 +573,8 @@ enrichment; ☑ **`event_id` dedup**; ☑ large batched inserts; ☑ **DLQ**; �
 storage. Tests: idempotent re-consume (no double count); poison → DLQ; **worker crash mid-batch → no loss,
 no dup**; backpressure behavior. See §6.5.
 
-**Phase 9 — Schema registry.** ☐ auto-register new events/properties with inferred types; ☐ deprecate/hide;
-☐ mark PII. Tests: new event auto-registers; type-conflict flagged; unknown events still ingest.
+**Phase 9 — Schema registry.** ☑ auto-register new events/properties with inferred types; ☑ deprecate/hide;
+☑ mark PII. Tests: new event auto-registers; type-conflict flagged; unknown events still ingest. See §6.6.
 
 **Phase 10 — SDK.** ☐ TS SDK (`identify`/`track`/`page`) with local buffer, batched flush on
 interval/size/`beforeunload`, backoff retry, `event_id`; ☐ thin Python server SDK. Tests: offline buffering,
@@ -688,3 +735,19 @@ trace follows an event end to end.
   `/ingest` and watched the worker's very next cycle pick it up under a *different* batch id, with a numeric
   property (`19.99`) and a boolean property (`true`) stringified exactly per the documented convention, and
   confirmed both batches' raw JSON landed in the MinIO bucket. 70 tests pass (64 -> 70); `ruff`/`mypy` clean.
+- 2026-09-17 — Phase 9 — Added §6.6 (the schema registry mechanism: best-effort decoupling verified against
+  a *real* FK-violation failure live, not just simulated in tests; the process-lifetime cache design;
+  bool-before-number type-inference ordering; type conflicts flagged, never overwritten; the
+  event-agnostic-property path deliberately left unbuilt; and the Phase-5-precedent URL nesting correction).
+  New `pulse/models/schema_registry.py` (`EventSchema`, `PropertySchema`, RLS-protected), migration
+  `0007_schema_registry`, `pulse/registry/service.py` (`register_batch` -- the cache + get-or-create +
+  conflict detection + grouped volume bump -- plus the API-facing list/update functions), new router
+  `pulse/api/schema_registry.py`. `pulse/worker/processing.py` gained `ParsedEvent.raw_properties` (the
+  pre-stringification values Phase 8 never exposed) and a `register_events` call after each successful
+  insert. Verified live end-to-end: posted a real event with a number/bool/string/datetime property mix
+  through `/ingest`, watched the worker's next cycle register all four types correctly via
+  `GET .../schema/events/{id}/properties`, deprecated the event through the real `PATCH` endpoint and
+  confirmed it persisted -- and, unplanned but genuinely useful, watched the registry's best-effort
+  decoupling hold under an actual `ForeignKeyViolationError` from a backlog of events whose orgs/projects
+  no longer existed (dropped by an intervening `alembic downgrade base` between phases): every one of those
+  events still landed in ClickHouse correctly. 78 tests pass (70 -> 78); `ruff`/`mypy` clean.

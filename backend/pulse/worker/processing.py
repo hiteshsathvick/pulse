@@ -1,4 +1,5 @@
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -7,8 +8,11 @@ from clickhouse_connect.driver.asyncclient import AsyncClient
 from redis.asyncio import Redis
 
 from pulse.events.repository import insert_events
+from pulse.registry import service as registry
 from pulse.repositories import object_storage
 from pulse.worker.consumer import StreamEntry, ack
+
+logger = logging.getLogger("pulse.worker")
 
 PropertyValue = str | float | bool | None
 
@@ -36,6 +40,11 @@ class ParsedEvent:
     timestamp: datetime
     received_at: datetime
     properties: dict[str, str]
+    # The pre-stringification values, for the schema registry's type
+    # inference (Phase 9) -- `properties` above has already flattened
+    # everything to strings for ClickHouse's Map(String, String) column,
+    # which would make every property look like a "string" to the registry.
+    raw_properties: dict[str, PropertyValue]
 
 
 @dataclass
@@ -86,6 +95,7 @@ def parse_stream_entry(fields: dict[bytes, bytes]) -> ParsedEvent:
             timestamp=datetime.fromisoformat(decoded["timestamp"]),
             received_at=datetime.fromisoformat(decoded["received_at"]),
             properties=_stringify_properties(raw_properties),
+            raw_properties=raw_properties,
         )
     except (KeyError, ValueError, json.JSONDecodeError) as exc:
         raise PoisonEvent(str(exc)) from exc
@@ -137,6 +147,17 @@ async def push_to_dlq(
     await redis_client.xadd(dlq_stream_key, entry)  # type: ignore[arg-type]
 
 
+async def register_events(observations: list[registry.RegistryObservation]) -> None:
+    """Best-effort, by design (SPEC.md #6.6): the schema registry is pure
+    governance metadata layered on top of ingestion, never a gate on it. A
+    Postgres hiccup here must never cost a ClickHouse insert, an archive
+    write, or an ack -- so any failure is logged and swallowed, not raised."""
+    try:
+        await registry.register_batch(observations)
+    except Exception:
+        logger.exception("schema registry write failed for %d event(s)", len(observations))
+
+
 async def archive_batch(ingest_batch: uuid.UUID, raw_events: list[dict[str, str]]) -> None:
     """Archives the *entire* raw batch -- good and poison entries alike --
     as one JSON object, per SPEC.md #6.7's "raw event archive (replay/backfill
@@ -177,6 +198,7 @@ async def process_batch(
     fresh_event_ids: list[uuid.UUID] = []
     ack_ids: list[bytes] = []
     raw_archive: list[dict[str, str]] = []
+    observations: list[registry.RegistryObservation] = []
 
     for entry_id, fields in entries:
         ack_ids.append(entry_id)
@@ -195,10 +217,19 @@ async def process_batch(
 
         good_rows.append(to_clickhouse_row(parsed, ingest_batch))
         fresh_event_ids.append(parsed.event_id)
+        observations.append(
+            registry.RegistryObservation(
+                org_id=parsed.org_id,
+                project_id=parsed.project_id,
+                event_name=parsed.event_name,
+                raw_properties=parsed.raw_properties,
+            )
+        )
 
     if good_rows:
         await insert_events(clickhouse_client, good_rows)
         result.processed = len(good_rows)
+        await register_events(observations)
 
     await archive_batch(ingest_batch, raw_archive)
     await mark_seen(redis_client, fresh_event_ids, dedup_ttl_seconds)

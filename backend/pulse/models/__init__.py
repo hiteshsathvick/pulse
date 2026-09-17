@@ -6,6 +6,7 @@ from pulse.models.membership import Membership, MembershipRole
 from pulse.models.organization import Organization
 from pulse.models.project import Project
 from pulse.models.refresh_token import RefreshToken
+from pulse.models.schema_registry import EventSchema, PropertySchema, PropertyType, SchemaStatus
 from pulse.models.user import User
 
 __all__ = [
@@ -13,11 +14,15 @@ __all__ = [
     "ApiKeyType",
     "AuditLog",
     "Base",
+    "EventSchema",
     "Invite",
     "Membership",
     "MembershipRole",
     "Organization",
     "Project",
+    "PropertySchema",
+    "PropertyType",
     "RefreshToken",
+    "SchemaStatus",
     "User",
 ]

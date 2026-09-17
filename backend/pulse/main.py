@@ -12,6 +12,7 @@ from pulse.api.invites import invites_router, org_invites_router
 from pulse.api.keys import router as keys_router
 from pulse.api.orgs import router as orgs_router
 from pulse.api.projects import router as projects_router
+from pulse.api.schema_registry import router as schema_registry_router
 from pulse.core.config import get_settings
 from pulse.core.error_handlers import (
     http_exception_handler,
@@ -65,3 +66,4 @@ app.include_router(projects_router)
 app.include_router(org_invites_router)
 app.include_router(invites_router)
 app.include_router(keys_router)
+app.include_router(schema_registry_router)
