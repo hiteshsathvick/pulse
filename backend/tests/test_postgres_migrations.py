@@ -100,3 +100,22 @@ def test_audit_logs_migration_round_trips() -> None:
 
     command.downgrade(config, "base")
     assert not asyncio.run(_table_exists("audit_logs"))
+
+
+def test_api_keys_migration_round_trips() -> None:
+    """Phase 5's api_keys table, and the api_key_type enum it introduces --
+    downgrade must drop that type explicitly (op.drop_table alone doesn't),
+    or a second upgrade/downgrade cycle would fail with "already exists"."""
+    config = _alembic_config()
+
+    command.upgrade(config, "head")
+    assert asyncio.run(_table_exists("api_keys"))
+
+    command.downgrade(config, "base")
+    assert not asyncio.run(_table_exists("api_keys"))
+
+    # Round-trip twice: proves the enum type was actually cleaned up, not
+    # just the table.
+    command.upgrade(config, "head")
+    assert asyncio.run(_table_exists("api_keys"))
+    command.downgrade(config, "base")

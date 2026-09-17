@@ -4,7 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from pulse.api.dependencies import get_org_membership
+from pulse.api.dependencies import require_role
 from pulse.core.security import get_current_user
 from pulse.models import Invite, Membership, MembershipRole, User
 from pulse.services import invites as invites_service
@@ -58,9 +58,14 @@ def _invite_response(invite: Invite) -> InviteResponse:
 )
 async def create_invite(
     body: CreateInviteRequest,
-    membership: Membership = Depends(get_org_membership),
+    membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
     current_user: User = Depends(get_current_user),
 ) -> InviteCreatedResponse:
+    if body.role == MembershipRole.OWNER and membership.role != MembershipRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an owner can invite someone as an owner",
+        )
     try:
         invite, token = await invites_service.create_invite(
             membership.org_id, body.email, body.role, current_user.id
@@ -75,7 +80,7 @@ async def create_invite(
 
 @org_invites_router.get("", response_model=list[InviteResponse])
 async def list_invites(
-    membership: Membership = Depends(get_org_membership),
+    membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
 ) -> list[InviteResponse]:
     invites = await invites_service.list_invites(membership.org_id)
     return [_invite_response(i) for i in invites]
@@ -83,7 +88,8 @@ async def list_invites(
 
 @org_invites_router.delete("/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_invite(
-    invite_id: uuid.UUID, membership: Membership = Depends(get_org_membership)
+    invite_id: uuid.UUID,
+    membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
 ) -> None:
     revoked = await invites_service.revoke_invite(membership.org_id, invite_id, membership.user_id)
     if not revoked:

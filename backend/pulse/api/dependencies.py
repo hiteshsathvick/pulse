@@ -1,13 +1,21 @@
 import uuid
+from collections.abc import Callable, Coroutine
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 
 from pulse.core.security import get_current_user
-from pulse.models import Membership, MembershipRole, User
+from pulse.models import ApiKey, ApiKeyType, Membership, MembershipRole, User
 from pulse.repositories.postgres import session_scope
+from pulse.services import api_keys as api_keys_service
 
-_ELEVATED_ROLES = (MembershipRole.OWNER, MembershipRole.ADMIN)
+# OWNER > ADMIN > MEMBER > VIEWER (SPEC.md #4 / PULSE_PROJECT_GUIDE.md).
+_ROLE_RANK: dict[MembershipRole, int] = {
+    MembershipRole.VIEWER: 0,
+    MembershipRole.MEMBER: 1,
+    MembershipRole.ADMIN: 2,
+    MembershipRole.OWNER: 3,
+}
 
 
 async def get_org_membership(
@@ -26,14 +34,43 @@ async def get_org_membership(
     return membership
 
 
-def require_elevated_role(membership: Membership) -> None:
-    """Minimal role gating for destructive/elevating actions (delete org or
-    project, change a member's role, remove a member) -- not Phase 5's
-    systematic, declarative permission-dependency framework applied to
-    every endpoint, just enough that these specific actions aren't left
-    open to any member regardless of role in the meantime."""
-    if membership.role not in _ELEVATED_ROLES:
+def require_role(
+    minimum: MembershipRole,
+) -> Callable[[Membership], Coroutine[None, None, Membership]]:
+    """Dependency factory: the caller's role in this org must be at least
+    `minimum`. Use as `Depends(require_role(MembershipRole.ADMIN))` directly
+    in a route signature -- this is Phase 5's "permission checks as
+    dependencies", replacing Phase 4's single inline elevated-or-not check
+    with the full Owner > Admin > Member > Viewer matrix (SPEC.md #4.1)."""
+
+    async def _check(membership: Membership = Depends(get_org_membership)) -> Membership:
+        if _ROLE_RANK[membership.role] < _ROLE_RANK[minimum]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Requires at least the {minimum.value} role in this organization",
+            )
+        return membership
+
+    return _check
+
+
+async def require_write_key(x_api_key: str = Header(...)) -> ApiKey:
+    """For Phase 7's /ingest to depend on -- built now so the DoD's "write
+    keys can only ingest, read keys can only query" is real and tested
+    ahead of there being an actual ingest endpoint to attach it to."""
+    try:
+        return await api_keys_service.resolve_api_key(x_api_key, ApiKeyType.WRITE)
+    except api_keys_service.InvalidApiKey as exc:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Requires an owner or admin role in this organization",
-        )
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked write key"
+        ) from exc
+
+
+async def require_read_key(x_api_key: str = Header(...)) -> ApiKey:
+    """For Phase 11's query endpoints to depend on -- see require_write_key."""
+    try:
+        return await api_keys_service.resolve_api_key(x_api_key, ApiKeyType.READ)
+    except api_keys_service.InvalidApiKey as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked read key"
+        ) from exc

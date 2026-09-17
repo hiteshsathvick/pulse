@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
-from pulse.api.dependencies import get_org_membership, require_elevated_role
+from pulse.api.dependencies import get_org_membership, require_role
 from pulse.core.security import get_current_user
 from pulse.models import Membership, MembershipRole, Organization, User
 from pulse.repositories.postgres import session_scope
@@ -94,7 +94,8 @@ async def get_org(membership: Membership = Depends(get_org_membership)) -> OrgRe
 
 @router.patch("/{org_id}", response_model=OrgResponse)
 async def update_org(
-    body: UpdateOrgRequest, membership: Membership = Depends(get_org_membership)
+    body: UpdateOrgRequest,
+    membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
 ) -> OrgResponse:
     org = await orgs_service.update_organization(
         membership.org_id,
@@ -108,8 +109,7 @@ async def update_org(
 
 
 @router.delete("/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_org(membership: Membership = Depends(get_org_membership)) -> None:
-    require_elevated_role(membership)
+async def delete_org(membership: Membership = Depends(require_role(MembershipRole.OWNER))) -> None:
     deleted = await orgs_service.delete_organization(membership.org_id, membership.user_id)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Organization not found")
@@ -136,9 +136,17 @@ async def list_members(
 async def update_member_role(
     user_id: uuid.UUID,
     body: UpdateMemberRoleRequest,
-    membership: Membership = Depends(get_org_membership),
+    membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
 ) -> MemberResponse:
-    require_elevated_role(membership)
+    # Only an owner can mint another owner -- otherwise an admin could
+    # self-escalate by promoting an accomplice (or themselves, via a second
+    # account) to owner.
+    if body.role == MembershipRole.OWNER and membership.role != MembershipRole.OWNER:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an owner can grant the owner role",
+        )
+
     async with session_scope(org_id=membership.org_id) as session:
         target = await session.scalar(select(Membership).where(Membership.user_id == user_id))
         if target is None:
@@ -169,9 +177,9 @@ async def update_member_role(
 
 @router.delete("/{org_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_member(
-    user_id: uuid.UUID, membership: Membership = Depends(get_org_membership)
+    user_id: uuid.UUID,
+    membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
 ) -> None:
-    require_elevated_role(membership)
     async with session_scope(org_id=membership.org_id) as session:
         target = await session.scalar(select(Membership).where(Membership.user_id == user_id))
         if target is None:

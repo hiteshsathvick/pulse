@@ -83,9 +83,12 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **Organization** — `id, name, slug, retention_days (default), ...`
 - **Membership** — `id, org_id, user_id, role (owner|admin|member|viewer)`
 - **Project** — `id, org_id, name, slug, timezone` — the analytics unit and the write-key boundary.
-- **ApiKey** — `id, org_id, project_id (nullable), type (write|read), key_hash, scopes[], last_used_at,
+- **ApiKey** — `id, org_id, project_id, key_prefix, type (write|read), key_hash, created_by, last_used_at,
   revoked_at`. **Write keys** are public/client-side, append-only to their project. **Read keys** are
-  server-side, scoped to query.
+  server-side, scoped to query. As built in Phase 5: `project_id` is required, not nullable — every key
+  belongs to exactly one project; an org-wide read key spanning multiple projects has no consumer yet and
+  is deferred. `scopes[]` is likewise deferred until a concrete consumer (Phase 7/11) needs finer-grained
+  scoping than the type split already provides.
 - **EventSchema** (registry) — `id, org_id, project_id, event_name, status (active|deprecated|hidden),
   first_seen_at, volume_estimate`.
 - **PropertySchema** — `id, event_schema_id (nullable = event-agnostic), key, inferred_type
@@ -97,27 +100,29 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **AuditLog** — `id, org_id, actor_id, action, target, metadata (JSONB), created_at`.
 - **Billing** — `Subscription`, `UsageRecord (org_id, period, events_ingested, mtu)` (Stripe-linked).
 
-> As of Phase 4: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
-> listed above — see §6.2), `Invite` and `AuditLog` (Phase 4, added ahead of the table above's original
-> phase notes — see §4.1). The rest of this list is the full eventual shape; each remaining table is built
-> in the phase that needs it (`ApiKey` Phase 5, schema registry Phase 9, `Insight`/`Dashboard` Phase 15/16,
-> `Alert` Phase 19, `Billing` Phase 20).
+> As of Phase 5: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
+> listed above — see §6.2), `Invite` and `AuditLog` (Phase 4), `ApiKey` (Phase 5, ahead of this table's
+> original phase note — see §4.1). The rest of this list is the full eventual shape; each remaining table
+> is built in the phase that needs it (schema registry Phase 9, `Insight`/`Dashboard` Phase 15/16, `Alert`
+> Phase 19, `Billing` Phase 20).
 
-### 4.1 Row-Level Security mechanism (implemented Phase 2, extended Phase 3/4)
+### 4.1 Row-Level Security mechanism (implemented Phase 2, extended Phase 3/4/5)
 
 Of the four Phase 2 tables, only `Membership` and `Project` carry `org_id` and are RLS-protected;
 `User` is a global identity (which orgs it belongs to lives in `Membership`) and `Organization` *is* the
 tenant rather than referencing one, so neither is RLS-scoped itself.
 
-**The actual rule, refined by Phase 3/4:** RLS protects tables reached via a *browse-this-org's-data*
-pattern (`Membership`, `Project`, and now `AuditLog`) — it's defense-in-depth against an application bug
-that forgets to filter by `org_id`. It does **not** protect tables reached via *token redemption*
-(`RefreshToken`, `Invite`), even though `Invite` carries `org_id`: accepting an invite (or refreshing a
-session) means looking a row up by an opaque secret *before* the caller has any org context to scope a
-session by — the token itself is the security boundary there, not RLS. Listing invites for management
-(`GET /orgs/{id}/invites`) still explicitly filters by `org_id` in the query, reached only once the
-caller's membership in that org has already been confirmed by `get_org_membership` (§6.2-adjacent, see
-`pulse/api/dependencies.py`).
+**The actual rule, refined by Phase 3/4/5:** RLS protects tables reached via a *browse-this-org's-data*
+pattern (`Membership`, `Project`, `AuditLog`) — it's defense-in-depth against an application bug that
+forgets to filter by `org_id`. It does **not** protect tables reached via *token redemption*
+(`RefreshToken`, `Invite`, and now `ApiKey`), even though `Invite`/`ApiKey` carry `org_id`: accepting an
+invite, refreshing a session, or validating an API key on an ingest/query request (Phase 7/11) all mean
+looking a row up by an opaque secret *before* the caller has any org context to scope a session by — the
+token itself is the security boundary there, not RLS. `ApiKey` is the clearest case of this rule, since it
+also has a real management/browse need (`GET .../keys`) and still isn't RLS-protected: redemption happens
+on every future ingest/query request and correctness there matters most, so management queries just filter
+by `org_id`/`project_id` explicitly instead, reached only once `require_role` has confirmed the caller's
+membership.
 
 **Two GUCs, not one, as of Phase 4.** `app.current_org_id` (Phase 2) scopes the common case. A second,
 `app.current_user_id` GUC (migration 0004) exists purely for "which orgs am I in" (`GET /orgs`): normally
@@ -270,7 +275,9 @@ GET    /api/v1/auth/me
 CRUD   /api/v1/orgs, /orgs/{id}/projects, /orgs/{id}/members    # Phase 4
 CRUD   /api/v1/orgs/{id}/invites                                # Phase 4
 POST   /api/v1/invites/accept                                   # Phase 4
-CRUD   /api/v1/projects/{id}/keys                                # Phase 5 -- not built yet
+CRUD   /api/v1/orgs/{org_id}/projects/{project_id}/keys          # Phase 5 -- nested under orgs, not
+                                                                  # the bare /projects/{id}/keys shown
+                                                                  # above; see the Phase 5 changelog entry
 
 # Ingestion (write key)
 POST   /ingest                 # { batch: [ {event_id, event, user_id?, anonymous_id?, timestamp?, properties?} ] } -> 202
@@ -343,6 +350,37 @@ envelope wrapping every *successful* response body is not part of any phase's Do
   wrong-password floods. Exceeding it returns `429` with `code: "rate_limited"` (§6.1).
 - Register and login are separate calls — register never returns tokens, per the DoD's literal
   "signup → login → protected route" sequence.
+
+### 6.3 RBAC and API keys (implemented Phase 5)
+
+**Role matrix.** `Owner > Admin > Member > Viewer` (`pulse/api/dependencies.py`'s `_ROLE_RANK`), enforced
+via `Depends(require_role(minimum))` directly in route signatures — declarative, not an imperative check
+buried in a handler body, per the DoD's "permission dependency on every endpoint." Replaces Phase 4's
+single inline elevated-or-not check with a graduated matrix:
+
+| Action | Minimum role |
+|---|---|
+| View org/projects/members | Viewer |
+| Create/update project | Member |
+| Delete project | Admin |
+| Update org settings | Admin |
+| Invite/revoke invite, list invites | Admin |
+| Change member role, remove member | Admin |
+| Create/revoke API keys | Admin |
+| Delete org | Owner |
+
+Plus one guard beyond the table: granting the `owner` role — whether via `PATCH .../members/{id}` or by
+inviting someone directly as owner — itself requires the actor to already be an owner, closing an
+admin-self-escalation path (an admin promoting an accomplice, or a second account, to owner).
+
+**API keys.** Write keys (`pulse_write_<secret>`) and read keys (`pulse_read_<secret>`) are project-scoped,
+hashed at rest (SHA-256, like refresh tokens), shown in full exactly once at creation; only a short,
+non-secret `key_prefix` is retrievable afterward for display in a key list. `require_write_key`/
+`require_read_key` (`pulse/api/dependencies.py`) resolve a key from an `X-API-Key` header and reject a
+revoked key or the wrong type outright — built now, ahead of there being a real `/ingest` (Phase 7) or
+query endpoint (Phase 11) to attach them to, so the DoD's "write keys can only ingest, read keys can only
+query" is real and tested (`resolve_api_key` type-checks explicitly) rather than deferred untested to
+whichever phase happens to need it.
 
 ---
 
@@ -503,3 +541,13 @@ trace follows an event end to end.
   actions (delete, role change, removal) require an OWNER/ADMIN role via one small helper
   (`require_elevated_role`) — a deliberately minimal exception to "RBAC is Phase 5," since leaving those
   specific actions open to any member felt like an obvious gap not worth waiting on.
+- 2026-09-17 — Phase 5 — Added §6.3 (the role matrix: `require_role(minimum)` as a declarative dependency
+  factory replacing Phase 4's single `require_elevated_role`, plus the owner-can-only-be-granted-by-owner
+  guard). New `ApiKey` table/endpoints (`POST/GET /orgs/{id}/projects/{id}/keys`, `DELETE .../keys/{id}`),
+  documented as not RLS-protected per §4.1's refined token-redemption rule, despite also having a real
+  management/browse use — redemption on the future ingest/query hot path wins. Corrected §6's route for
+  keys from the bare `/projects/{id}/keys` shorthand to `/orgs/{id}/projects/{id}/keys`, consistent with
+  how every other project sub-resource is already nested (and necessary: resolving which org a bare
+  `project_id` belongs to, before there's org context to check membership, is the same problem invites'
+  URL shape already solves). `require_write_key`/`require_read_key` exist and are tested ahead of Phase
+  7/11 having a real endpoint to attach them to.
