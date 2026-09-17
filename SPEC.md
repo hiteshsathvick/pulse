@@ -193,7 +193,7 @@ query engine, so tenant scoping, caps, and validation are inherited for free.
 
 ## 5. Data model — event plane (ClickHouse)
 
-### 5.1 Raw events table
+### 5.1 Raw events table (implemented Phase 6)
 
 ```sql
 CREATE TABLE events
@@ -211,23 +211,38 @@ CREATE TABLE events
     -- platform   LowCardinality(String) DEFAULT properties['platform'],
     _ingest_batch UUID                            -- for replay/debug
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(received_at)
 PARTITION BY (org_id, toYYYYMM(timestamp))
-ORDER BY (org_id, project_id, event_name, timestamp)
+ORDER BY (org_id, project_id, event_name, timestamp, event_id)
 TTL toDateTime(timestamp) + INTERVAL 365 DAY      -- per-org override applied via config/materialized policy
 SETTINGS index_granularity = 8192;
 ```
 
 Design notes (be able to defend each in an interview):
-- **`ORDER BY (org_id, project_id, event_name, timestamp)`** matches the dominant filter and makes the
-  common query a bounded range scan. This is the single biggest performance lever.
+- **`ORDER BY (org_id, project_id, event_name, timestamp, event_id)`** matches the dominant filter and
+  makes the common query a bounded range scan. This is the single biggest performance lever.
 - **`PARTITION BY (org_id, toYYYYMM(...))`** isolates tenants and makes retention/TTL and per-tenant
   deletion cheap (drop parts, not row-by-row).
 - **`properties Map(String,String)`** gives schema flexibility with no migration per new property; hot
   properties get **promoted** to typed materialized columns for speed once the registry sees their volume.
 - **`LowCardinality`** on `event_name`/promoted enums shrinks storage and speeds group-bys.
-- **Dedup:** dedup on `event_id` at the worker (keep a short-TTL seen-set in Redis) and/or use a
-  `ReplacingMergeTree(received_at)` variant keyed by `event_id` as defense-in-depth. Document which and why.
+- **Dedup — resolved:** `ReplacingMergeTree(received_at)`, with `event_id` appended to `ORDER BY`. This is
+  more subtle than "keyed by `event_id`" sounds: `ReplacingMergeTree` doesn't dedupe by an arbitrary key —
+  it collapses rows sharing the *entire sorting key* during background merges. The dominant-filter `ORDER
+  BY` above has no `event_id` in it at all, so without appending it, two *different* events that happen to
+  share `(org_id, project_id, event_name, timestamp)` — a real possibility at any volume, e.g. two users
+  triggering the same named event in the same millisecond — would be silently collapsed into one, dropping
+  real data. Appending `event_id` as the trailing column fixes this: a true duplicate (an ingest worker's
+  retried batch) has an identical `event_id` and therefore an identical full sort key, so it still
+  collapses; two distinct events no longer can, no matter what else they share. The trailing position
+  doesn't hurt the dominant range-scan query pattern, since only the *leading* `ORDER BY` columns matter
+  for the sparse primary index.
+  This is a **background, eventual** safety net, not the real guarantee — merges run lazily, so a query
+  immediately after insert can still see duplicate rows (`OPTIMIZE ... FINAL` forces one, but is expensive
+  and not something a normal query path should ever call). The actual, synchronous idempotency guarantee
+  is Phase 8's ingestion-worker-level dedup (a short-TTL seen-set in Redis, checked *before* the insert
+  happens) — this table's `ReplacingMergeTree` engine is a backstop for whatever slips past that, not a
+  substitute for it.
 
 ### 5.2 Rollups (Phase 17)
 
@@ -551,3 +566,12 @@ trace follows an event end to end.
   `project_id` belongs to, before there's org context to check membership, is the same problem invites'
   URL shape already solves). `require_write_key`/`require_read_key` exist and are tested ahead of Phase
   7/11 having a real endpoint to attach them to.
+- 2026-09-17 — Phase 6 — Resolved §5.1's open dedup question: `ReplacingMergeTree(received_at)` with
+  `event_id` appended to `ORDER BY` (not just "keyed by `event_id`" as the pre-Phase-6 text put it) --
+  `ReplacingMergeTree` dedupes by the *entire* sorting key, and `event_id` wasn't in it, which would have
+  either missed true duplicates or (worse) silently collapsed distinct events that happen to share
+  `(org_id, project_id, event_name, timestamp)`. Documented the precedence this implies: this is a
+  background, eventual safety net, not the real guarantee -- that's Phase 8's synchronous, pre-insert
+  worker-level Redis dedup. Added the ClickHouse migration CLI (`python -m pulse.clickhouse_migrations`,
+  documented in `README.md`) -- the runner existed since Phase 1 but had never been given a real product
+  migration or a one-line way to invoke it, mirroring `alembic upgrade head` for the other store.

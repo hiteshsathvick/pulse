@@ -12,7 +12,8 @@ and architecture rationale. We build strictly phase-by-phase per `SPEC.md` §7.
 cd infra/docker
 cp .env.example .env
 docker compose up --build
-docker compose run --rm api alembic upgrade head   # first run only, until Phase 1's DoD grows a CI/deploy migration step
+docker compose run --rm api alembic upgrade head           # Postgres -- first run only, see below
+docker compose run --rm api python -m pulse.clickhouse_migrations  # ClickHouse -- first run only
 ```
 
 - Frontend: http://localhost:3000
