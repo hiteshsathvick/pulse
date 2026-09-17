@@ -438,6 +438,54 @@ tenant field at all, so there's nothing client-supplied to distrust.
   could ride on regardless of which endpoint a wide-open policy exposes. Hand-rolling a path-scoped CORS
   middleware to avoid that was rejected as reinventing preflight handling for no real security gain.
 
+### 6.5 Ingestion worker mechanism (implemented Phase 8)
+
+The only thing that ever writes to ClickHouse. Consumes `pulse:ingest:events` via a Redis Streams
+consumer group (`ingest-workers`), one fixed consumer name (`worker-1`) so a crashed-and-restarted worker
+naturally reclaims its own still-pending entries -- true multi-consumer takeover (`XCLAIM`) is deferred
+until something actually runs more than one worker replica.
+
+- **Two deferred/scoped-down pieces of the DoD's "registry validation + enrichment" bullet.** "Registry
+  validation" is a no-op: Phase 9's schema registry doesn't exist yet, so there is nothing to validate
+  against -- unknown events pass through unchanged, matching Phase 9's own future DoD wording ("unknown
+  events still ingest"). "Enrichment" is scoped to what Phase 7 actually captured: assigning `_ingest_batch`
+  per worker-processed batch (the column the `events` table already reserves "for replay/debug", and that
+  Phase 6's own fixture generator flagged as "like a real ingest worker's batch (Phase 8) would produce").
+  Geo/device-from-headers enrichment (mentioned in `PULSE_PROJECT_GUIDE.md`) is out of scope here -- Phase
+  7's `/ingest` never captured `User-Agent`/client IP into the stream entry in the first place, so there's
+  nothing to enrich from yet.
+- **One `XREADGROUP` call gives both the size and time trigger.** `BLOCK` (`worker_block_ms`, default 5000)
+  + `COUNT` (`worker_batch_size`, default 500) on a single call means a batch is whatever arrived within the
+  block window, up to the count cap -- no separate manual timer/accumulator loop needed. Each read cycle
+  first reclaims this consumer's own pending (unacked) entries via `id="0"`, and only reads new entries
+  (`id=">"`) once that backlog is empty -- the crash-recovery path.
+- **Correctness ordering is the crux of "no loss, no dup" under a crash.** Per event: parse (a parse
+  failure -> `PoisonEvent` -> DLQ, no further processing) -> a read-only dedup **check** against a Redis
+  seen-set to decide skip-vs-insert -> after the whole batch is classified, one bulk `insert_events` call
+  for the survivors -> archive the *entire* raw batch (good + poison) to object storage -> **mark** the
+  freshly-inserted event ids seen (TTL `worker_dedup_ttl_seconds`, default 24h) -> ack every entry. Marking
+  "seen" happens strictly *after* the insert, not before: if the worker dies in between, the redelivered
+  event is re-inserted rather than silently lost -- Phase 6's `ReplacingMergeTree(received_at)` is already
+  documented as exactly this backstop ("a background, eventual safety net... not a substitute for it"). If
+  the ClickHouse insert itself raises, the exception propagates out of `process_batch` *before* marking-seen
+  or acking; the caller (the main loop) logs it and leaves the batch pending for the next cycle -- that is
+  the backpressure behavior, and it requires no explicit retry/backoff logic of its own.
+- **The DLQ is a second Redis Stream** (`pulse:ingest:dlq`, `worker_dlq_stream_key`), not a new store --
+  reuses the same infrastructure and primitives as the main buffer. Each entry carries the original raw
+  fields plus `error` and `failed_at`. Poison entries are archived (as part of the raw batch) and acked
+  like any other entry -- DLQ'd is a terminal, handled outcome, not a reason to retry forever.
+- **Property values are stringified for ClickHouse's `Map(String, String)` column** using the exact
+  convention Phase 6's fixture generator already established: numbers via plain `str()`, booleans as
+  lowercase `"true"`/`"false"` (Python's own `str(True) == "True"` would silently break a later
+  `= 'true'`-style query), and a `null`-valued property is dropped from the map entirely (the column has no
+  null representation, so an absent key is the natural encoding).
+- **New dependency: `minio`** (the official sync S3/MinIO client -- no async SDK exists), wrapped in
+  `asyncio.to_thread` for both `ensure_bucket()` (idempotent, called on worker startup, mirroring
+  `alembic/env.py`'s `_ensure_app_role_exists`) and the per-batch archive write, so a slow object-storage
+  call doesn't stall the Streams consume loop. Archive object key:
+  `raw/{received_at:%Y/%m/%d}/{ingest_batch}.json`, one object per worker-processed batch (not per event),
+  containing the *entire* raw batch as read off the stream.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -473,10 +521,10 @@ round-trip. Tests: insert/read round-trip; org/project columns always present; p
 Streams, `202`; ☑ size limits + rate limit; ☑ browser CORS. Tests: batch buffered (nothing hits ClickHouse
 synchronously); oversized/malformed rejected; write-key scoping; p99 latency sanity. See §6.4.
 
-**Phase 8 — Ingestion workers.** ☐ consumer-group workers; ☐ batch by size/time; ☐ registry validation +
-enrichment; ☐ **`event_id` dedup**; ☐ large batched inserts; ☐ **DLQ**; ☐ raw-batch archive to object
+**Phase 8 — Ingestion workers.** ☑ consumer-group workers; ☑ batch by size/time; ☑ registry validation +
+enrichment; ☑ **`event_id` dedup**; ☑ large batched inserts; ☑ **DLQ**; ☑ raw-batch archive to object
 storage. Tests: idempotent re-consume (no double count); poison → DLQ; **worker crash mid-batch → no loss,
-no dup**; backpressure behavior.
+no dup**; backpressure behavior. See §6.5.
 
 **Phase 9 — Schema registry.** ☐ auto-register new events/properties with inferred types; ☐ deprecate/hide;
 ☐ mark PII. Tests: new event auto-registers; type-conflict flagged; unknown events still ingest.
@@ -625,3 +673,18 @@ trace follows an event end to end.
   the running `/ingest`, confirmed the event landed in the Redis stream with `org_id`/`project_id` correctly
   injected from the resolved key (never from the request body), and confirmed ClickHouse's `events` table
   stayed at zero rows throughout. 64 tests pass (52 -> 64); `ruff`/`mypy` clean.
+- 2026-09-17 — Phase 8 — Added §6.5 (the ingestion worker mechanism: which parts of "registry validation +
+  enrichment" are deferred/scoped-down and why, the single-`XREADGROUP` size+time trigger, the
+  check-before-insert/mark-after-insert ordering that makes the crash-recovery story correct, the DLQ as a
+  second Redis Stream, and the exact property-stringification convention). New `pulse/worker/consumer.py`
+  (consumer-group setup + read/ack), `pulse/worker/processing.py` (parse/dedup/insert/archive/DLQ, the
+  testable `process_batch` core), `pulse/repositories/object_storage.py` (new `minio` dependency); rewrote
+  the Phase 0 placeholder `pulse/worker/main.py` into the real consume loop. `infra/docker/docker-compose.yml`
+  gained a MinIO healthcheck (missing since Phase 0) and wired `S3_*` env vars + a `service_healthy`
+  dependency into `ingest-worker`. Verified live end-to-end, not just the test suite: brought up the real
+  worker against a genuine backlog of 206 events (accumulated in the real Redis stream across earlier
+  phases' test runs) and watched it drain the entire backlog in one batch on first startup, correctly
+  grouped under one `_ingest_batch` id, zero to the DLQ; then posted one fresh event through the real
+  `/ingest` and watched the worker's very next cycle pick it up under a *different* batch id, with a numeric
+  property (`19.99`) and a boolean property (`true`) stringified exactly per the documented convention, and
+  confirmed both batches' raw JSON landed in the MinIO bucket. 70 tests pass (64 -> 70); `ruff`/`mypy` clean.

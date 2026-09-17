@@ -1,0 +1,278 @@
+import asyncio
+import json
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+
+import clickhouse_connect
+import pytest
+
+from pulse.clickhouse_migrations.runner import migrate
+from pulse.core.config import get_settings
+from pulse.events.repository import query_events
+from pulse.repositories import object_storage
+from pulse.repositories.clickhouse import get_client as get_clickhouse_client
+from pulse.repositories.redis import get_client as get_redis_client
+from pulse.worker.consumer import ensure_consumer_group, read_batch
+from pulse.worker.processing import process_batch
+
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+_MIGRATIONS_DIR = _BACKEND_ROOT / "pulse" / "clickhouse_migrations" / "migrations"
+
+
+async def _with_fresh_clickhouse_client(body) -> None:
+    """Same short-lived-client pattern as test_events_clickhouse.py /
+    test_ingest_api.py -- a module-scoped fixture runs on a different event
+    loop than the per-test-function ones, so it must not touch the shared
+    get_client() singleton."""
+    settings = get_settings()
+    client = await clickhouse_connect.get_async_client(
+        host=settings.clickhouse_host,
+        port=settings.clickhouse_port,
+        username=settings.clickhouse_user,
+        password=settings.clickhouse_password,
+        database=settings.clickhouse_database,
+        secure=settings.clickhouse_secure,
+    )
+    try:
+        await body(client)
+    finally:
+        await client.close()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _events_table():
+    asyncio.run(_with_fresh_clickhouse_client(lambda client: migrate(client, _MIGRATIONS_DIR)))
+    yield
+
+    async def _teardown(client) -> None:
+        await client.command("DROP TABLE IF EXISTS events")
+        await client.command("ALTER TABLE schema_migrations DELETE WHERE version = 1")
+
+    asyncio.run(_with_fresh_clickhouse_client(_teardown))
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _bucket():
+    """Minio's client is sync (no event-loop binding), so unlike the
+    ClickHouse/Postgres fixtures above, ensure_bucket() is safe to call
+    module-scoped without a cross-loop hazard."""
+    asyncio.run(object_storage.ensure_bucket())
+
+
+def _stream_key() -> str:
+    return f"test:worker:stream:{uuid.uuid4().hex[:8]}"
+
+
+def _group() -> str:
+    return f"test-group-{uuid.uuid4().hex[:8]}"
+
+
+def _raw_fields(**overrides: str) -> dict[str, str]:
+    now = datetime.now(UTC).isoformat()
+    fields = {
+        "org_id": str(uuid.uuid4()),
+        "project_id": str(uuid.uuid4()),
+        "event_id": str(uuid.uuid4()),
+        "event_name": "button clicked",
+        "user_id": "user_1",
+        "anonymous_id": "",
+        "timestamp": now,
+        "received_at": now,
+        "properties": json.dumps({"platform": "web"}),
+    }
+    fields.update(overrides)
+    return fields
+
+
+async def _process(stream_key: str, group: str, entries) -> object:
+    settings = get_settings()
+    return await process_batch(
+        redis_client=get_redis_client(),
+        clickhouse_client=await get_clickhouse_client(),
+        entries=entries,
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+    )
+
+
+async def test_idempotent_reprocessing_does_not_double_count() -> None:
+    """DoD: idempotent re-consume -- the same physical entry processed twice
+    (as a redelivery after a crash would produce) must not double-count."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    fields = _raw_fields(org_id=str(org_id), project_id=str(project_id))
+    entry = (b"1-1", {k.encode(): v.encode() for k, v in fields.items()})
+
+    for _ in range(2):
+        await _process(stream_key, group, [entry])
+
+    ch_client = await get_clickhouse_client()
+    await ch_client.command("OPTIMIZE TABLE events FINAL")
+    rows = await query_events(ch_client, org_id, project_id)
+    assert len(rows) == 1
+
+
+async def test_poison_event_goes_to_dlq_and_is_acked_not_dropped() -> None:
+    """DoD: poison -> DLQ, never a silent drop."""
+    stream_key, group = _stream_key(), _group()
+    dlq_key = f"{stream_key}:dlq"
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    await redis_client.xadd(stream_key, _raw_fields(properties="not valid json"))
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    assert len(entries) == 1
+
+    result = await _process(stream_key, group, entries)
+
+    assert result.poisoned == 1
+    assert result.processed == 0
+
+    dlq_entries = await redis_client.xrange(dlq_key)
+    assert len(dlq_entries) == 1
+    _, dlq_fields = dlq_entries[0]
+    assert b"error" in dlq_fields
+    assert b"failed_at" in dlq_fields
+
+    pending = await redis_client.xpending(stream_key, group)
+    assert pending["pending"] == 0
+
+
+async def test_worker_crash_mid_batch_is_recovered_without_loss_or_dup() -> None:
+    """DoD: worker crash mid-batch -> no loss, no dup. Simulates a crash by
+    reading via XREADGROUP directly and never acking -- the entry sits in
+    the consumer's PEL exactly as it would after a real process death."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    settings = get_settings()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    await redis_client.xadd(
+        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
+    )
+
+    crashed_read = await redis_client.xreadgroup(
+        group, settings.worker_consumer_name, {stream_key: ">"}, count=10
+    )
+    assert crashed_read, "the 'crashed' worker must have actually read the entry once"
+
+    # Restart: the real read cycle reclaims this consumer's own pending
+    # entries before looking for anything new.
+    entries = await read_batch(
+        redis_client, stream_key, group, settings.worker_consumer_name, count=10, block_ms=100
+    )
+    assert len(entries) == 1
+
+    result = await _process(stream_key, group, entries)
+    assert result.processed == 1
+    assert result.acked == 1
+
+    pending = await redis_client.xpending(stream_key, group)
+    assert pending["pending"] == 0
+
+    ch_client = await get_clickhouse_client()
+    rows = await query_events(ch_client, org_id, project_id)
+    assert len(rows) == 1
+
+
+async def test_clickhouse_failure_leaves_batch_pending_not_lost() -> None:
+    """DoD: backpressure -- a ClickHouse outage must not lose or ack data;
+    the batch stays pending and succeeds once the store recovers."""
+    stream_key, group = _stream_key(), _group()
+    dlq_key = f"{stream_key}:dlq"
+    redis_client = get_redis_client()
+    settings = get_settings()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    await redis_client.xadd(
+        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
+    )
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+
+    class _BrokenClickHouse:
+        async def insert(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError("simulated ClickHouse outage")
+
+    with pytest.raises(RuntimeError):
+        await process_batch(
+            redis_client=redis_client,
+            clickhouse_client=_BrokenClickHouse(),  # type: ignore[arg-type]
+            entries=entries,
+            stream_key=stream_key,
+            group=group,
+            dlq_stream_key=dlq_key,
+            dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+        )
+
+    pending = await redis_client.xpending(stream_key, group)
+    assert pending["pending"] == 1, "a failed batch must not be acked"
+
+    entries_again = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    result = await _process(stream_key, group, entries_again)
+    assert result.processed == 1
+
+    ch_client = await get_clickhouse_client()
+    rows = await query_events(ch_client, org_id, project_id)
+    assert len(rows) == 1, "recovery must not have also double-inserted"
+
+
+async def test_batch_shares_one_ingest_batch_id_and_a_new_cycle_gets_a_new_one() -> None:
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    for _ in range(2):
+        await redis_client.xadd(
+            stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
+        )
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    assert len(entries) == 2
+
+    result = await _process(stream_key, group, entries)
+
+    ch_client = await get_clickhouse_client()
+    rows = await query_events(ch_client, org_id, project_id)
+    assert len(rows) == 2
+    assert {row["_ingest_batch"] for row in rows} == {result.ingest_batch}
+
+    await redis_client.xadd(
+        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
+    )
+    more_entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    result2 = await _process(stream_key, group, more_entries)
+    assert result2.ingest_batch != result.ingest_batch
+
+
+async def test_batch_is_archived_to_object_storage() -> None:
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    settings = get_settings()
+    await ensure_consumer_group(redis_client, stream_key, group)
+    await object_storage.ensure_bucket()
+
+    event_id = uuid.uuid4()
+    await redis_client.xadd(stream_key, _raw_fields(event_id=str(event_id)))
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+
+    result = await _process(stream_key, group, entries)
+
+    key = f"raw/{datetime.now(UTC):%Y/%m/%d}/{result.ingest_batch}.json"
+    client = object_storage.get_client()
+    response = await asyncio.to_thread(client.get_object, settings.s3_bucket, key)
+    try:
+        content = json.loads(response.read())
+    finally:
+        response.close()
+        response.release_conn()
+
+    assert len(content) == 1
+    assert content[0]["event_id"] == str(event_id)

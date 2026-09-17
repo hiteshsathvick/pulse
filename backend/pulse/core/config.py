@@ -53,6 +53,32 @@ class Settings(BaseSettings):
     # there's no CSRF surface for an open CORS policy to create.
     ingest_cors_allow_origins: list[str] = ["*"]
 
+    # Phase 8: the ingest-worker. A single, fixed consumer name (not one
+    # generated per process) so a crashed-and-restarted worker reclaims its
+    # own still-pending entries via XREADGROUP ... 0 -- true multi-replica
+    # consumer takeover (XCLAIM) is deferred until something actually runs
+    # more than one worker.
+    worker_consumer_group: str = "ingest-workers"
+    worker_consumer_name: str = "worker-1"
+    # BLOCK+COUNT on one XREADGROUP call gives both the size and time
+    # trigger the DoD asks for -- no separate manual timer/accumulator needed.
+    worker_batch_size: int = 500
+    worker_block_ms: int = 5000
+    # The synchronous idempotency guarantee (SPEC.md #5.1) -- generous
+    # relative to any realistic crash-recovery window; ClickHouse's
+    # ReplacingMergeTree is the backstop for whatever slips past it.
+    worker_dedup_ttl_seconds: int = 86_400
+    worker_dlq_stream_key: str = "pulse:ingest:dlq"
+
+    # Object storage (MinIO locally / S3-compatible in prod) -- the raw
+    # per-batch archive, per SPEC.md #6.7. Access/secret reuse the same
+    # dev-only credentials as every other store in this file.
+    s3_endpoint_url: str = "http://localhost:9002"
+    s3_access_key: str = "pulse"
+    s3_secret_key: str = "pulse12345"
+    s3_bucket: str = "pulse-raw-events"
+    s3_region: str = "us-east-1"
+
 
 @lru_cache
 def get_settings() -> Settings:
