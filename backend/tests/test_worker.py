@@ -192,9 +192,7 @@ async def test_worker_crash_mid_batch_is_recovered_without_loss_or_dup() -> None
     await ensure_consumer_group(redis_client, stream_key, group)
 
     org_id, project_id = uuid.uuid4(), uuid.uuid4()
-    await redis_client.xadd(
-        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
-    )
+    await redis_client.xadd(stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id)))
 
     crashed_read = await redis_client.xreadgroup(
         group, settings.worker_consumer_name, {stream_key: ">"}, count=10
@@ -230,9 +228,7 @@ async def test_clickhouse_failure_leaves_batch_pending_not_lost() -> None:
     await ensure_consumer_group(redis_client, stream_key, group)
 
     org_id, project_id = uuid.uuid4(), uuid.uuid4()
-    await redis_client.xadd(
-        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
-    )
+    await redis_client.xadd(stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id)))
     entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
 
     class _BrokenClickHouse:
@@ -282,9 +278,7 @@ async def test_batch_shares_one_ingest_batch_id_and_a_new_cycle_gets_a_new_one()
     assert len(rows) == 2
     assert {row["_ingest_batch"] for row in rows} == {result.ingest_batch}
 
-    await redis_client.xadd(
-        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
-    )
+    await redis_client.xadd(stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id)))
     more_entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
     result2 = await _process(stream_key, group, more_entries)
     assert result2.ingest_batch != result.ingest_batch
@@ -360,9 +354,7 @@ async def test_broken_registry_does_not_block_insert_archive_or_ack() -> None:
     await ensure_consumer_group(redis_client, stream_key, group)
 
     org_id, project_id = uuid.uuid4(), uuid.uuid4()  # deliberately not real rows
-    await redis_client.xadd(
-        stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id))
-    )
+    await redis_client.xadd(stream_key, _raw_fields(org_id=str(org_id), project_id=str(project_id)))
     entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
 
     result = await _process(stream_key, group, entries)

@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     s3_bucket: str = "pulse-raw-events"
     s3_region: str = "us-east-1"
 
+    # Phase 11: the query engine. Caps are enforced as ClickHouse query
+    # settings, not a separate application-level timeout layer -- ClickHouse's
+    # own enforcement is the real boundary here.
+    query_max_execution_time_seconds: int = 10
+    query_max_rows_to_read: int = 10_000_000
+    query_result_limit: int = 10_000
+    # Short: query results are cached per exact (spec, org, project), so a
+    # short TTL still absorbs the common case (a dashboard re-rendering,
+    # someone re-running the same trend) without serving badly stale numbers.
+    query_cache_ttl_seconds: int = 60
+
 
 @lru_cache
 def get_settings() -> Settings:

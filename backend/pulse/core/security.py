@@ -78,3 +78,22 @@ async def get_current_user(
     if user is None or not user.is_active:
         raise unauthorized
     return user
+
+
+async def get_current_user_optional(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> User | None:
+    """Like get_current_user, but returns None instead of raising. For
+    Phase 11's query routes, which accept *either* a JWT or a read API key
+    (SPEC.md #6) -- a missing/invalid JWT isn't an error there if a valid
+    key was supplied instead; the combined dependency in
+    pulse/api/dependencies.py is what actually enforces one-or-the-other."""
+    if credentials is None:
+        return None
+    try:
+        user_id = decode_access_token(credentials.credentials)
+    except InvalidAccessToken:
+        return None
+    async with session_scope() as session:
+        user = await session.get(User, user_id)
+    return user if user is not None and user.is_active else None

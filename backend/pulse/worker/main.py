@@ -41,9 +41,7 @@ async def run_cycle() -> None:
         # Not acked -- entries stay pending and are reclaimed next cycle.
         # This is the backpressure behavior: a ClickHouse (or object-storage)
         # outage backs the stream up instead of losing or dropping data.
-        logger.exception(
-            "batch processing failed, %d entries remain pending", len(entries)
-        )
+        logger.exception("batch processing failed, %d entries remain pending", len(entries))
         return
 
     logger.info(

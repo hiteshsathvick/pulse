@@ -186,9 +186,9 @@ async def test_type_conflict_is_flagged_but_original_type_is_preserved() -> None
         ]
     )
     properties_after = await list_properties(org_id, events[0].id)
-    assert properties_after[0].inferred_type == PropertyType.NUMBER, (
-        "original type is not overwritten"
-    )
+    assert (
+        properties_after[0].inferred_type == PropertyType.NUMBER
+    ), "original type is not overwritten"
     assert properties_after[0].type_conflict_detected_at is not None
 
 

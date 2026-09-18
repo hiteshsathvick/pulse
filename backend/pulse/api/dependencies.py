@@ -4,10 +4,11 @@ from collections.abc import Callable, Coroutine
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy import select
 
-from pulse.core.security import get_current_user
+from pulse.core.security import get_current_user, get_current_user_optional
 from pulse.models import ApiKey, ApiKeyType, Membership, MembershipRole, User
 from pulse.repositories.postgres import session_scope
 from pulse.services import api_keys as api_keys_service
+from pulse.services import projects as projects_service
 
 # OWNER > ADMIN > MEMBER > VIEWER (SPEC.md #4 / PULSE_PROJECT_GUIDE.md).
 _ROLE_RANK: dict[MembershipRole, int] = {
@@ -74,3 +75,38 @@ async def require_read_key(x_api_key: str = Header(...)) -> ApiKey:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked read key"
         ) from exc
+
+
+async def resolve_query_scope(
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    x_api_key: str | None = Header(None),
+    current_user: User | None = Depends(get_current_user_optional),
+) -> None:
+    """SPEC.md #6: query endpoints accept *either* a JWT (console user) or a
+    read API key (server-side) -- every other endpoint so far has used
+    exactly one mechanism. An X-API-Key header takes precedence when
+    present (it must be a valid read key scoped to exactly this project);
+    otherwise falls back to the same JWT + membership check every other
+    org-scoped route uses. A write key here is rejected the same way a read
+    key is rejected on /ingest -- read keys can only query, write keys can
+    only ingest."""
+    if x_api_key is not None:
+        try:
+            api_key = await api_keys_service.resolve_api_key(x_api_key, ApiKeyType.READ)
+        except api_keys_service.InvalidApiKey as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or revoked read key"
+            ) from exc
+        if api_key.org_id != org_id or api_key.project_id != project_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        return
+
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required"
+        )
+
+    await get_org_membership(org_id, current_user)  # raises 404 if not a member
+    if await projects_service.get_project(org_id, project_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
