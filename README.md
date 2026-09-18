@@ -33,6 +33,23 @@ cd infra/docker
 docker compose run --rm api pytest -v
 ```
 
+## Frontend
+
+The console (shell, auth, org/project switcher -- see `SPEC.md` §7 Phase 14) runs against the API's
+host-published port directly from the browser, not through Next.js's own server -- set
+`NEXT_PUBLIC_API_URL` if the API isn't at the default `http://localhost:8000`.
+
+```bash
+cd frontend
+npm install
+npm run dev            # http://localhost:3000, needs the backend stack running (see above)
+npm run lint
+npm run typecheck
+npm test               # component tests (Vitest + Testing Library)
+npm run test:e2e       # Playwright flows -- needs the full docker-compose stack AND `npm run dev`
+                        # running locally; not wired into CI yet (see playwright.config.ts)
+```
+
 ## Ingestion SDKs
 
 Two standalone packages, not linked into the rest of the monorepo via a workspace:

@@ -703,6 +703,68 @@ generated dynamically -- fragile and unbounded. Instead, following the same spli
 - **All three insight kinds (trend/funnel/retention) are now built** -- `InsightSpec` is the complete set
   SPEC.md #4.2 originally sketched.
 
+### 6.11 Frontend foundation mechanism (implemented Phase 14)
+
+The first frontend phase -- nothing existed beyond Phase 0's placeholder scaffold (a bare `app/`, a
+server-rendered health check on `/`). Ported the portable pieces of Helix's own frontend shell (a sibling
+project, `ALL PROJECTS/helix`, explicitly named as portable in `PULSE_PROJECT_GUIDE.md`'s Phase 14 entry)
+rather than building from scratch, adapted where pulse's actual backend shape differs.
+
+- **Session persistence deviates from Helix's own pattern, because the backend shape differs.** Helix's
+  `/auth/refresh` reads an httpOnly cookie the backend itself sets; pulse's (`SPEC.md` §6.2, built Phase
+  3) returns the refresh token in the JSON response body instead -- there's no cookie mechanism to read at
+  all. Confirmed with the user before building: the access token stays in-memory only (never persisted, as
+  in Helix), but the refresh token now persists in `localStorage`
+  (`src/lib/refresh-token-storage.ts`) so a page reload can silently recover a session -- the trade-off
+  (more XSS-exposed than an httpOnly cookie) is deliberate and documented, not accidental. Verified live,
+  not just in the component tests: registered and logged in through the real running API, confirmed the
+  session survives both a plain reload and a fresh deep link straight to a nested
+  `/orgs/[orgId]/projects/[projectId]` route, and confirmed logout clears the stored token and redirects to
+  `/login`.
+- **No server-side "active org" concept, unlike Helix's `user.active_org_id` + `POST /orgs/{id}/switch`.**
+  Pulse's own API has no such endpoint -- which org/project you're looking at is purely the URL's own
+  `/orgs/[orgId]/projects/[projectId]` segments (`OrgProjectSwitcher`, two plain `<select>`s driven by the
+  real `GET /orgs` and `GET /orgs/{org_id}/projects`, not a fancier menu component). This mirrors the
+  backend's own URL nesting convention rather than inventing a separate frontend-only org model.
+- **Scope deliberately stops at proving the shell, not building every feature it could wrap.** Confirmed
+  with the user first: since no frontend page existed before this phase, "wrapping existing features"
+  (the DoD's own wording) meant login/register, an org list/create page, a project list/create page, and a
+  minimal project-home placeholder -- enough to prove auth routing, the switcher, and deep-linking all
+  resolve correctly end to end. Schema registry, API keys, and insight/dashboard UIs are real, already-built
+  backend features with no frontend yet, but building pages for them here would blur into Phase 15/16/19's
+  own scope rather than this phase's "foundation."
+- **A real, pre-existing bug was found and fixed, not introduced by this phase:** Phase 0's
+  `eslint.config.mjs` used the old `FlatCompat({...}).extends("next/core-web-vitals", "next/typescript")`
+  shim for eslintrc-style shareable configs, which throws `TypeError: Converting circular structure to
+  JSON` under `eslint-config-next` 16's plugin set -- reproduced against the untouched Phase 0 scaffold
+  (via `git stash`) before writing the fix, confirming it wasn't something this phase's own changes caused.
+  Fixed by importing `eslint-config-next`'s native flat configs directly
+  (`eslint-config-next/core-web-vitals`, `eslint-config-next/typescript`), the modern replacement for the
+  legacy shim.
+- **A second real bug, this time surfaced by the new lint rule itself:** `eslint-config-next` 16 ships
+  `eslint-plugin-react-hooks` 7, whose `set-state-in-effect` rule flagged a synchronous `setInitializing`
+  call in the session-recovery effect's no-stored-token branch. Fixed by routing every branch through the
+  same promise chain (a `Promise.resolve(null)` sentinel for "nothing to recover") so `setInitializing`
+  only ever runs inside `.finally()`, matching the pattern the other branches already used -- not a
+  suppression, a genuine restructure.
+- **A third bug, found only by actually running the app against the real stack, not by any test:** the
+  running `docker-api-1` container's Postgres had never had `alembic upgrade head` run against it (a
+  side effect of this session's earlier Docker Desktop instability, unrelated to this phase's own code),
+  which surfaced in the browser as a confusing "blocked by CORS policy" console error -- the real cause was
+  a `500` on `/auth/register` with no `Access-Control-Allow-Origin` header on the *error* response, which
+  Chrome reports as a CORS failure regardless of the actual server-side cause. A reminder that a CORS error
+  in the browser console is a symptom, not necessarily a CORS *configuration* problem -- confirmed by
+  `curl`ing the endpoint directly and reading the real traceback server-side before assuming the
+  documented-as-wide-open CORS policy (`SPEC.md` §6.4) was somehow misconfigured.
+- **Testing is split three ways, each verified for real:** Vitest + Testing Library component tests
+  (`ProtectedRoute`, `GuestRoute`, `AppShell`, `OrgProjectSwitcher`, the storage helper) wired into a new
+  CI job (`test-frontend`, mirroring Phase 10's `test-sdk-js` precedent); two Playwright e2e flows
+  (register→login→org picker with a reload, and create-org→create-project→project-home) run and verified
+  locally against the real docker-compose stack and a real `next dev` server, kept out of CI for now per
+  the user's confirmed scope decision (`playwright.config.ts` documents why); and the full flow was also
+  driven manually through the built-in browser tool end to end as a final check, which is what actually
+  caught the CORS/migrations bug above -- none of the automated tests would have.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -760,8 +822,8 @@ Tests: ordering enforced; window boundaries; **hand-computed fixture funnel matc
 **Phase 13 — Retention.** ☑ cohort grids + curve, built on the same shared query-building layer.
 Tests: cohort assignment; day/week bucketing; **hand-computed retention fixture matches**. See §6.10.
 
-**Phase 14 — Frontend foundation.** ☐ shell/nav/design system/data layer/auth routing/org+project switcher.
-Tests: components + a couple of Playwright flows.
+**Phase 14 — Frontend foundation.** ☑ shell/nav/design system/data layer/auth routing/org+project switcher.
+Tests: components + a couple of Playwright flows. See §6.11.
 
 **Phase 15 — Insight builder + charts.** ☐ builder with schema-driven autocomplete; ☐ line/bar/table +
 funnel + retention viz; ☐ save insights. Tests: builder emits valid specs; each result type renders; saved
@@ -1015,3 +1077,25 @@ trace follows an event end to end.
   (including a user retained only after the query range's own `to`, proving the window-widening works, not
   just that it compiles), a day-bucketing grid, the `return_event == born_event` case, and a dedicated
   retention tenant-leakage test.
+- 2026-09-18 — Phase 14 — Added §6.11 (the frontend foundation mechanism): session persistence deviates
+  from Helix's httpOnly-cookie pattern to a localStorage-persisted refresh token, confirmed with the user
+  first, because pulse's own `/auth/refresh` (unlike Helix's) returns the refresh token in the JSON body,
+  not a cookie; no server-side "active org" concept, unlike Helix's `active_org_id` + `/switch` endpoint --
+  the org/project switcher is purely URL-driven, mirroring the backend's own nesting; scope confirmed with
+  the user as shell+auth+switcher+minimal proof-of-concept pages only, not full CRUD for every existing
+  backend feature. New `frontend/src/` tree (`lib/{api,auth-api,auth-context,orgs-api,projects-api,
+  query-client,refresh-token-storage}.ts(x)`, `components/{ui/*,ProtectedRoute,GuestRoute,AppShell,
+  OrgProjectSwitcher}.tsx`, `app/{login,register,orgs,orgs/[orgId]/projects,
+  orgs/[orgId]/projects/[projectId]}` routes); restructured `app/` under `src/app/` to match. New CI job
+  `test-frontend` (lint/typecheck/vitest); Playwright e2e flows written and verified locally, deliberately
+  kept out of CI this phase (confirmed with the user). Three real bugs found and fixed, none of them this
+  phase's own regressions: a pre-existing Phase-0 ESLint config bug (the old `FlatCompat` eslintrc shim
+  throws under `eslint-config-next` 16, reproduced against the untouched scaffold via `git stash` before
+  fixing it with the native flat-config imports); a genuine `react-hooks/set-state-in-effect` violation in
+  the session-recovery effect, fixed by routing every branch through one promise chain instead of a
+  synchronous early-return `setState`; and a confusing browser-reported "CORS policy" error that was
+  actually an unrelated `500` on `/auth/register` because the running `docker-api-1` container's Postgres
+  had never had `alembic upgrade head` run against it (fallout from this session's earlier Docker Desktop
+  instability, unrelated to any code in this phase) -- found only by driving the real app through the
+  built-in browser end to end, not by any automated test. 13 new component/unit tests pass;
+  lint/typecheck/`npm run build` all clean; both Playwright flows pass locally against the real stack.
