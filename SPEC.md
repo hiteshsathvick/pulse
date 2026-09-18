@@ -578,6 +578,45 @@ packages -- no npm workspace links `sdk-js` to `frontend/`, and `sdk-python` is 
   plain `docker run` step instead of a `services:` entry. New `test-sdk-js` and `test-sdk-python` CI
   jobs (typecheck/test/build for one, ruff/mypy/pytest for the other).
 
+### 6.8 Query engine mechanism (implemented Phase 11)
+
+The read path's only entry point into ClickHouse: a validated `TrendSpec` compiles to parameterized SQL
+with tenant scope, caps, and a cache layer wrapped around it -- never hand-built SQL at a call site.
+
+- **`org_id`/`project_id` are function parameters to `build_trend_query`, not fields on the spec at
+  all.** `TrendSpec` (`pulse/query/spec.py`) has no tenant field for a client to populate or a bug to
+  forget to filter by -- SPEC.md #3's "tenant scope is injected, never trusted" enforced by the type
+  itself, not just by convention at the call site.
+- **Every client-controlled value is a named ClickHouse parameter, never string-interpolated** -- event
+  names, filter keys/values, the breakdown key, the resolved timezone, even the measure's property key.
+  `pulse/query/builder.py` builds `WHERE`/`GROUP BY`/`SELECT` as SQL *fragments* referencing
+  `{param:Type}` placeholders; the actual values travel separately via `clickhouse-connect`'s
+  `parameters=`.
+- **Caps are ClickHouse query settings, not an application-level timeout wrapper**
+  (`query_max_execution_time_seconds`, `query_max_rows_to_read`, `query_result_limit` in
+  `pulse/core/config.py`) -- ClickHouse's own enforcement is the real boundary, matching CLAUDE.md §5's
+  "every ClickHouse query carries `max_execution_time`, row/scan caps, and a `LIMIT`."
+- **Timezone bucketing, not the `WHERE` bound, is where timezone-aware SQL actually matters.** The range
+  bound is converted to UTC once in Python (`_utc_bounds`, inclusive of both calendar dates in the
+  resolved timezone -- `to` extends through the end of that local day); the `GROUP BY` bucket expression
+  (`toStartOf<granularity>(timestamp, {tz:String})`) is the one place ClickHouse itself does timezone
+  work, per SPEC.md #5.3's "store UTC, bucket with tz -- never bucket on raw UTC."
+- **Query routes accept either a JWT or a read API key, the first endpoint to need both at once.**
+  `get_current_user_optional` (`pulse/core/security.py`) is `get_current_user` without the raise; the
+  combined check lives in `resolve_query_scope` (`pulse/api/dependencies.py`), not spread across the
+  route -- an `X-API-Key` header takes precedence when present (validated as a **read** key scoped to
+  exactly this project, the same read/write split Phase 5 already enforces for `/ingest`), otherwise
+  falls back to the JWT + membership check every other org-scoped route uses.
+- **Result caching is keyed by `(spec, org_id, project_id)`, not by a hand-rolled cache key.** A validated
+  Pydantic model's own `model_dump_json()` is already deterministic for equivalent input (field order
+  follows the model's declaration, not the client's), so `pulse/query/cache.py` just SHA-256s that
+  string plus the tenant IDs -- no separate canonicalization step. TTL is short
+  (`query_cache_ttl_seconds`, default 60s) on purpose: short enough to serve the common case (a dashboard
+  re-rendering, someone re-running the same trend) without returning badly stale numbers, per CLAUDE.md
+  §6's "cache query results in Redis with a short TTL."
+- **Only `trend` is built this phase.** `funnel`/`retention` specs exist in SPEC.md #4.2's shape sketch
+  but have no builder yet -- that's Phase 12/13's own job, reusing this same parameterization discipline.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -625,9 +664,9 @@ no dup**; backpressure behavior. See §6.5.
 interval/size/`beforeunload`, backoff retry, `event_id`; ☑ thin Python server SDK. Tests: offline buffering,
 flush triggers, retry/idempotency, no loss on unload. See §6.7.
 
-**Phase 11 — Query engine + trends.** ☐ spec→SQL builder with **org/project injected**, caps, timeouts; ☐
+**Phase 11 — Query engine + trends.** ☑ spec→SQL builder with **org/project injected**, caps, timeouts; ☑
 Redis result cache. Tests: spec→SQL correctness; **tenant-leakage tests**; tz-correct bucketing; cache
-hit/miss.
+hit/miss. See §6.8.
 
 **Phase 12 — Funnels.** ☐ `windowFunnel`-based; ☐ per-step counts + conversion/drop-off; ☐ breakdown.
 Tests: ordering enforced; window boundaries; **hand-computed fixture funnel matches exactly**.
@@ -831,3 +870,16 @@ trace follows an event end to end.
   adding `DATABASE_BOOTSTRAP_URL` (superuser, for `alembic/env.py`'s one-time role-creation step) to
   the `test` job's env, matching every other environment's convention. Full 78-test suite re-verified
   green under the corrected role -- nothing else had been quietly depending on the bypass.
+- 2026-09-18 — Phase 11 — Added §6.8 (the query engine mechanism: tenant scope as a function parameter
+  rather than a spec field, every client-controlled value as a named ClickHouse parameter, caps as
+  ClickHouse query settings rather than an app-level timeout, UTC-bound-but-tz-bucketed range handling,
+  the dual JWT-or-read-key auth path, and the spec+tenant-keyed cache). New `pulse/query/` module
+  (`spec.py`: `TrendSpec` and its nested filter/range/measure shapes; `builder.py`: `build_trend_query`;
+  `cache.py`: `cache_key`/`get_cached`/`set_cached`; `service.py`: `run_trend`, the cache-then-ClickHouse
+  orchestration), new router `pulse/api/query.py` (`POST .../query/trend`). `pulse/core/security.py`
+  gained `get_current_user_optional`; `pulse/api/dependencies.py` gained `resolve_query_scope`, the
+  either-JWT-or-read-key check. Four new `query_*` settings in `pulse/core/config.py`. 98 tests pass (78
+  -> 98, +10 query-builder unit tests, +5 query-engine integration tests); `ruff`/`mypy` clean. Verified
+  via the full local suite against the real containers (ClickHouse/Postgres/Redis), not mocks --
+  tenant-leakage, timezone bucketing, and cache hit/miss all exercised against genuine inserted events,
+  not fixtures standing in for the store.
