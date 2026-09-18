@@ -4,8 +4,22 @@ from datetime import date
 import pytest
 
 from pulse.core.config import Settings
-from pulse.query.builder import build_trend_query, parse_measure, resolve_timezone
-from pulse.query.spec import DateRange, Filter, FilterOp, Granularity, TrendSpec
+from pulse.query.builder import (
+    build_funnel_query,
+    build_trend_query,
+    parse_measure,
+    resolve_timezone,
+    window_seconds,
+)
+from pulse.query.spec import (
+    DateRange,
+    Filter,
+    FilterOp,
+    FunnelSpec,
+    FunnelWindow,
+    Granularity,
+    TrendSpec,
+)
 
 
 def _settings() -> Settings:
@@ -139,3 +153,87 @@ def test_range_bounds_are_converted_to_utc_from_the_project_timezone() -> None:
     end = built.parameters["range_end"]
     assert start.isoformat() == "2026-08-01T04:00:00+00:00"  # type: ignore[union-attr]
     assert end.isoformat() == "2026-08-02T04:00:00+00:00"  # type: ignore[union-attr]
+
+
+def _funnel_spec(**overrides: object) -> FunnelSpec:
+    payload: dict[str, object] = {
+        "kind": "funnel",
+        "steps": [
+            {"event": "signed up"},
+            {"event": "added to cart"},
+            {"event": "checkout completed"},
+        ],
+        "window": {"value": 7, "unit": "day"},
+        "range": {"from": "2026-08-01", "to": "2026-08-31"},
+    }
+    payload.update(overrides)
+    return FunnelSpec.model_validate(payload)
+
+
+def test_window_seconds_converts_hour_and_day_units() -> None:
+    assert window_seconds(FunnelWindow(value=2, unit="hour")) == 7200
+    assert window_seconds(FunnelWindow(value=7, unit="day")) == 604_800
+
+
+def test_funnel_org_and_project_are_always_injected_as_parameters() -> None:
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    built = build_funnel_query(_funnel_spec(), org_id, project_id, "UTC", _settings())
+
+    assert "org_id = {org_id:UUID}" in built.sql
+    assert "project_id = {project_id:UUID}" in built.sql
+    assert built.parameters["org_id"] == str(org_id)
+    assert built.parameters["project_id"] == str(project_id)
+    assert built.parameters["events"] == ["signed up", "added to cart", "checkout completed"]
+
+
+def test_funnel_steps_compile_to_windowfunnel_conditions_in_order() -> None:
+    """Ordering enforced: the step conditions must appear in the same order
+    as the spec's steps, as positional windowFunnel arguments -- swapping
+    two conditions changes which sequence of events counts as progress."""
+    built = build_funnel_query(_funnel_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings())
+
+    assert "windowFunnel({window_seconds:UInt64})" in built.sql
+    assert (
+        "(toDateTime(timestamp), event_name = {step_0_event:String}, "
+        "event_name = {step_1_event:String}, event_name = {step_2_event:String})" in built.sql
+    )
+    assert built.parameters["step_0_event"] == "signed up"
+    assert built.parameters["step_1_event"] == "added to cart"
+    assert built.parameters["step_2_event"] == "checkout completed"
+
+
+def test_funnel_window_seconds_is_a_parameter_not_interpolated() -> None:
+    built = build_funnel_query(
+        _funnel_spec(window={"value": 2, "unit": "hour"}),
+        uuid.uuid4(),
+        uuid.uuid4(),
+        "UTC",
+        _settings(),
+    )
+    assert built.parameters["window_seconds"] == 7200
+    assert "{window_seconds:UInt64}" in built.sql
+
+
+def test_funnel_filters_are_parameterized_never_interpolated() -> None:
+    spec = _funnel_spec(
+        filters=[{"key": "platform", "op": "eq", "value": "'; DROP TABLE events; --"}]
+    )
+    built = build_funnel_query(spec, uuid.uuid4(), uuid.uuid4(), "UTC", _settings())
+
+    assert "DROP TABLE" not in built.sql
+    assert built.parameters["filter_0_value"] == "'; DROP TABLE events; --"
+
+
+def test_funnel_breakdown_groups_the_inner_and_outer_query_by_it() -> None:
+    spec = _funnel_spec(breakdown="utm_source")
+    built = build_funnel_query(spec, uuid.uuid4(), uuid.uuid4(), "UTC", _settings())
+
+    assert "properties[{breakdown_key:String}] AS breakdown" in built.sql
+    assert "GROUP BY uid, breakdown" in built.sql
+    assert "GROUP BY level, breakdown" in built.sql
+    assert built.parameters["breakdown_key"] == "utm_source"
+
+
+def test_funnel_caps_are_passed_as_clickhouse_query_settings() -> None:
+    built = build_funnel_query(_funnel_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings())
+    assert built.settings == {"max_execution_time": 10, "max_rows_to_read": 1_000_000}

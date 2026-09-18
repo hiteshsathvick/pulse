@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from pulse.core.config import Settings
-from pulse.query.spec import FilterOp, Granularity, TrendSpec
+from pulse.query.spec import Filter, FilterOp, FunnelSpec, FunnelWindow, Granularity, TrendSpec
 
 
 @dataclass
@@ -82,6 +82,40 @@ def _filter_clause(index: int, op: FilterOp, parameters: dict[str, object]) -> s
     raise ValueError(f"unknown filter op: {op}")
 
 
+def _tenant_and_range_where(
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    events: list[str],
+    range_start: datetime,
+    range_end: datetime,
+    parameters: dict[str, object],
+) -> list[str]:
+    """The predicates every query type shares: tenant scope always
+    injected (SPEC.md #3), restricted to the event names the spec actually
+    needs, bounded to the resolved UTC range."""
+    parameters["org_id"] = str(org_id)
+    parameters["project_id"] = str(project_id)
+    parameters["events"] = events
+    parameters["range_start"] = range_start
+    parameters["range_end"] = range_end
+    return [
+        "org_id = {org_id:UUID}",
+        "project_id = {project_id:UUID}",
+        "event_name IN {events:Array(String)}",
+        "timestamp >= {range_start:DateTime64(3)}",
+        "timestamp < {range_end:DateTime64(3)}",
+    ]
+
+
+def _apply_filters(
+    filters: list[Filter], where_clauses: list[str], parameters: dict[str, object]
+) -> None:
+    for index, filter_ in enumerate(filters):
+        parameters[f"filter_{index}_key"] = filter_.key
+        parameters[f"filter_{index}_value"] = filter_.value
+        where_clauses.append(_filter_clause(index, filter_.op, parameters))
+
+
 def build_trend_query(
     spec: TrendSpec,
     org_id: uuid.UUID,
@@ -100,27 +134,11 @@ def build_trend_query(
     tz_name = resolve_timezone(spec.range.tz, project_timezone)
     range_start, range_end = _utc_bounds(spec.range.from_, spec.range.to, tz_name)
 
-    parameters: dict[str, object] = {
-        "org_id": str(org_id),
-        "project_id": str(project_id),
-        "events": list(spec.events),
-        "range_start": range_start,
-        "range_end": range_end,
-        "tz": tz_name,
-        "result_limit": settings.query_result_limit,
-    }
-
-    where_clauses = [
-        "org_id = {org_id:UUID}",
-        "project_id = {project_id:UUID}",
-        "event_name IN {events:Array(String)}",
-        "timestamp >= {range_start:DateTime64(3)}",
-        "timestamp < {range_end:DateTime64(3)}",
-    ]
-    for index, filter_ in enumerate(spec.filters):
-        parameters[f"filter_{index}_key"] = filter_.key
-        parameters[f"filter_{index}_value"] = filter_.value
-        where_clauses.append(_filter_clause(index, filter_.op, parameters))
+    parameters: dict[str, object] = {"tz": tz_name, "result_limit": settings.query_result_limit}
+    where_clauses = _tenant_and_range_where(
+        org_id, project_id, list(spec.events), range_start, range_end, parameters
+    )
+    _apply_filters(spec.filters, where_clauses, parameters)
 
     select_columns = [f"{_bucket_expr(spec.granularity)} AS bucket"]
     group_by = ["bucket"]
@@ -137,6 +155,71 @@ def build_trend_query(
         GROUP BY {", ".join(group_by)}
         ORDER BY bucket
         LIMIT {{result_limit:UInt32}}
+    """
+
+    query_settings: dict[str, object] = {
+        "max_execution_time": settings.query_max_execution_time_seconds,
+        "max_rows_to_read": settings.query_max_rows_to_read,
+    }
+    return BuiltQuery(sql=sql, parameters=parameters, settings=query_settings)
+
+
+_WINDOW_UNIT_SECONDS = {"hour": 3600, "day": 86400}
+
+
+def window_seconds(window: FunnelWindow) -> int:
+    return window.value * _WINDOW_UNIT_SECONDS[window.unit]
+
+
+def build_funnel_query(
+    spec: FunnelSpec,
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    project_timezone: str,
+    settings: Settings,
+) -> BuiltQuery:
+    """Compiles a validated FunnelSpec into a windowFunnel query. Per-user
+    level (how many steps were completed, in order, within the conversion
+    window) is computed in an inner query, then rolled up to a per-level
+    histogram -- turning that histogram into cumulative per-step counts,
+    conversion %, and drop-off is query/service.py's job, not SQL's; this
+    function only ever emits the raw level distribution."""
+    tz_name = resolve_timezone(spec.range.tz, project_timezone)
+    range_start, range_end = _utc_bounds(spec.range.from_, spec.range.to, tz_name)
+
+    step_events = [step.event for step in spec.steps]
+    parameters: dict[str, object] = {"window_seconds": window_seconds(spec.window)}
+    where_clauses = _tenant_and_range_where(
+        org_id, project_id, step_events, range_start, range_end, parameters
+    )
+    _apply_filters(spec.filters, where_clauses, parameters)
+
+    step_conditions = []
+    for index, event_name in enumerate(step_events):
+        param_name = f"step_{index}_event"
+        parameters[param_name] = event_name
+        step_conditions.append(f"event_name = {{{param_name}:String}}")
+
+    breakdown_select, breakdown_group, breakdown_select_outer = "", "", ""
+    if spec.breakdown is not None:
+        parameters["breakdown_key"] = spec.breakdown
+        breakdown_select = ", properties[{breakdown_key:String}] AS breakdown"
+        breakdown_group = ", breakdown"
+        breakdown_select_outer = ", breakdown"
+
+    sql = f"""
+        SELECT level{breakdown_select_outer}, count() AS users
+        FROM (
+            SELECT
+                if(user_id != '', user_id, anonymous_id) AS uid{breakdown_select},
+                windowFunnel({{window_seconds:UInt64}})
+                    (toDateTime(timestamp), {", ".join(step_conditions)}) AS level
+            FROM events
+            WHERE {" AND ".join(where_clauses)}
+            GROUP BY uid{breakdown_group}
+        )
+        GROUP BY level{breakdown_group}
+        ORDER BY level{breakdown_group}
     """
 
     query_settings: dict[str, object] = {

@@ -72,3 +72,38 @@ class TrendSpec(BaseModel):
         if self.range.from_ > self.range.to:
             raise ValueError("range.from must not be after range.to")
         return self
+
+
+class FunnelStep(BaseModel):
+    event: str = Field(min_length=1)
+
+
+class FunnelWindow(BaseModel):
+    """The conversion window: a user must complete every step within
+    `value` `unit`s of their *first* matching step (SPEC.md #4.2). Only
+    hour/day are exposed -- a funnel spanning weeks/months isn't a
+    meaningful "did this happen in one session/journey" question."""
+
+    value: int = Field(gt=0)
+    unit: Literal["hour", "day"] = "day"
+
+
+class FunnelSpec(BaseModel):
+    kind: Literal["funnel"] = "funnel"
+    version: Literal[1] = 1
+    steps: list[FunnelStep] = Field(min_length=2)
+    window: FunnelWindow
+    filters: list[Filter] = Field(default_factory=list)
+    breakdown: str | None = None
+    range: DateRange
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "FunnelSpec":
+        if self.range.from_ > self.range.to:
+            raise ValueError("range.from must not be after range.to")
+        return self
+
+
+# The only two insight kinds the query engine can compile so far (Phase
+# 11/12) -- retention (Phase 13) joins this once it has a builder too.
+InsightSpec = TrendSpec | FunnelSpec

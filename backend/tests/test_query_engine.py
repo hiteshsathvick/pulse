@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,7 @@ from pulse.main import app
 from pulse.models import User
 from pulse.query import service as query_service
 from pulse.query.cache import cache_key
-from pulse.query.spec import TrendSpec
+from pulse.query.spec import FunnelSpec, TrendSpec
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
 from pulse.repositories.postgres import session_scope
 from pulse.repositories.redis import get_client as get_redis_client
@@ -256,6 +256,156 @@ async def test_cache_hit_serves_the_stale_result_without_requerying_clickhouse()
     assert second.cached is True
     assert second.results[0]["value"] == 1  # stale on purpose -- proves it's cached, not recomputed
     assert second.results[0]["bucket"] == first.results[0]["bucket"]
+
+
+def _funnel_spec(**overrides: Any) -> FunnelSpec:
+    payload: dict[str, Any] = {
+        "kind": "funnel",
+        "steps": [
+            {"event": "signed up"},
+            {"event": "added to cart"},
+            {"event": "checkout completed"},
+        ],
+        "window": {"value": 1, "unit": "day"},
+        "range": {"from": "2026-08-15", "to": "2026-08-18"},
+    }
+    payload.update(overrides)
+    return FunnelSpec.model_validate(payload)
+
+
+async def test_funnel_ordering_and_window_boundaries_match_hand_computed_counts() -> None:
+    """DoD: ordering enforced; window boundaries; hand-computed fixture
+    funnel matches exactly (CLAUDE.md #4: funnel math must be verified
+    against a fixture with a provably correct answer, not just 'ran without
+    error'). Seven users, each isolating one thing the engine must get
+    right:
+      u1 completes all 3 steps, in order, well inside the window -> level 3
+      u2 completes steps 1-2 only                                -> level 2
+      u3 completes step 1 only                                   -> level 1
+      u4 never does step 1 at all (only step 2)                  -> level 0
+      u5 does steps 1 and 3, skipping step 2                     -> level 1
+      u6 does steps 1-2, but step 2 lands 2 days after step 1,
+         outside the 1-day conversion window                     -> level 1
+      u7 does step 2 *before* step 1 -- wrong order               -> level 1
+    Hand-computed cumulative counts (reaching level >= k means step k was
+    completed): step1 = 6 (everyone but u4), step2 = 2 (u1, u2),
+    step3 = 1 (u1)."""
+    org_id, project_id, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    t = datetime(2026, 8, 15, 0, 0, 0, tzinfo=UTC)
+
+    def _e(event_name: str, user_id: str, offset: timedelta) -> dict[str, object]:
+        return generate_fake_event(
+            org_id, project_id, event_name=event_name, user_id=user_id, timestamp=t + offset
+        )
+
+    zero = timedelta()
+    await insert_events(
+        ch_client,
+        [
+            _e("signed up", "u1", zero),
+            _e("added to cart", "u1", timedelta(hours=1)),
+            _e("checkout completed", "u1", timedelta(hours=2)),
+            _e("signed up", "u2", zero),
+            _e("added to cart", "u2", timedelta(hours=1)),
+            _e("signed up", "u3", zero),
+            _e("added to cart", "u4", zero),
+            _e("signed up", "u5", zero),
+            _e("checkout completed", "u5", timedelta(hours=1)),
+            _e("signed up", "u6", zero),
+            _e("added to cart", "u6", timedelta(days=2)),
+            _e("added to cart", "u7", zero),
+            _e("signed up", "u7", timedelta(hours=1)),
+        ],
+    )
+
+    result = await query_service.run_funnel(_funnel_spec(), org_id, project_id)
+
+    assert result.results == [
+        {"step": "signed up", "users": 6, "conversion_pct": 100.0, "drop_off": 0},
+        {
+            "step": "added to cart",
+            "users": 2,
+            "conversion_pct": pytest.approx(33.3333, rel=1e-4),
+            "drop_off": 4,
+        },
+        {
+            "step": "checkout completed",
+            "users": 1,
+            "conversion_pct": pytest.approx(16.6666, rel=1e-4),
+            "drop_off": 1,
+        },
+    ]
+
+
+async def test_funnel_never_leaks_across_tenants() -> None:
+    """DoD: tenant-leakage test, mandatory per CLAUDE.md #4 for every query type."""
+    org_a, project_a, _ = await _create_org_and_project()
+    org_b, project_b, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    t = datetime(2026, 8, 15, 0, 0, 0, tzinfo=UTC)
+
+    await insert_events(
+        ch_client,
+        [
+            generate_fake_event(
+                org_a, project_a, event_name="signed up", user_id="a1", timestamp=t
+            ),
+            generate_fake_event(
+                org_a, project_a, event_name="added to cart", user_id="a1", timestamp=t
+            ),
+        ],
+    )
+    await insert_events(
+        ch_client,
+        [
+            generate_fake_event(
+                org_b, project_b, event_name="signed up", user_id=f"b{i}", timestamp=t
+            )
+            for i in range(3)
+        ],
+    )
+
+    result_a = await query_service.run_funnel(_funnel_spec(), org_a, project_a)
+    result_b = await query_service.run_funnel(_funnel_spec(), org_b, project_b)
+
+    assert result_a.results[0]["users"] == 1
+    assert result_a.results[1]["users"] == 1
+    assert result_b.results[0]["users"] == 3
+    assert result_b.results[1]["users"] == 0
+
+
+async def test_funnel_breakdown_splits_results_per_dimension_value() -> None:
+    org_id, project_id, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    t = datetime(2026, 8, 15, 0, 0, 0, tzinfo=UTC)
+
+    def _e(user_id: str, event_name: str, platform: str) -> dict[str, object]:
+        return generate_fake_event(
+            org_id,
+            project_id,
+            event_name=event_name,
+            user_id=user_id,
+            timestamp=t,
+            properties={"platform": platform},
+        )
+
+    await insert_events(
+        ch_client,
+        [
+            _e("ios1", "signed up", "ios"),
+            _e("ios1", "added to cart", "ios"),
+            _e("web1", "signed up", "web"),
+        ],
+    )
+
+    result = await query_service.run_funnel(_funnel_spec(breakdown="platform"), org_id, project_id)
+
+    by_breakdown = {(row["breakdown"], row["step"]): row["users"] for row in result.results}
+    assert by_breakdown[("ios", "signed up")] == 1
+    assert by_breakdown[("ios", "added to cart")] == 1
+    assert by_breakdown[("web", "signed up")] == 1
+    assert by_breakdown[("web", "added to cart")] == 0
 
 
 def _client() -> httpx.AsyncClient:

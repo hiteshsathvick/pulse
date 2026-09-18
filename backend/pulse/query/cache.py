@@ -4,12 +4,12 @@ import uuid
 
 from redis.asyncio import Redis
 
-from pulse.query.spec import TrendSpec
+from pulse.query.spec import InsightSpec
 
 _KEY_PREFIX = "query:cache:"
 
 
-def cache_key(spec: TrendSpec, org_id: uuid.UUID, project_id: uuid.UUID) -> str:
+def cache_key(spec: InsightSpec, org_id: uuid.UUID, project_id: uuid.UUID) -> str:
     """Keyed by (spec, org_id, project_id), per SPEC.md #6: a validated
     spec's own JSON dump is already deterministic for equivalent input (field
     order follows the model's declaration, not the client's), so no extra

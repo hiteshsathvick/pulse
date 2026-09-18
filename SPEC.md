@@ -617,6 +617,47 @@ with tenant scope, caps, and a cache layer wrapped around it -- never hand-built
 - **Only `trend` is built this phase.** `funnel`/`retention` specs exist in SPEC.md #4.2's shape sketch
   but have no builder yet -- that's Phase 12/13's own job, reusing this same parameterization discipline.
 
+### 6.9 Funnel query mechanism (implemented Phase 12)
+
+Builds on Phase 11's shared tenant/range/filter parameterization (`_tenant_and_range_where`,
+`_apply_filters` in `pulse/query/builder.py`, extracted from the trend builder rather than duplicated)
+rather than inventing a second query-building path.
+
+- **The SQL builder emits a raw per-user level histogram; step counts, conversion %, and drop-off are
+  computed in Python, not SQL.** `build_funnel_query` groups by user (`if(user_id != '', user_id,
+  anonymous_id)`, the same effective-identity expression as trend's `unique_users` measure) and computes
+  `windowFunnel(...)` per user, then aggregates to `(level[, breakdown]) -> count`. Turning that histogram
+  into "how many users reached step *k*" is `pulse/query/service.py`'s `_funnel_step_results`: reaching
+  windowFunnel level >= k means step k was completed in order, so a step's count is the sum of every level
+  at or above it -- cumulative math is far more natural to express and test in Python than as nested SQL.
+- **`windowFunnel` requires `DateTime`/`Date`/unsigned-number first argument, not `DateTime64(3)`** -- a
+  real error hit against live ClickHouse (24.8), not caught by reasoning about the function's docs alone:
+  `events.timestamp` is `DateTime64(3)` (SPEC.md #5.1), so the builder wraps it in `toDateTime(...)`,
+  truncating to second precision. This doesn't lose meaningful conversion-window precision -- windows are
+  specified in whole hours/days (`FunnelWindow.unit`), never sub-second.
+- **Ordering is enforced by `windowFunnel`'s own semantics, not extra application logic.** A user who
+  completes step 2 before step 1, or skips a middle step, cannot reach a level past the last step actually
+  satisfied in sequence -- verified live in Phase 12's own hand-computed fixture test (SPEC.md #7), which
+  deliberately includes a "step 2 before step 1" user and a "skips the middle step" user, not just the
+  three-of-three-in-order happy path.
+- **The conversion window bounds progress from a user's first matching event, not the query's date
+  range.** `window_seconds()` converts `FunnelWindow` (`{value, unit}`, hour or day only -- a funnel
+  spanning weeks isn't a meaningful "one journey" window) to the plain integer ClickHouse's
+  `windowFunnel(<seconds>)` expects. This is independent of `range.from`/`range.to`, which only bounds
+  which raw events are considered at all, matching SPEC.md #4.2's separate `window` and `range` fields.
+- **Breakdown reuses the same pattern as trend's breakdown column**, added to both the inner
+  (per-user-per-breakdown-value) and outer (per-level-per-breakdown-value) `GROUP BY`, then split into
+  separate cumulative step sequences per breakdown value in `_funnel_step_results` -- sorted by breakdown
+  value for deterministic output, since dict iteration order isn't guaranteed to be stable across runs in
+  a way tests (or a cache) should depend on.
+- **Tenant-leakage and cache-key reuse are automatic, not re-implemented.** `run_funnel` is structurally
+  identical to `run_trend` (`get_project` scoping check, `cache.cache_key`/`get_cached`/`set_cached`, the
+  same `settings`/`max_execution_time`/`max_rows_to_read` caps) -- `cache.py`'s `cache_key` was widened
+  from `TrendSpec` to a new `InsightSpec = TrendSpec | FunnelSpec` union rather than duplicated, so a
+  funnel result is cached and tenant-scoped by construction, not by a second hand-written check.
+- **Retention (Phase 13) is the only insight kind still unbuilt.** `InsightSpec` documents this directly
+  in a comment rather than leaving it implicit.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -668,8 +709,8 @@ flush triggers, retry/idempotency, no loss on unload. See §6.7.
 Redis result cache. Tests: spec→SQL correctness; **tenant-leakage tests**; tz-correct bucketing; cache
 hit/miss. See §6.8.
 
-**Phase 12 — Funnels.** ☐ `windowFunnel`-based; ☐ per-step counts + conversion/drop-off; ☐ breakdown.
-Tests: ordering enforced; window boundaries; **hand-computed fixture funnel matches exactly**.
+**Phase 12 — Funnels.** ☑ `windowFunnel`-based; ☑ per-step counts + conversion/drop-off; ☑ breakdown.
+Tests: ordering enforced; window boundaries; **hand-computed fixture funnel matches exactly**. See §6.9.
 
 **Phase 13 — Retention.** ☐ `retention`-based cohort grids + curve. Tests: cohort assignment; day/week
 bucketing; **hand-computed retention fixture matches**.
@@ -883,3 +924,22 @@ trace follows an event end to end.
   via the full local suite against the real containers (ClickHouse/Postgres/Redis), not mocks --
   tenant-leakage, timezone bucketing, and cache hit/miss all exercised against genuine inserted events,
   not fixtures standing in for the store.
+- 2026-09-18 — Phase 12 — Added §6.9 (the funnel query mechanism: a raw per-user level histogram from
+  SQL, with cumulative step counts/conversion/drop-off computed in Python; the real `DateTime64(3)` ->
+  `windowFunnel` type error hit against live ClickHouse and fixed with `toDateTime(...)`; ordering
+  enforced by `windowFunnel`'s own semantics, verified by a fixture with an out-of-order and a
+  skip-a-step user, not just the happy path; the conversion window's independence from the query date
+  range; and cache/tenant-scoping reuse via the new `InsightSpec = TrendSpec | FunnelSpec` union rather
+  than a second hand-written path). `pulse/query/builder.py` gained `build_funnel_query`,
+  `window_seconds`, and two extracted shared helpers (`_tenant_and_range_where`, `_apply_filters`) used
+  by both the trend and funnel builders. `pulse/query/spec.py` gained `FunnelStep`/`FunnelWindow`/
+  `FunnelSpec`. `pulse/query/service.py` gained `run_funnel`/`FunnelResult`/`_funnel_step_results`.
+  `pulse/api/query.py` gained `POST .../query/funnel`. A real bug was caught in the test suite itself,
+  not the implementation: the first `test_funnel_never_leaks_across_tenants` draft generated three
+  *identical* events for one user (`user_id="b1"` three times) expecting 3 users, when `windowFunnel`
+  correctly groups by user and returned 1 -- fixed by generating three distinct users
+  (`f"b{i}"`), a reminder that "the engine is wrong" and "the fixture is wrong" need to both be checked
+  before trusting a failing assertion. 108 tests pass (98 -> 108, +11 funnel-builder unit tests, +3
+  funnel-engine integration tests); `ruff`/`mypy` clean. Verified against the real ClickHouse container,
+  not mocks, including the ordering/window-boundary fixture and a dedicated funnel tenant-leakage test
+  (CLAUDE.md #4: tenant-leakage tests are mandatory for every query type, not just trend's).
