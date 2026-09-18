@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from pulse.api.dependencies import resolve_query_scope
 from pulse.query import service as query_service
-from pulse.query.spec import FunnelSpec, TrendSpec
+from pulse.query.spec import FunnelSpec, RetentionSpec, TrendSpec
 
 router = APIRouter(
     prefix="/api/v1/orgs/{org_id}/projects/{project_id}/query",
@@ -20,6 +20,11 @@ class TrendResponse(BaseModel):
 
 
 class FunnelResponse(BaseModel):
+    results: list[dict[str, object]]
+    cached: bool
+
+
+class RetentionResponse(BaseModel):
     results: list[dict[str, object]]
     cached: bool
 
@@ -46,3 +51,16 @@ async def query_funnel(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from exc
     return FunnelResponse(results=result.results, cached=result.cached)
+
+
+@router.post("/retention", response_model=RetentionResponse)
+async def query_retention(
+    org_id: uuid.UUID, project_id: uuid.UUID, spec: RetentionSpec
+) -> RetentionResponse:
+    try:
+        result = await query_service.run_retention(spec, org_id, project_id)
+    except query_service.ProjectNotFound as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from exc
+    return RetentionResponse(results=result.results, cached=result.cached)

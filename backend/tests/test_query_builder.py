@@ -6,6 +6,8 @@ import pytest
 from pulse.core.config import Settings
 from pulse.query.builder import (
     build_funnel_query,
+    build_retention_activity_query,
+    build_retention_cohort_query,
     build_trend_query,
     parse_measure,
     resolve_timezone,
@@ -18,6 +20,7 @@ from pulse.query.spec import (
     FunnelSpec,
     FunnelWindow,
     Granularity,
+    RetentionSpec,
     TrendSpec,
 )
 
@@ -237,3 +240,103 @@ def test_funnel_breakdown_groups_the_inner_and_outer_query_by_it() -> None:
 def test_funnel_caps_are_passed_as_clickhouse_query_settings() -> None:
     built = build_funnel_query(_funnel_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings())
     assert built.settings == {"max_execution_time": 10, "max_rows_to_read": 1_000_000}
+
+
+def _retention_spec(**overrides: object) -> RetentionSpec:
+    payload: dict[str, object] = {
+        "kind": "retention",
+        "born_event": "signed up",
+        "return_event": "checkout completed",
+        "period": "week",
+        "periods": 4,
+        "range": {"from": "2026-08-01", "to": "2026-08-07"},
+    }
+    payload.update(overrides)
+    return RetentionSpec.model_validate(payload)
+
+
+def test_retention_cohort_query_buckets_on_the_first_born_event() -> None:
+    built = build_retention_cohort_query(
+        _retention_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    assert "min(toStartOfWeek(timestamp, 1, {tz:String})) AS cohort_period" in built.sql
+    assert "GROUP BY uid" in built.sql
+    assert built.parameters["events"] == ["signed up"]
+
+
+def test_retention_activity_query_filters_on_return_event_only() -> None:
+    built = build_retention_activity_query(
+        _retention_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    assert built.parameters["events"] == ["checkout completed"]
+    assert "toStartOfWeek(timestamp, 1, {tz:String}) AS activity_period" in built.sql
+
+
+@pytest.mark.parametrize(
+    ("period", "expected_fragment"),
+    [
+        ("day", "toStartOfDay(timestamp, {tz:String})"),
+        ("week", "toStartOfWeek(timestamp, 1, {tz:String})"),
+    ],
+)
+def test_retention_bucket_reuses_trend_granularity_for_day_and_week(
+    period: str, expected_fragment: str
+) -> None:
+    spec = _retention_spec(period=period)
+    cohort_built = build_retention_cohort_query(
+        spec, uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    activity_built = build_retention_activity_query(
+        spec, uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    assert expected_fragment in cohort_built.sql
+    assert expected_fragment in activity_built.sql
+
+
+def test_retention_org_and_project_are_always_injected_in_both_queries() -> None:
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    cohort_built = build_retention_cohort_query(
+        _retention_spec(), org_id, project_id, "UTC", _settings()
+    )
+    activity_built = build_retention_activity_query(
+        _retention_spec(), org_id, project_id, "UTC", _settings()
+    )
+    for built in (cohort_built, activity_built):
+        assert "org_id = {org_id:UUID}" in built.sql
+        assert "project_id = {project_id:UUID}" in built.sql
+        assert built.parameters["org_id"] == str(org_id)
+        assert built.parameters["project_id"] == str(project_id)
+
+
+def test_retention_activity_query_widens_the_range_past_range_to() -> None:
+    """The activity window must extend `periods` periods past range.to, or
+    a cohort near the end of the range could never show retention at its
+    later offsets."""
+    spec = _retention_spec(
+        period="week", periods=3, range={"from": "2026-08-01", "to": "2026-08-07"}
+    )
+    cohort_built = build_retention_cohort_query(
+        spec, uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    activity_built = build_retention_activity_query(
+        spec, uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+
+    # Cohort range end stays at range.to (2026-08-08 00:00, exclusive).
+    assert cohort_built.parameters["range_end"].isoformat() == "2026-08-08T00:00:00+00:00"  # type: ignore[union-attr]
+    # Activity range end is widened by periods * 1 week = 3 weeks past range.to.
+    assert activity_built.parameters["range_end"].isoformat() == "2026-08-29T00:00:00+00:00"  # type: ignore[union-attr]
+    # Both start at the same range.from.
+    assert cohort_built.parameters["range_start"] == activity_built.parameters["range_start"]
+
+
+def test_retention_caps_are_passed_as_clickhouse_query_settings() -> None:
+    cohort_built = build_retention_cohort_query(
+        _retention_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    activity_built = build_retention_activity_query(
+        _retention_spec(), uuid.uuid4(), uuid.uuid4(), "UTC", _settings()
+    )
+    expected = {"max_execution_time": 10, "max_rows_to_read": 1_000_000}
+    assert cohort_built.settings == expected
+    assert activity_built.settings == expected

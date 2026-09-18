@@ -18,7 +18,7 @@ from pulse.main import app
 from pulse.models import User
 from pulse.query import service as query_service
 from pulse.query.cache import cache_key
-from pulse.query.spec import FunnelSpec, TrendSpec
+from pulse.query.spec import FunnelSpec, RetentionSpec, TrendSpec
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
 from pulse.repositories.postgres import session_scope
 from pulse.repositories.redis import get_client as get_redis_client
@@ -406,6 +406,164 @@ async def test_funnel_breakdown_splits_results_per_dimension_value() -> None:
     assert by_breakdown[("ios", "added to cart")] == 1
     assert by_breakdown[("web", "signed up")] == 1
     assert by_breakdown[("web", "added to cart")] == 0
+
+
+def _retention_spec(**overrides: Any) -> RetentionSpec:
+    payload: dict[str, Any] = {
+        "kind": "retention",
+        "born_event": "signed up",
+        "return_event": "checkout completed",
+        "period": "week",
+        "periods": 3,
+        "range": {"from": "2026-08-03", "to": "2026-08-16"},
+    }
+    payload.update(overrides)
+    return RetentionSpec.model_validate(payload)
+
+
+async def test_retention_cohort_assignment_and_week_bucketing_match_hand_computed_grid() -> None:
+    """DoD: cohort assignment; day/week bucketing (week half); hand-computed
+    retention fixture matches exactly (CLAUDE.md #4). Two ISO weeks of born
+    events (Mon 2026-08-03 and Mon 2026-08-10), each its own cohort:
+
+    Cohort week 1 (Aug 3-9), 3 users:
+      c1: returns in week 1 (offset 0) and week 2 (offset 1), not week 3
+      c2: returns in week 1 (offset 0) only
+      c3: never returns
+      -> offset0 2/3, offset1 1/3, offset2 0/3
+
+    Cohort week 2 (Aug 10-16), 2 users:
+      c4: returns in week 2 (offset 0) and week 4 relative to its own
+          cohort (offset 2), skipping offset 1 -- retention need not be
+          monotonic, each offset is checked independently
+      c5: never returns
+      -> offset0 1/2, offset1 0/2, offset2 1/2
+
+    The offset-2 activity for c4 (2026-08-26) falls *after* the query
+    range's own `to` (2026-08-16), proving the activity window widening
+    actually works, not just that it compiles."""
+    org_id, project_id, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+
+    def _e(event_name: str, user_id: str, when: datetime) -> dict[str, object]:
+        return generate_fake_event(
+            org_id, project_id, event_name=event_name, user_id=user_id, timestamp=when
+        )
+
+    await insert_events(
+        ch_client,
+        [
+            _e("signed up", "c1", datetime(2026, 8, 3, 9, 0, tzinfo=UTC)),
+            _e("checkout completed", "c1", datetime(2026, 8, 4, tzinfo=UTC)),
+            _e("checkout completed", "c1", datetime(2026, 8, 11, tzinfo=UTC)),
+            _e("signed up", "c2", datetime(2026, 8, 5, tzinfo=UTC)),
+            _e("checkout completed", "c2", datetime(2026, 8, 5, 12, 0, tzinfo=UTC)),
+            _e("signed up", "c3", datetime(2026, 8, 6, tzinfo=UTC)),
+            _e("signed up", "c4", datetime(2026, 8, 11, tzinfo=UTC)),
+            _e("checkout completed", "c4", datetime(2026, 8, 12, tzinfo=UTC)),
+            _e("checkout completed", "c4", datetime(2026, 8, 26, tzinfo=UTC)),
+            _e("signed up", "c5", datetime(2026, 8, 14, tzinfo=UTC)),
+        ],
+    )
+
+    result = await query_service.run_retention(_retention_spec(), org_id, project_id)
+
+    by_cohort_offset = {
+        (row["cohort_period"], row["period_offset"]): (row["cohort_size"], row["retained"])
+        for row in result.results
+    }
+    week1 = "2026-08-03T00:00:00+00:00"
+    week2 = "2026-08-10T00:00:00+00:00"
+    assert by_cohort_offset[(week1, 0)] == (3, 2)
+    assert by_cohort_offset[(week1, 1)] == (3, 1)
+    assert by_cohort_offset[(week1, 2)] == (3, 0)
+    assert by_cohort_offset[(week2, 0)] == (2, 1)
+    assert by_cohort_offset[(week2, 1)] == (2, 0)
+    assert by_cohort_offset[(week2, 2)] == (2, 1)
+
+
+async def test_retention_day_bucketing_matches_hand_computed_grid() -> None:
+    """DoD: day/week bucketing (day half). One cohort day, one user retained
+    the next day but not two days later."""
+    org_id, project_id, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+
+    def _e(event_name: str, user_id: str, when: datetime) -> dict[str, object]:
+        return generate_fake_event(
+            org_id, project_id, event_name=event_name, user_id=user_id, timestamp=when
+        )
+
+    await insert_events(
+        ch_client,
+        [
+            _e("signed up", "d1", datetime(2026, 8, 3, 9, 0, tzinfo=UTC)),
+            _e("checkout completed", "d1", datetime(2026, 8, 4, 10, 0, tzinfo=UTC)),
+            _e("signed up", "d2", datetime(2026, 8, 3, 15, 0, tzinfo=UTC)),
+        ],
+    )
+
+    spec = _retention_spec(
+        period="day", periods=3, range={"from": "2026-08-03", "to": "2026-08-03"}
+    )
+    result = await query_service.run_retention(spec, org_id, project_id)
+
+    by_offset = {row["period_offset"]: row["retained"] for row in result.results}
+    assert result.results[0]["cohort_size"] == 2
+    assert by_offset[0] == 0
+    assert by_offset[1] == 1
+    assert by_offset[2] == 0
+
+
+async def test_retention_when_return_event_equals_born_event_period_zero_is_full() -> None:
+    """SPEC.md #4.2: return_event may equal born_event, for "came back at
+    all" -- period 0 is then trivially 100%, since the born event itself
+    is activity in its own cohort period."""
+    org_id, project_id, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    t = datetime(2026, 8, 3, 9, 0, tzinfo=UTC)
+    await insert_events(
+        ch_client,
+        [
+            generate_fake_event(
+                org_id, project_id, event_name="signed up", user_id="r1", timestamp=t
+            )
+        ],
+    )
+
+    spec = _retention_spec(born_event="signed up", return_event="signed up", periods=1)
+    result = await query_service.run_retention(spec, org_id, project_id)
+
+    assert result.results[0]["cohort_size"] == 1
+    assert result.results[0]["retained"] == 1
+    assert result.results[0]["retention_pct"] == 100.0
+
+
+async def test_retention_never_leaks_across_tenants() -> None:
+    """DoD: tenant-leakage test, mandatory per CLAUDE.md #4 for every query type."""
+    org_a, project_a, _ = await _create_org_and_project()
+    org_b, project_b, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    t = datetime(2026, 8, 3, 9, 0, tzinfo=UTC)
+
+    await insert_events(
+        ch_client,
+        [generate_fake_event(org_a, project_a, event_name="signed up", user_id="a1", timestamp=t)],
+    )
+    await insert_events(
+        ch_client,
+        [
+            generate_fake_event(
+                org_b, project_b, event_name="signed up", user_id=f"b{i}", timestamp=t
+            )
+            for i in range(4)
+        ],
+    )
+
+    result_a = await query_service.run_retention(_retention_spec(periods=1), org_a, project_a)
+    result_b = await query_service.run_retention(_retention_spec(periods=1), org_b, project_b)
+
+    assert result_a.results[0]["cohort_size"] == 1
+    assert result_b.results[0]["cohort_size"] == 4
 
 
 def _client() -> httpx.AsyncClient:

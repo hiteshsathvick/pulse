@@ -271,7 +271,10 @@ Rollup-eligible insights read from the MV (`uniqMerge(users_state)`); everything
 - **Trend:** `SELECT toStartOf<granularity>(timestamp, tz), <measure> ... GROUP BY bucket [, breakdown]`.
 - **Funnel:** `windowFunnel(<window_seconds>)(timestamp, event_name = s1, ..., event_name = sN)` per user;
   bucket by max level reached → per-step counts, conversion %, drop-off.
-- **Retention:** `retention(<born cond>, <return cond @ period 1>, ...)` per user → cohort grid.
+- **Retention:** a per-user cohort period (first `born_event` bucket) joined against a per-user activity-
+  period set (every `return_event` bucket, widened past the range end) → cohort grid, computed in
+  Python -- not ClickHouse's `retention()` aggregate function, which can't express a per-user-relative
+  period offset. See §6.10 for why.
 - **Uniques:** `uniqExact` for small/verifiable results; `uniq`/`uniqCombined` when volume demands.
 - All timezone bucketing uses the project timezone; store UTC, bucket with tz — never bucket on raw UTC.
 
@@ -658,6 +661,48 @@ rather than inventing a second query-building path.
 - **Retention (Phase 13) is the only insight kind still unbuilt.** `InsightSpec` documents this directly
   in a comment rather than leaving it implicit.
 
+### 6.10 Retention query mechanism (implemented Phase 13)
+
+**Deliberate deviation from this section's original sketch:** SPEC.md #5.3 originally said retention
+would be built on ClickHouse's `retention(...)` aggregate function. It isn't -- `retention()` answers "did
+this user do cond1, and did they also do condN at some point," which is presence-based, not
+period-relative: it can't express "checked at exactly N periods after *this user's own* cohort start,"
+because every user's cohort start is a different row value, not a single query-wide constant the function
+can take as an argument. Building that with `retention()` would mean one call per possible cohort period,
+generated dynamically -- fragile and unbounded. Instead, following the same split Phase 12 established
+(SQL emits raw per-user facts; Python computes the grid):
+
+- **Two queries, not one.** `build_retention_cohort_query` gets each user's cohort period (the bucket of
+  their *first* `born_event` in range); `build_retention_activity_query` gets every `(user, period)` where
+  they did `return_event`, **widened past `range.to`** by `periods * period-length` -- a cohort near the
+  end of the range must still be checkable at its later offsets, or retention would silently look worse
+  near the range boundary for a reason that has nothing to do with actual user behavior. Both reuse the
+  existing `_tenant_and_range_where`/`_apply_filters` helpers and the trend builder's own `_bucket_expr`
+  (day -> `Granularity.DAY`, week -> `Granularity.WEEK`) rather than a third bucketing implementation.
+- **`pulse/query/service.py`'s `_retention_grid_rows` does the merge:** for each cohort, for each offset in
+  `[0, periods)`, count how many of that cohort's users have `cohort_period + offset * period_length` in
+  their activity-period set. Output is a flat `(cohort_period, cohort_size, period_offset, retained,
+  retention_pct)` row per cohort/offset pair -- a grid flattened to rows, the same shape convention trend
+  and funnel results already use, easy for a future frontend to pivot into an actual grid or curve.
+- **A real ClickHouse asymmetry, caught live against the container, not from reading docs:**
+  `toStartOfWeek` returns `Date`, while `toStartOfDay` returns `DateTime` -- the same `_bucket_expr` call
+  therefore comes back as a bare Python `date` for week periods and a full `datetime` for day periods.
+  Query building itself is unaffected (date/date and datetime/datetime arithmetic both work), but it would
+  have made the API response shape inconsistent (`"2026-08-03"` vs `"2026-08-03T00:00:00+00:00"` for
+  `cohort_period`) depending on which `period` was requested. Fixed with `_as_utc_datetime`, coercing
+  either ClickHouse return shape to midnight UTC `datetime` right after the row is read, so the grid is
+  the same shape regardless of period. Never surfaced in Phase 11 because trend's own engine tests only
+  ever exercised `granularity="day"` against live ClickHouse, never `"week"`.
+- **`return_event` may equal `born_event`**, per SPEC.md #4.2's "came back at all" case -- no special-casing
+  needed, since the activity query is just a second independent scan for whatever event name it's given;
+  when it's the same name as the born event, the born event itself is naturally also activity in period 0.
+- **Tenant scoping, caching, and caps are inherited exactly like trend/funnel** -- `run_retention` has the
+  same `get_project` check, `cache.cache_key`/`get_cached`/`set_cached` calls, and per-query
+  `max_execution_time`/`max_rows_to_read` settings, via the same `InsightSpec` union, not a fourth
+  hand-written scoping path.
+- **All three insight kinds (trend/funnel/retention) are now built** -- `InsightSpec` is the complete set
+  SPEC.md #4.2 originally sketched.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -712,8 +757,8 @@ hit/miss. See §6.8.
 **Phase 12 — Funnels.** ☑ `windowFunnel`-based; ☑ per-step counts + conversion/drop-off; ☑ breakdown.
 Tests: ordering enforced; window boundaries; **hand-computed fixture funnel matches exactly**. See §6.9.
 
-**Phase 13 — Retention.** ☐ `retention`-based cohort grids + curve. Tests: cohort assignment; day/week
-bucketing; **hand-computed retention fixture matches**.
+**Phase 13 — Retention.** ☑ cohort grids + curve, built on the same shared query-building layer.
+Tests: cohort assignment; day/week bucketing; **hand-computed retention fixture matches**. See §6.10.
 
 **Phase 14 — Frontend foundation.** ☐ shell/nav/design system/data layer/auth routing/org+project switcher.
 Tests: components + a couple of Playwright flows.
@@ -943,3 +988,30 @@ trace follows an event end to end.
   funnel-engine integration tests); `ruff`/`mypy` clean. Verified against the real ClickHouse container,
   not mocks, including the ordering/window-boundary fixture and a dedicated funnel tenant-leakage test
   (CLAUDE.md #4: tenant-leakage tests are mandatory for every query type, not just trend's).
+- 2026-09-18 — Phase 13 — Added §6.10 (the retention query mechanism) and corrected §5.3's original
+  `retention()`-based sketch: ClickHouse's `retention()` aggregate can't express a per-user-relative
+  period offset (every user's cohort start is a different value, not a query-wide constant), so retention
+  is instead two queries -- a per-user cohort period and a per-user activity-period set, the latter
+  deliberately widened past `range.to` by `periods * period-length` so a cohort near the range's end can
+  still show later-offset retention -- merged into a flat cohort/offset grid in Python, the same
+  SQL-emits-facts/Python-computes-the-shape split Phase 12 established. `pulse/query/builder.py` gained
+  `build_retention_cohort_query`/`build_retention_activity_query`, reusing trend's own `_bucket_expr` (no
+  third bucketing implementation). `pulse/query/spec.py` gained `RetentionPeriod`/`RetentionSpec`;
+  `InsightSpec` is now `TrendSpec | FunnelSpec | RetentionSpec` -- all three insight kinds SPEC.md #4.2
+  originally sketched are now built. `pulse/query/service.py` gained `run_retention`/`RetentionResult`/
+  `_retention_grid_rows`. `pulse/api/query.py` gained `POST .../query/retention`. A real ClickHouse
+  asymmetry was caught live, not from documentation: `toStartOfWeek` returns `Date` while `toStartOfDay`
+  returns `DateTime`, so the same bucket expression came back as a bare `date` for week periods and a full
+  `datetime` for day periods -- invisible until an actual week-period query ran against live ClickHouse,
+  since Phase 11's own engine tests only ever exercised day granularity; fixed with `_as_utc_datetime`,
+  normalizing both shapes to midnight-UTC `datetime` so the API response is consistent regardless of
+  period. Also caught a bug in the test fixture itself (not the implementation): the first hand-computed
+  grid assertion hardcoded a full ISO-datetime cohort-period key before that normalization fix existed,
+  which would have papered over the exact asymmetry it was meant to catch -- worth naming since it's the
+  second phase running in which "the test's own expectation was wrong" needed ruling out before trusting a
+  failing assertion, the same lesson Phase 12's tenant-leakage fixture taught. 119 tests pass (108 -> 119,
+  +7 retention-builder unit tests, +4 retention-engine integration tests); `ruff`/`mypy` clean. Verified
+  against the real ClickHouse container: a two-cohort, five-user hand-computed week-bucketing grid
+  (including a user retained only after the query range's own `to`, proving the window-widening works, not
+  just that it compiles), a day-bucketing grid, the `return_event == born_event` case, and a dedicated
+  retention tenant-leakage test.

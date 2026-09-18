@@ -4,7 +4,16 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from pulse.core.config import Settings
-from pulse.query.spec import Filter, FilterOp, FunnelSpec, FunnelWindow, Granularity, TrendSpec
+from pulse.query.spec import (
+    Filter,
+    FilterOp,
+    FunnelSpec,
+    FunnelWindow,
+    Granularity,
+    RetentionPeriod,
+    RetentionSpec,
+    TrendSpec,
+)
 
 
 @dataclass
@@ -157,6 +166,85 @@ def build_trend_query(
         LIMIT {{result_limit:UInt32}}
     """
 
+    query_settings: dict[str, object] = {
+        "max_execution_time": settings.query_max_execution_time_seconds,
+        "max_rows_to_read": settings.query_max_rows_to_read,
+    }
+    return BuiltQuery(sql=sql, parameters=parameters, settings=query_settings)
+
+
+def _retention_bucket_granularity(period: RetentionPeriod) -> Granularity:
+    return Granularity.DAY if period == RetentionPeriod.DAY else Granularity.WEEK
+
+
+def _period_timedelta(period: RetentionPeriod) -> timedelta:
+    return timedelta(days=1) if period == RetentionPeriod.DAY else timedelta(weeks=1)
+
+
+def build_retention_cohort_query(
+    spec: RetentionSpec,
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    project_timezone: str,
+    settings: Settings,
+) -> BuiltQuery:
+    """Each user's cohort period: the bucket of their *first* born_event
+    within the range -- one row per user who qualifies for a cohort at
+    all. Reuses trend's own `_bucket_expr` (day/week) rather than a second
+    bucketing implementation."""
+    tz_name = resolve_timezone(spec.range.tz, project_timezone)
+    range_start, range_end = _utc_bounds(spec.range.from_, spec.range.to, tz_name)
+
+    parameters: dict[str, object] = {"tz": tz_name}
+    where_clauses = _tenant_and_range_where(
+        org_id, project_id, [spec.born_event], range_start, range_end, parameters
+    )
+
+    bucket_expr = _bucket_expr(_retention_bucket_granularity(spec.period))
+    sql = f"""
+        SELECT
+            if(user_id != '', user_id, anonymous_id) AS uid,
+            min({bucket_expr}) AS cohort_period
+        FROM events
+        WHERE {" AND ".join(where_clauses)}
+        GROUP BY uid
+    """
+    query_settings: dict[str, object] = {
+        "max_execution_time": settings.query_max_execution_time_seconds,
+        "max_rows_to_read": settings.query_max_rows_to_read,
+    }
+    return BuiltQuery(sql=sql, parameters=parameters, settings=query_settings)
+
+
+def build_retention_activity_query(
+    spec: RetentionSpec,
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    project_timezone: str,
+    settings: Settings,
+) -> BuiltQuery:
+    """Every (user, activity period) where the user did return_event,
+    widened *past* range.to by periods * period-length -- a user whose
+    cohort starts near the end of the range must still be checkable at
+    every later offset, not cut off at the cohort range's own boundary."""
+    tz_name = resolve_timezone(spec.range.tz, project_timezone)
+    range_start, _ = _utc_bounds(spec.range.from_, spec.range.to, tz_name)
+    activity_end_date = spec.range.to + _period_timedelta(spec.period) * spec.periods
+    _, activity_range_end = _utc_bounds(activity_end_date, activity_end_date, tz_name)
+
+    parameters: dict[str, object] = {"tz": tz_name}
+    where_clauses = _tenant_and_range_where(
+        org_id, project_id, [spec.return_event], range_start, activity_range_end, parameters
+    )
+
+    bucket_expr = _bucket_expr(_retention_bucket_granularity(spec.period))
+    sql = f"""
+        SELECT DISTINCT
+            if(user_id != '', user_id, anonymous_id) AS uid,
+            {bucket_expr} AS activity_period
+        FROM events
+        WHERE {" AND ".join(where_clauses)}
+    """
     query_settings: dict[str, object] = {
         "max_execution_time": settings.query_max_execution_time_seconds,
         "max_rows_to_read": settings.query_max_rows_to_read,

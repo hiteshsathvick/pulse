@@ -104,6 +104,30 @@ class FunnelSpec(BaseModel):
         return self
 
 
-# The only two insight kinds the query engine can compile so far (Phase
-# 11/12) -- retention (Phase 13) joins this once it has a builder too.
-InsightSpec = TrendSpec | FunnelSpec
+class RetentionPeriod(enum.StrEnum):
+    DAY = "day"
+    WEEK = "week"
+
+
+class RetentionSpec(BaseModel):
+    kind: Literal["retention"] = "retention"
+    version: Literal[1] = 1
+    born_event: str = Field(min_length=1)
+    # May equal born_event, per SPEC.md #4.2 -- "came back at all" is a
+    # valid retention question, not a special case.
+    return_event: str = Field(min_length=1)
+    period: RetentionPeriod = RetentionPeriod.WEEK
+    # Capped: an unbounded grid width is an unbounded amount of Python-side
+    # cohort math per query, not just an unbounded SQL scan.
+    periods: int = Field(gt=0, le=52)
+    range: DateRange
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "RetentionSpec":
+        if self.range.from_ > self.range.to:
+            raise ValueError("range.from must not be after range.to")
+        return self
+
+
+# Every insight kind the query engine can compile (Phase 11/12/13).
+InsightSpec = TrendSpec | FunnelSpec | RetentionSpec
