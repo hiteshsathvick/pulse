@@ -747,6 +747,21 @@ rather than building from scratch, adapted where pulse's actual backend shape di
   same promise chain (a `Promise.resolve(null)` sentinel for "nothing to recover") so `setInitializing`
   only ever runs inside `.finally()`, matching the pattern the other branches already used -- not a
   suppression, a genuine restructure.
+- **A fourth bug, found later in `next dev` (not by Phase 14's own tests): session recovery ran twice under
+  React Strict Mode and the second run wiped the session.** The refresh token is single-use (the backend
+  rotates it on every redeem), and Strict Mode runs the mount effect twice back to back, so both runs read
+  the same not-yet-rotated token from `localStorage` and sent two `POST /auth/refresh` calls: the first
+  returned `200` (rotated), the second `401`, and the failure path cleared the stored token -- leaving
+  `localStorage` empty and an empty orgs page after any reload or deep link. An effect cleanup/ignore flag
+  was ruled out: it would only discard the stale run's *result*, while its request would still be sent and
+  still `401`. Fixed at the request instead: `recoverSession` in `auth-context.tsx` (refresh, persist the
+  rotated token, `fetchMe`) keeps one module-level in-flight promise keyed by the stored token, so both
+  effect invocations share a single request, then clears it once settled so a later, separate mount always
+  recovers fresh. It never rejects (a failure clears the stored token and resolves `null`), so the effect
+  keeps its single `.then().finally()` chain and `set-state-in-effect` is still satisfied without a
+  suppression. `auth-context.test.tsx` covers it under `<React.StrictMode>` with a mock that 401s a
+  re-used token (one `apiRefresh` call, session recovered, rotated token stored), plus the rejected-refresh,
+  no-stored-token, and later-remount cases; confirmed the new tests fail against the unfixed code first.
 - **A third bug, found only by actually running the app against the real stack, not by any test:** the
   running `docker-api-1` container's Postgres had never had `alembic upgrade head` run against it (a
   side effect of this session's earlier Docker Desktop instability, unrelated to this phase's own code),
@@ -1099,3 +1114,11 @@ trace follows an event end to end.
   instability, unrelated to any code in this phase) -- found only by driving the real app through the
   built-in browser end to end, not by any automated test. 13 new component/unit tests pass;
   lint/typecheck/`npm run build` all clean; both Playwright flows pass locally against the real stack.
+- 2026-09-21 — Phase 14 (bug fix, no new phase work) — Fixed session loss on full reload / deep link in
+  `next dev`: `AuthProvider`'s recovery effect sent two `POST /auth/refresh` calls with the same single-use
+  refresh token under React Strict Mode (first `200`, second `401`, then the failure path cleared
+  `localStorage`). Recovery now goes through one module-level in-flight promise keyed by the stored token
+  (`recoverSession` in `frontend/src/lib/auth-context.tsx`), shared by both effect invocations and cleared
+  on settle; the effect keeps its single promise-chain shape, no lint suppression. No API or backend
+  change. Updated §6.11; added `frontend/src/lib/auth-context.test.tsx` (4 tests, Strict Mode, verified
+  failing before the fix).
