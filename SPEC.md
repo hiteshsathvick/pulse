@@ -100,11 +100,11 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **AuditLog** — `id, org_id, actor_id, action, target, metadata (JSONB), created_at`.
 - **Billing** — `Subscription`, `UsageRecord (org_id, period, events_ingested, mtu)` (Stripe-linked).
 
-> As of Phase 9: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
+> As of Phase 15: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
 > listed above — see §6.2), `Invite` and `AuditLog` (Phase 4), `ApiKey` (Phase 5, ahead of this table's
-> original phase note — see §4.1), `EventSchema`/`PropertySchema` (Phase 9, see §6.6). The rest of this
-> list is the full eventual shape; each remaining table is built in the phase that needs it (`Insight`/
-> `Dashboard` Phase 15/16, `Alert` Phase 19, `Billing` Phase 20).
+> original phase note — see §4.1), `EventSchema`/`PropertySchema` (Phase 9, see §6.6), `Insight` (Phase 15,
+> see §6.12). The rest of this list is the full eventual shape; each remaining table is built in the phase
+> that needs it (`Dashboard` Phase 16, `Alert` Phase 19, `Billing` Phase 20).
 
 ### 4.1 Row-Level Security mechanism (implemented Phase 2, extended Phase 3/4/5)
 
@@ -780,6 +780,99 @@ rather than building from scratch, adapted where pulse's actual backend shape di
   driven manually through the built-in browser tool end to end as a final check, which is what actually
   caught the CORS/migrations bug above -- none of the automated tests would have.
 
+### 6.12 Insight builder + charts mechanism (implemented Phase 15)
+
+The first phase that surfaces Phases 11-13's query engine in the UI, plus the `Insight` table that lets a
+built query be saved and reopened.
+
+**Backend (`Insight` persistence)**
+- **`insights` table (migration `0008`)** -- `id, org_id, project_id, name, kind, spec JSONB, created_by`,
+  RLS-protected on `org_id` exactly like `event_schemas` (a browse-this-project's-saved-insights pattern,
+  not token redemption). `kind` (`insight_kind` enum) is denormalized from `spec.kind` so a list can label
+  by type without parsing JSONB; `update_insight` re-derives it whenever the spec changes, so the two can't
+  drift.
+- **A saved spec can never be one the query engine can't compile.** The write requests take the spec as
+  `InsightSpec` behind a `kind` discriminator (`pulse/api/insights.py`), so FastAPI rejects a bad spec with a
+  clean `422` before any row is written -- the same Pydantic models the query endpoints use, not a second
+  validator. The service stores `model_dump(mode="json", by_alias=True)`, so `DateRange` keeps its `"from"`
+  alias and a stored spec can be POSTed straight back to `/query/{kind}`.
+- **Endpoints** under `/api/v1/orgs/{org_id}/projects/{project_id}/insights`: `GET` (list, newest-updated
+  first), `POST`, `GET /{id}`, `PATCH /{id}` (rename and/or replace the spec; at least one required),
+  `DELETE /{id}`. Read needs `viewer`; write/delete need `member` (this repo's roles are
+  viewer/member/admin/owner). Every mutation writes an `AuditLog` row in the same transaction. An insight
+  is only reachable through its own project's URL -- a sibling project in the same org gets a `404`.
+- **A real bug caught by the new tests, worth remembering for any future RLS-table service:** the org
+  scope (`set_config(..., true)`) is *transaction-local*. Calling `session.refresh(obj)` **after**
+  `session.commit()` opens a fresh, unscoped transaction, so the RLS policy's
+  `current_setting('app.current_org_id')::uuid` reads `''` and Postgres raises `invalid input syntax for
+  type uuid: ""` -- not a permissions error, which made it look like a driver problem. Fix: flush and
+  refresh *before* commit (needed here because `updated_at` is a server-side `onupdate` value SQLAlchemy
+  expires after flush).
+
+**Frontend (builder + charts)**
+- **Chart library: Recharts** (the choice §2 deferred to this phase). Line/bar/table trends use it;
+  **funnel and retention are custom components** (a step-bar list; a cohort × period heat grid) because
+  neither is a standard chart shape, so a charting library would not have saved any work there.
+- **The form edits a string-typed `Draft`; `buildSpec()` (`src/lib/insight-spec.ts`) is the only place a
+  spec is produced**, and it validates the same rules the backend enforces (≥1 event / ≥2 funnel steps,
+  positive integer window, retention `periods` 1-52, ordered date range, complete filter rows). An invalid
+  form shows why and sends nothing. `specToDraft()` is its inverse, which is what makes a saved insight
+  reload into the form losslessly (round-trip tested for all three kinds, including a non-default `tz`).
+  Retention has no filters or breakdown in the API, so the UI hides them for that kind rather than
+  collecting fields that would be silently dropped.
+- **Schema-driven autocomplete uses a native `<input list>` + `<datalist>`, not a custom combobox** --
+  accessible for free and, importantly, still accepts free text: the registry only learns an event/property
+  name once it has been ingested, so a user can legitimately type one it doesn't know yet. Event
+  suggestions come from `GET /schema/events`; property suggestions from the properties of the events
+  currently picked. `hidden` events/properties are excluded; the sum/average measure offers numeric
+  properties only.
+- **Result shaping is pure and separate from rendering** (`src/lib/insight-results.ts`: `pivotTrend`,
+  `groupFunnel`, `pivotRetention`), so the pivoting is unit-tested without a DOM. Bucket labels are
+  trimmed from the server's string rather than round-tripped through `Date`, which would re-shift them
+  into the browser's timezone and undo the query engine's project-timezone bucketing (§5.3).
+- **Routes:** `.../insights` (list), `.../insights/new`, `.../insights/[insightId]` (opens a saved insight:
+  form pre-filled from its stored spec and its result re-run automatically). The project home links to it.
+
+**Testing.** Backend `tests/test_insights.py` (14): each kind round-trips through save → reload with an
+identical parsed spec; six invalid specs are rejected and nothing is stored; rename / re-spec keeps `kind`
+in sync; delete; viewer-read-only; **tenant-leakage** (another org gets `404` on read/list/patch/delete, and
+RLS independently hides it at the service layer); a sibling project can't reach it. Frontend (43 new
+Vitest tests): spec building/validation/round-trip, result pivoting and formatting, every result type
+rendering (chart wrapper + table view for trend, steps/drop-off for funnel, grid + unobserved-cell dash for
+retention, and each empty state), and the builder end to end against a mocked API (autocomplete contents,
+the exact spec sent for each kind, save/update/delete, API errors surfaced, saved insight pre-fills and
+auto-runs). Recharts needs a `ResizeObserver` stub in `vitest.setup.ts` (jsdom has none); tests assert on
+the chart's wrapper and the table view, not SVG geometry.
+
+**Verified live, and what that caught.** Beyond the tests, the phase was driven through the built-in
+browser against a real API, Postgres, and ClickHouse seeded with a synthetic event stream (a local demo
+account/dataset, not part of the repo): the deep-linked insights list, opening a saved funnel (form
+pre-filled, result auto-run, drop-offs summing correctly), building a trend from scratch (autocomplete
+offering the registry's events, then the picked event's properties, numeric-only for a sum), the real
+Recharts line chart with three breakdown series, saving (redirects to the new insight's own page), and
+the retention grid. Two defects surfaced that no unit test had, both fixed with regression tests:
+- **Float noise in summed decimals** (`88.97999999999999` in the trend table). Values now go through
+  `formatValue()` (whole numbers stay whole, at most two decimals, thousands grouped), in the table and
+  the chart tooltip.
+- **Retention showed `0.0%` for periods that hadn't happened yet.** The engine (§6.10) returns a row for
+  every cohort × offset, so a cohort born last week had offsets 1..N reading 0. That misstates retention
+  (it reads as "nobody came back"). `RetentionResult` now renders a dash ("Not observable yet") for any
+  cell whose period start is in the future (`hasPeriodStarted`), so the grid is the correct staircase.
+  This needs the period length, which the response rows don't carry, so the retention `QueryResult`
+  variant now carries the spec's `period`.
+
+**Found along the way, outside this phase:** in `next dev`, a full reload lost the session -- Phase 14's
+recovery effect (`auth-context.tsx`) had no in-flight guard, and React Strict Mode runs effects twice, so
+two refreshes raced on one single-use refresh token (one 200, one 401 that cleared state). A production
+build runs the effect once and was unaffected, which is why the live checks above used `next build` +
+`next start`. Fixed separately as a Phase 14 bug fix (see the 2026-09-21 Phase 14 change-log entry), not
+as part of this phase.
+
+**Deliberately not done this phase:** dashboards / arranging saved insights (Phase 16); a Playwright flow
+for the builder (the DoD's named tests are the three above; Phase 14's precedent kept e2e out of CI);
+role-aware hiding of Save/Delete for viewers (the API's `403` is shown instead); unsaved-changes prompt on
+navigation.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -840,9 +933,9 @@ Tests: cohort assignment; day/week bucketing; **hand-computed retention fixture 
 **Phase 14 — Frontend foundation.** ☑ shell/nav/design system/data layer/auth routing/org+project switcher.
 Tests: components + a couple of Playwright flows. See §6.11.
 
-**Phase 15 — Insight builder + charts.** ☐ builder with schema-driven autocomplete; ☐ line/bar/table +
-funnel + retention viz; ☐ save insights. Tests: builder emits valid specs; each result type renders; saved
-insights reload.
+**Phase 15 — Insight builder + charts.** ☑ builder with schema-driven autocomplete; ☑ line/bar/table +
+funnel + retention viz; ☑ save insights. Tests: builder emits valid specs; each result type renders; saved
+insights reload. See §6.12.
 
 **Phase 16 — Dashboards.** ☐ dashboard CRUD; ☐ arrange saved insights; ☐ per-dashboard range + refresh; ☐
 RBAC sharing. Tests: layout persistence; permission-scoped sharing; refresh correctness.
@@ -1122,3 +1215,23 @@ trace follows an event end to end.
   on settle; the effect keeps its single promise-chain shape, no lint suppression. No API or backend
   change. Updated §6.11; added `frontend/src/lib/auth-context.test.tsx` (4 tests, Strict Mode, verified
   failing before the fix).
+- 2026-09-21 — Phase 15 — Added §6.12 (the insight builder + charts mechanism) and ticked the Phase 15
+  DoD. Backend: an `insights` table (migration `0008`, RLS-protected on `org_id` like `event_schemas`) and
+  list/create/get/patch/delete endpoints under `/orgs/{org_id}/projects/{project_id}/insights` (viewer
+  reads, member+ writes, every mutation audit-logged); the spec is validated by the same Pydantic models
+  the query endpoints use behind a `kind` discriminator, so a saved spec can never be one the engine can't
+  compile, and is stored with the `"from"` alias so it can be POSTed straight back to `/query/{kind}`.
+  Frontend: Recharts for line/bar/table trends; custom funnel step-bars and a retention cohort grid; a
+  `Draft` → `buildSpec()` builder that mirrors the backend's validation, with native `<datalist>`
+  autocomplete from the schema registry (hidden entries excluded, numeric-only for sum/average, free text
+  still allowed); routes `.../insights`, `.../insights/new`, `.../insights/[insightId]` (a saved insight
+  pre-fills the form and re-runs on open). One real backend bug caught by the new tests: the org scope is
+  transaction-local, so `session.refresh()` *after* `commit()` ran in an unscoped transaction and RLS
+  raised `invalid input syntax for type uuid: ""` (fixed by flushing/refreshing before commit). Two real
+  frontend defects caught only by driving the app in the built-in browser against a real stack, both
+  fixed with regression tests: float noise in summed decimals (`88.97999999999999`), and retention showing
+  `0.0%` for periods that hadn't happened yet (now a dash; the retention result carries its `period`).
+  A pre-existing Phase 14 session-loss-on-reload bug in `next dev` was found and fixed separately (entry
+  above). Not done, by design: dashboards (Phase 16), a Playwright flow for the builder, role-aware hiding
+  of Save/Delete for viewers, an unsaved-changes prompt. 14 new backend tests (133 total pass); 43 new
+  frontend tests; ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc / `npm run build` all clean.
