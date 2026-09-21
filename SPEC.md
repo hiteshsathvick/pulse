@@ -1235,3 +1235,15 @@ trace follows an event end to end.
   above). Not done, by design: dashboards (Phase 16), a Playwright flow for the builder, role-aware hiding
   of Save/Delete for viewers, an unsaved-changes prompt. 14 new backend tests (133 total pass); 43 new
   frontend tests; ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc / `npm run build` all clean.
+- 2026-09-21 — CI fix (no phase work) — The `test` job's "Start MinIO" step had failed (`docker run` exit 125)
+  on every master run since at least 2026-09-18, so the backend suite (including Phase 8/9's object-storage
+  archiving tests and, since Phase 15, the insights tests) never actually ran in CI. Two causes: the
+  `minio/minio` Docker Hub repository no longer exists (MinIO now publishes to quay.io), and the step
+  published MinIO on host port 9000, which the ClickHouse service container already holds for its native
+  port -- the clash the local compose file already avoids by using 9002. CI now runs
+  `quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z` (pinned, not `latest`) on 9002, with `S3_ENDPOINT_URL`
+  and the readiness probe updated to match; the same pinned image replaces `minio/minio:latest` in
+  `infra/docker/docker-compose.yml`, which only worked on machines that still had a cached copy. Verified
+  locally by starting that exact image with the CI `docker run` command and running `tests/test_worker.py`
+  against it (8 pass; the same 8 error with MinIO stopped, so they do exercise it). The full CI run itself
+  can only be confirmed on GitHub.

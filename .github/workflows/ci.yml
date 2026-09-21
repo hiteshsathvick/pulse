@@ -109,7 +109,7 @@ jobs:
       CLICKHOUSE_PASSWORD: pulse
       CLICKHOUSE_DATABASE: pulse
       REDIS_URL: redis://localhost:6379/0
-      S3_ENDPOINT_URL: http://localhost:9000
+      S3_ENDPOINT_URL: http://localhost:9002
       S3_ACCESS_KEY: pulse
       S3_SECRET_KEY: pulse12345
     steps:
@@ -127,11 +127,18 @@ jobs:
       # passed explicitly or it never starts serving. Missing since this job
       # was first written; Phase 8/9's worker tests (object-storage
       # archiving) need it and were silently unexercised in CI until now.
+      #
+      # Two things that made this step fail (exit 125) on every run: the
+      # `minio/minio` Docker Hub repository no longer exists (MinIO publishes
+      # to quay.io now), and host port 9000 is already taken by the ClickHouse
+      # service's native port -- the same clash the local compose file avoids
+      # by publishing MinIO on 9002. The tag is pinned, not `latest`, so a
+      # future upstream change can't silently break CI again.
       - name: Start MinIO
         run: |
-          docker run -d --name minio -p 9000:9000 \
+          docker run -d --name minio -p 9002:9000 \
             -e MINIO_ROOT_USER=pulse -e MINIO_ROOT_PASSWORD=pulse12345 \
-            minio/minio server /data
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
 
       - name: Wait for ClickHouse
         run: |
@@ -145,7 +152,7 @@ jobs:
       - name: Wait for MinIO
         run: |
           for i in $(seq 1 30); do
-            curl -sf http://localhost:9000/minio/health/live && exit 0
+            curl -sf http://localhost:9002/minio/health/live && exit 0
             sleep 2
           done
           echo "MinIO never became ready" >&2
