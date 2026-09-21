@@ -100,11 +100,11 @@ All tenant-scoped tables carry `org_id` and are protected by Row-Level Security.
 - **AuditLog** — `id, org_id, actor_id, action, target, metadata (JSONB), created_at`.
 - **Billing** — `Subscription`, `UsageRecord (org_id, period, events_ingested, mtu)` (Stripe-linked).
 
-> As of Phase 15: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
+> As of Phase 16: `User`/`Organization`/`Membership`/`Project` (Phase 2), `RefreshToken` (Phase 3, not
 > listed above — see §6.2), `Invite` and `AuditLog` (Phase 4), `ApiKey` (Phase 5, ahead of this table's
 > original phase note — see §4.1), `EventSchema`/`PropertySchema` (Phase 9, see §6.6), `Insight` (Phase 15,
-> see §6.12). The rest of this list is the full eventual shape; each remaining table is built in the phase
-> that needs it (`Dashboard` Phase 16, `Alert` Phase 19, `Billing` Phase 20).
+> see §6.12), `Dashboard`/`DashboardItem` (Phase 16, see §6.13). The rest of this list is the full eventual
+> shape; each remaining table is built in the phase that needs it (`Alert` Phase 19, `Billing` Phase 20).
 
 ### 4.1 Row-Level Security mechanism (implemented Phase 2, extended Phase 3/4/5)
 
@@ -873,6 +873,98 @@ for the builder (the DoD's named tests are the three above; Phase 14's precedent
 role-aware hiding of Save/Delete for viewers (the API's `403` is shown instead); unsaved-changes prompt on
 navigation.
 
+### 6.13 Dashboards mechanism (implemented Phase 16)
+
+Arranges saved insights (§6.12) on a shared grid, with a per-dashboard date range and a refresh that
+really is fresh. No new query capability: every tile runs the same `/query/{kind}` endpoints as the builder.
+
+**Backend**
+- **Tables (migration `0009`):** `dashboards` (`name, layout, default_range, shared_scope, created_by`) and
+  `dashboard_items` (`dashboard_id, insight_id, position`), both RLS-protected on `org_id`. Beyond §4's
+  sketch, an item also carries its own `org_id` (so its policy is a direct check, never a join) and the
+  usual timestamps, and `(dashboard_id, insight_id)` is unique. Deleting an insight deletes its items
+  (`ON DELETE CASCADE`): it simply disappears from the dashboards that showed it. `layout` holds only grid
+  configuration (`{"columns": 12}`); each tile's placement lives on its item as `{x, y, w, h}`.
+- **Sharing is two separate rules** (`pulse/dashboards/service.py`, the only place they live):
+  *who can see it* -- `shared_scope` `private` (its creator only; not even an org owner or admin) or `org`
+  (every member); and *who can edit it* -- never a viewer, always the creator, and an admin/owner for any
+  dashboard they can see. There is no per-user grant table: the spec's data model has a single
+  `shared_scope` column, and scope + role covers "share it read-only with a teammate". An invisible
+  dashboard reads as `404`, not `403`, so a private dashboard's existence isn't leaked; a visible but
+  uneditable one is `403`. The response carries a server-computed `can_edit`, so the UI never
+  re-implements these rules.
+- **Endpoints** under `/orgs/{org_id}/projects/{project_id}/dashboards`: `GET` (only what the caller can
+  see, with an item count), `POST` (member+), `GET /{id}` (with each item's insight and spec embedded, in
+  reading order), `PATCH /{id}` and `DELETE /{id}` (member+, then the edit rule). **`PATCH` takes an
+  optional `items` list that replaces the whole layout in one transaction** -- there is no partial layout
+  update, so a saved dashboard is never half old, half new. (An earlier plan had a separate
+  `PUT /{id}/items`; folding it into `PATCH` makes rename-plus-relayout atomic too.) Every mutation is
+  audit-logged with which fields changed.
+- **Layout validation is server-side and independent of the UI:** each tile inside the 12-column grid
+  (`x + w <= 12`, `1 <= h <= 8`), no two tiles overlapping, no insight twice, at most 20 tiles, and every
+  insight must exist *in this project* -- another org's insight is simply absent under RLS, so it fails the
+  same way as a nonexistent one (`422`, without confirming it exists elsewhere).
+- **Two persistence details worth remembering:** a layout-only change doesn't modify the `dashboards` row,
+  so `updated_at` (an `onupdate` default) would never move -- it is touched explicitly. And re-saving an
+  insight that was already on the dashboard must not trip the unique constraint: the old items are removed
+  with a Core `DELETE` that executes immediately, because an ORM `session.delete()` would be ordered
+  *after* the same flush's `INSERT`s.
+- **Refresh:** the three query endpoints accept `?refresh=true`, which skips the Redis *read* but still
+  writes the fresh result back (`run_trend/funnel/retention(..., refresh=True)`). Without it a Refresh
+  button could show up to `query_cache_ttl_seconds` (60 s) of stale numbers; with the write-back, the next
+  ordinary call is served the up-to-date value rather than the old one.
+
+**Frontend**
+- **Range.** `default_range` is `relative` ("last N days", N 1-366, counting today) or `absolute`. A saved
+  insight carries its own fixed dates; on a dashboard the dashboard's range overrides only `from`/`to`
+  (`withRange`) -- a per-insight timezone override, funnel window, retention periods etc. are left as
+  saved. "Today" is resolved in the **project's** timezone, not the browser's, because the query engine
+  bounds and buckets by project-local dates (§5.3); otherwise "last 7 days" is off by one near midnight.
+  Anyone, including a read-only viewer, can change the range for their own view; only an editor can change
+  the saved default.
+- **Layout editing works on an ordered list of sized tiles, not free-form rectangles.** `packLayout` places
+  tiles left to right, wraps at 12 columns, and starts each row below the tallest tile in the previous one,
+  so an overlapping or out-of-bounds layout is unrepresentable from the UI (a randomized test asserts it for
+  arbitrary mixes). Sizes are Small 4x3, Medium 6x3, Large 12x4; a tile is reordered with Up/Down. **No
+  drag-and-drop** -- it needs a grid library and is the hardest part to test reliably; because positions
+  are stored as `{x, y, w, h}`, adding it later needs no migration. `buildPatch` sends only what changed
+  (a rename doesn't rewrite the layout).
+- **The page** renders the saved placement as a CSS grid from `md` up (140 px rows) and stacks tiles in one
+  column below that. Each tile fetches for itself (a failing insight shows its own error and leaves the
+  rest working) and keeps its previous chart on screen while a new range or refresh loads. Refresh bumps a
+  counter that both changes the query key and sends `refresh=true`; auto-refresh (off / 1 min / 5 min) is a
+  client-side timer that does the same and is deliberately not persisted (a saved interval would need a
+  column beyond the spec's model). A brand-new empty dashboard opens straight in the editor; the
+  create form is hidden from viewers (the API would refuse it).
+
+**Testing.** Backend (16 new; 149 total pass): CRUD and defaults; invalid ranges; **layout persistence**
+(out-of-order input reloads in reading order, a second save replaces the first including a re-placed
+insight, `[]` clears it, a layout-only change moves `updated_at`); seven kinds of invalid layout rejected
+with the saved one untouched; a cross-project insight refused; deleting an insight drops its tiles; the
+full **sharing matrix** (private / org x owner / admin / creator / other member / viewer, including 404 vs
+403 and that changing scope changes visibility immediately); **tenant leakage** (another org gets 404 on
+everything, cannot place this org's insight, and RLS independently hides it below the router); and
+**refresh correctness** (a normal call returns the cached stale value, `refresh` returns the new one and the
+next ordinary call then agrees, for all three insight kinds and over HTTP). Frontend (59 new; 119 total):
+range resolution incl. timezone boundaries (the same instant is a different calendar date in India and
+California), `withRange` for each insight kind, layout packing/operations, draft diffing; and the view,
+editor and list components against a mocked API.
+
+**Verified live** in the built-in browser against a real API, Postgres and ClickHouse, with two real
+accounts: an owner assembled a trend + funnel + retention dashboard shared with the org (the saved
+placement applied exactly at desktop width, and survived a full reload); changing the range and pressing
+Refresh re-ran all three tiles (`?refresh=true`, and a signup inserted directly into ClickHouse appeared);
+a *viewer* then saw the dashboard read-only (no Edit button, own range change works), and driving the API
+as that viewer returned `403` for rename, re-layout, delete and create, and `404` for a private dashboard.
+No defects surfaced in that run.
+
+**Deliberately not done:** drag-and-drop; per-user sharing/ACLs; dashboard-wide filters; duplicating a
+dashboard; public links; text tiles; alerts (Phase 19); a Playwright flow (as in Phase 15, e2e stays out of
+CI); an unsaved-changes prompt; and **reading from rollups** -- `PULSE_PROJECT_GUIDE.md`'s Phase 16 entry
+lists it, but this spec assigns rollups to Phase 17 with their own parity tests and benchmarks, so this
+phase follows the spec. **Known risk until Phase 17:** a dashboard fires one query per tile at once (at
+most 20), and per-tenant query rate limits don't exist yet.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -937,8 +1029,8 @@ Tests: components + a couple of Playwright flows. See §6.11.
 funnel + retention viz; ☑ save insights. Tests: builder emits valid specs; each result type renders; saved
 insights reload. See §6.12.
 
-**Phase 16 — Dashboards.** ☐ dashboard CRUD; ☐ arrange saved insights; ☐ per-dashboard range + refresh; ☐
-RBAC sharing. Tests: layout persistence; permission-scoped sharing; refresh correctness.
+**Phase 16 — Dashboards.** ☑ dashboard CRUD; ☑ arrange saved insights; ☑ per-dashboard range + refresh; ☑
+RBAC sharing. Tests: layout persistence; permission-scoped sharing; refresh correctness. See §6.13.
 
 **Phase 17 — Rollups + performance.** ☐ MVs per §5.2; ☐ router prefers rollups; ☐ per-tenant query rate
 limits; ☐ load tests. Tests: **rollup vs raw parity**; documented before/after benchmarks meeting §1.4 targets.
@@ -1247,3 +1339,19 @@ trace follows an event end to end.
   locally by starting that exact image with the CI `docker run` command and running `tests/test_worker.py`
   against it (8 pass; the same 8 error with MinIO stopped, so they do exercise it). The full CI run itself
   can only be confirmed on GitHub.
+- 2026-09-21 — Phase 16 — Added §6.13 (the dashboards mechanism) and ticked the Phase 16 DoD. Backend: RLS-
+  protected `dashboards` / `dashboard_items` tables (migration `0009`) and list/create/get/patch/delete
+  endpoints; sharing is `private` | `org` for visibility plus a separate edit rule (never a viewer; the
+  creator; an admin/owner on anything they can see), with invisible dashboards returning `404` and a
+  server-computed `can_edit`; the whole layout is replaced atomically through `PATCH` (a deviation from the
+  plan's separate `PUT /items`) and validated for bounds, overlap, duplicates, the 20-tile cap and
+  same-project insights; and `?refresh=true` on the three query endpoints skips the cache read but
+  re-fills it. Frontend: `.../dashboards` and `.../dashboards/[dashboardId]`, a relative/absolute range
+  that overrides each insight's saved dates and resolves "today" in the project's timezone, a tile editor
+  that packs an ordered list of sized tiles into a 12-column grid (so overlap is unrepresentable; no
+  drag-and-drop), per-tile loading and errors, Refresh and optional auto-refresh. Verified live with an owner
+  and a second, viewer-role account (read-only in the UI, `403`/`404` from the API). Not done, by design:
+  drag-and-drop, per-user sharing, dashboard-wide filters, a Playwright flow, and rollups (the project
+  guide lists them under Phase 16, this spec under Phase 17; the spec was followed). 16 new backend tests
+  (149 total pass); 59 new frontend tests (119 total pass); ruff / ruff format / mypy (`pulse`, strict) /
+  eslint / tsc / `npm run build` all clean.

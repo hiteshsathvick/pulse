@@ -30,9 +30,11 @@ class RetentionResponse(BaseModel):
 
 
 @router.post("/trend", response_model=TrendResponse)
-async def query_trend(org_id: uuid.UUID, project_id: uuid.UUID, spec: TrendSpec) -> TrendResponse:
+async def query_trend(
+    org_id: uuid.UUID, project_id: uuid.UUID, spec: TrendSpec, refresh: bool = False
+) -> TrendResponse:
     try:
-        result = await query_service.run_trend(spec, org_id, project_id)
+        result = await query_service.run_trend(spec, org_id, project_id, refresh=refresh)
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
@@ -42,10 +44,10 @@ async def query_trend(org_id: uuid.UUID, project_id: uuid.UUID, spec: TrendSpec)
 
 @router.post("/funnel", response_model=FunnelResponse)
 async def query_funnel(
-    org_id: uuid.UUID, project_id: uuid.UUID, spec: FunnelSpec
+    org_id: uuid.UUID, project_id: uuid.UUID, spec: FunnelSpec, refresh: bool = False
 ) -> FunnelResponse:
     try:
-        result = await query_service.run_funnel(spec, org_id, project_id)
+        result = await query_service.run_funnel(spec, org_id, project_id, refresh=refresh)
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
@@ -55,10 +57,10 @@ async def query_funnel(
 
 @router.post("/retention", response_model=RetentionResponse)
 async def query_retention(
-    org_id: uuid.UUID, project_id: uuid.UUID, spec: RetentionSpec
+    org_id: uuid.UUID, project_id: uuid.UUID, spec: RetentionSpec, refresh: bool = False
 ) -> RetentionResponse:
     try:
-        result = await query_service.run_retention(spec, org_id, project_id)
+        result = await query_service.run_retention(spec, org_id, project_id, refresh=refresh)
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"

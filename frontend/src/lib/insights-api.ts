@@ -104,10 +104,13 @@ export async function runInsightQuery(
   accessToken: string,
   orgId: string,
   projectId: string,
-  spec: InsightSpec
+  spec: InsightSpec,
+  // `refresh` skips the server's short result cache (and re-fills it), so a
+  // dashboard's Refresh shows current data rather than up-to-a-minute-old data.
+  options: { refresh?: boolean } = {}
 ): Promise<QueryResult> {
   const response = await authedFetch(
-    `/api/v1/orgs/${orgId}/projects/${projectId}/query/${spec.kind}`,
+    `/api/v1/orgs/${orgId}/projects/${projectId}/query/${spec.kind}${options.refresh ? "?refresh=true" : ""}`,
     accessToken,
     { method: "POST", body: JSON.stringify(spec) }
   );

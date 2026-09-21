@@ -20,7 +20,9 @@ class TrendResult:
     cached: bool
 
 
-async def run_trend(spec: TrendSpec, org_id: uuid.UUID, project_id: uuid.UUID) -> TrendResult:
+async def run_trend(
+    spec: TrendSpec, org_id: uuid.UUID, project_id: uuid.UUID, *, refresh: bool = False
+) -> TrendResult:
     project = await projects_service.get_project(org_id, project_id)
     if project is None:
         raise ProjectNotFound()
@@ -29,7 +31,9 @@ async def run_trend(spec: TrendSpec, org_id: uuid.UUID, project_id: uuid.UUID) -
     redis_client = get_redis_client()
     key = cache.cache_key(spec, org_id, project_id)
 
-    cached = await cache.get_cached(redis_client, key)
+    # `refresh` skips only the read: the fresh result is still written back below,
+    # so the next ordinary call is served the up-to-date value, not a stale one.
+    cached = None if refresh else await cache.get_cached(redis_client, key)
     if cached is not None:
         return TrendResult(results=cached, cached=True)
 
@@ -66,7 +70,9 @@ class FunnelResult:
     cached: bool
 
 
-async def run_funnel(spec: FunnelSpec, org_id: uuid.UUID, project_id: uuid.UUID) -> FunnelResult:
+async def run_funnel(
+    spec: FunnelSpec, org_id: uuid.UUID, project_id: uuid.UUID, *, refresh: bool = False
+) -> FunnelResult:
     project = await projects_service.get_project(org_id, project_id)
     if project is None:
         raise ProjectNotFound()
@@ -75,7 +81,9 @@ async def run_funnel(spec: FunnelSpec, org_id: uuid.UUID, project_id: uuid.UUID)
     redis_client = get_redis_client()
     key = cache.cache_key(spec, org_id, project_id)
 
-    cached = await cache.get_cached(redis_client, key)
+    # `refresh` skips only the read: the fresh result is still written back below,
+    # so the next ordinary call is served the up-to-date value, not a stale one.
+    cached = None if refresh else await cache.get_cached(redis_client, key)
     if cached is not None:
         return FunnelResult(results=cached, cached=True)
 
@@ -154,7 +162,7 @@ class RetentionResult:
 
 
 async def run_retention(
-    spec: RetentionSpec, org_id: uuid.UUID, project_id: uuid.UUID
+    spec: RetentionSpec, org_id: uuid.UUID, project_id: uuid.UUID, *, refresh: bool = False
 ) -> RetentionResult:
     project = await projects_service.get_project(org_id, project_id)
     if project is None:
@@ -164,7 +172,9 @@ async def run_retention(
     redis_client = get_redis_client()
     key = cache.cache_key(spec, org_id, project_id)
 
-    cached = await cache.get_cached(redis_client, key)
+    # `refresh` skips only the read: the fresh result is still written back below,
+    # so the next ordinary call is served the up-to-date value, not a stale one.
+    cached = None if refresh else await cache.get_cached(redis_client, key)
     if cached is not None:
         return RetentionResult(results=cached, cached=True)
 

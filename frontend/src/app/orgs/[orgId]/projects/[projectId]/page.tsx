@@ -37,8 +37,16 @@ function ProjectHome() {
           Insights
         </Link>
         <p className="text-gray-500">
-          Build trends, funnels, and retention charts, and save them. Dashboards and schema
-          management land in later phases.
+          Build trends, funnels, and retention charts, and save them.
+        </p>
+        <Link
+          href={`/orgs/${orgId}/projects/${projectId}/dashboards`}
+          className="mt-2 text-lg font-medium underline"
+        >
+          Dashboards
+        </Link>
+        <p className="text-gray-500">
+          Arrange saved insights on a dashboard and share it with your team.
         </p>
       </div>
     </div>

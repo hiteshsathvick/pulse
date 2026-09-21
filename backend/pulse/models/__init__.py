@@ -1,6 +1,7 @@
 from pulse.models.api_key import ApiKey, ApiKeyType
 from pulse.models.audit_log import AuditLog
 from pulse.models.base import Base
+from pulse.models.dashboard import Dashboard, DashboardItem, DashboardScope
 from pulse.models.insight import Insight, InsightKind
 from pulse.models.invite import Invite
 from pulse.models.membership import Membership, MembershipRole
@@ -15,6 +16,9 @@ __all__ = [
     "ApiKeyType",
     "AuditLog",
     "Base",
+    "Dashboard",
+    "DashboardItem",
+    "DashboardScope",
     "EventSchema",
     "Insight",
     "InsightKind",

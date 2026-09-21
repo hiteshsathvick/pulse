@@ -634,3 +634,94 @@ async def test_query_auth_accepts_jwt_or_read_key_and_rejects_everything_else() 
         assert (
             await client.post(other_url, json=body, headers={"X-API-Key": read_key})
         ).status_code == 404
+
+
+async def test_refresh_bypasses_the_cache_but_repopulates_it() -> None:
+    """Phase 16 DoD: refresh correctness. A dashboard's Refresh button must show
+    current data (not the up-to-60s-stale cached value), and the fresh value
+    must be what the next ordinary call is served -- not left behind the old one."""
+    org_id, project_id, _ = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+
+    def event() -> dict[str, object]:
+        return generate_fake_event(
+            org_id, project_id, event_name="checkout completed", timestamp=_FIXED_TIMESTAMP
+        )
+
+    await insert_events(ch_client, [event()])
+    spec = _spec()
+    first = await query_service.run_trend(spec, org_id, project_id)
+    assert (first.cached, first.results[0]["value"]) == (False, 1)
+
+    await insert_events(ch_client, [event()])
+
+    stale = await query_service.run_trend(spec, org_id, project_id)
+    assert (stale.cached, stale.results[0]["value"]) == (True, 1)
+
+    refreshed = await query_service.run_trend(spec, org_id, project_id, refresh=True)
+    assert (refreshed.cached, refreshed.results[0]["value"]) == (False, 2)
+
+    after = await query_service.run_trend(spec, org_id, project_id)
+    assert (after.cached, after.results[0]["value"]) == (True, 2)
+
+
+@pytest.mark.parametrize("kind", ["funnel", "retention"])
+async def test_refresh_is_honoured_by_every_insight_kind(kind: str) -> None:
+    org_id, project_id, _ = await _create_org_and_project()
+    run = (
+        (
+            lambda refresh: query_service.run_funnel(
+                _funnel_spec(), org_id, project_id, refresh=refresh
+            )
+        )
+        if kind == "funnel"
+        else (
+            lambda refresh: query_service.run_retention(
+                _retention_spec(), org_id, project_id, refresh=refresh
+            )
+        )
+    )
+
+    assert (await run(False)).cached is False
+    assert (await run(False)).cached is True
+    assert (await run(True)).cached is False
+    assert (await run(False)).cached is True
+
+
+async def test_refresh_query_parameter_reaches_the_query_endpoints() -> None:
+    """The HTTP surface: `?refresh=true` is what the dashboard sends, so prove it
+    is actually wired to the service for all three endpoints, not just accepted."""
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        email = f"refresh-{uuid.uuid4().hex[:8]}@example.com"
+        await client.post(
+            "/api/v1/auth/register", json={"email": email, "password": _PASSWORD, "name": "R"}
+        )
+        login = await client.post(
+            "/api/v1/auth/login", json={"email": email, "password": _PASSWORD}
+        )
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        org = await client.post(
+            "/api/v1/orgs",
+            json={"name": "Refresh Org", "slug": f"refresh-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
+        )
+        org_id = org.json()["id"]
+        project = await client.post(
+            f"/api/v1/orgs/{org_id}/projects", json={"name": "Web", "slug": "web"}, headers=headers
+        )
+        base = f"/api/v1/orgs/{org_id}/projects/{project.json()['id']}/query"
+
+        bodies = {
+            "trend": _spec().model_dump(mode="json", by_alias=True),
+            "funnel": _funnel_spec().model_dump(mode="json", by_alias=True),
+            "retention": _retention_spec().model_dump(mode="json", by_alias=True),
+        }
+        for kind, body in bodies.items():
+            url = f"{base}/{kind}"
+            assert (await client.post(url, json=body, headers=headers)).json()["cached"] is False
+            assert (await client.post(url, json=body, headers=headers)).json()["cached"] is True
+            refreshed = await client.post(f"{url}?refresh=true", json=body, headers=headers)
+            assert refreshed.status_code == 200
+            assert refreshed.json()["cached"] is False

@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from pulse.api.auth import router as auth_router
+from pulse.api.dashboards import router as dashboards_router
 from pulse.api.health import router as health_router
 from pulse.api.insights import router as insights_router
 from pulse.api.invites import invites_router, org_invites_router
@@ -71,3 +72,4 @@ app.include_router(keys_router)
 app.include_router(schema_registry_router)
 app.include_router(query_router)
 app.include_router(insights_router)
+app.include_router(dashboards_router)
