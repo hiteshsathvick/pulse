@@ -33,3 +33,7 @@ Thumbs.db
 # tool) -- machine-specific convenience, not project source; matches this
 # author's other repos, none of which track .claude/.
 .claude/
+
+# Phase 17 load tests: .bench.json holds API keys, the CSVs are raw locust output
+backend/loadtests/.bench.json
+backend/loadtests/results/*.csv

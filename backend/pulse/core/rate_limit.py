@@ -3,7 +3,10 @@ from pulse.repositories.redis import get_client
 
 
 class RateLimitExceeded(Exception):
-    pass
+    def __init__(self, retry_after: int | None = None) -> None:
+        super().__init__()
+        # Seconds until the window resets, when the limiter knows it.
+        self.retry_after = retry_after
 
 
 async def check_login_rate_limit(identifier: str) -> None:
@@ -41,3 +44,31 @@ async def check_ingest_rate_limit(api_key_id: str) -> None:
 
     if count > settings.ingest_rate_limit_max_requests:
         raise RateLimitExceeded()
+
+
+async def check_query_rate_limit(org_id: str) -> None:
+    """Per-tenant limit on queries that actually run against ClickHouse (the
+    caller invokes this only after a cache miss, so cache hits are free).
+    Keyed by org -- the tenant -- not by user or API key, so one organization
+    can't crowd out the others no matter how many users or keys it has, and
+    isn't rewarded for splitting its load across them. Same fixed-window
+    Redis counter as the other limiters here.
+
+    Unlike them, it reports how long until the window resets, so the client
+    can be told when to retry."""
+    settings = get_settings()
+    client = get_client()
+    key = f"query:executions:{org_id}"
+
+    count = await client.incr(key)
+    if count == 1:
+        await client.expire(key, settings.query_rate_limit_window_seconds)
+
+    if count > settings.query_rate_limit_max_queries:
+        remaining = await client.ttl(key)
+        if remaining < 0:
+            # The key has no expiry (a crash between INCR and EXPIRE): without
+            # this it would block the org forever. Re-arm it.
+            await client.expire(key, settings.query_rate_limit_window_seconds)
+            remaining = settings.query_rate_limit_window_seconds
+        raise RateLimitExceeded(retry_after=max(remaining, 1))

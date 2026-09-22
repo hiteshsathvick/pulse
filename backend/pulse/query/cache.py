@@ -1,12 +1,22 @@
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 
 from redis.asyncio import Redis
 
 from pulse.query.spec import InsightSpec
 
-_KEY_PREFIX = "query:cache:"
+# v2: the cached value became {"results", "source", "approximate"} instead of a
+# bare list, so the answer's provenance survives a cache hit.
+_KEY_PREFIX = "query:cache:v2:"
+
+
+@dataclass(frozen=True)
+class CachedResult:
+    results: list[dict[str, object]]
+    source: str = "raw"
+    approximate: bool = False
 
 
 def cache_key(spec: InsightSpec, org_id: uuid.UUID, project_id: uuid.UUID) -> str:
@@ -19,15 +29,26 @@ def cache_key(spec: InsightSpec, org_id: uuid.UUID, project_id: uuid.UUID) -> st
     return f"{_KEY_PREFIX}{digest}"
 
 
-async def get_cached(redis_client: Redis, key: str) -> list[dict[str, object]] | None:
+async def get_cached(redis_client: Redis, key: str) -> CachedResult | None:
     raw = await redis_client.get(key)
     if raw is None:
         return None
-    result: list[dict[str, object]] = json.loads(raw)
-    return result
+    data = json.loads(raw)
+    return CachedResult(
+        results=data["results"],
+        source=data.get("source", "raw"),
+        approximate=data.get("approximate", False),
+    )
 
 
 async def set_cached(
-    redis_client: Redis, key: str, results: list[dict[str, object]], ttl_seconds: int
+    redis_client: Redis,
+    key: str,
+    results: list[dict[str, object]],
+    ttl_seconds: int,
+    *,
+    source: str = "raw",
+    approximate: bool = False,
 ) -> None:
-    await redis_client.set(key, json.dumps(results, default=str), ex=ttl_seconds)
+    payload = {"results": results, "source": source, "approximate": approximate}
+    await redis_client.set(key, json.dumps(payload, default=str), ex=ttl_seconds)

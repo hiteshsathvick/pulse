@@ -1,0 +1,79 @@
+{
+  "label": "dash_large_off",
+  "scenario": "query",
+  "rollups": "off",
+  "mv": "on",
+  "subset": "dashboard",
+  "users": 30,
+  "duration_s": 60,
+  "stats": {
+    "trend.dau": {
+      "requests": 89,
+      "failures": 89,
+      "rps": 1.522772546784314,
+      "avg_ms": 13378.749219102921,
+      "p50_ms": 13000.0,
+      "p95_ms": 17000.0,
+      "p99_ms": 18000.0,
+      "max_ms": 17943.810499971732
+    },
+    "trend.event_counts": {
+      "requests": 87,
+      "failures": 87,
+      "rps": 1.488552938991408,
+      "avg_ms": 922.9208701216594,
+      "p50_ms": 790.0,
+      "p95_ms": 2200.0,
+      "p99_ms": 3900.0,
+      "max_ms": 3931.132099998649
+    },
+    "trend.hourly": {
+      "requests": 55,
+      "failures": 0,
+      "rps": 0.9410392143049132,
+      "avg_ms": 3033.3135072766295,
+      "p50_ms": 2800.0,
+      "p95_ms": 5500.0,
+      "p99_ms": 6500.0,
+      "max_ms": 6544.397799996659
+    },
+    "trend.mau": {
+      "requests": 31,
+      "failures": 31,
+      "rps": 0.530403920790042,
+      "avg_ms": 962.804232256472,
+      "p50_ms": 720.0,
+      "p95_ms": 2000.0,
+      "p99_ms": 5100.0,
+      "max_ms": 5125.113399990369
+    },
+    "trend.wau": {
+      "requests": 48,
+      "failures": 48,
+      "rps": 0.8212705870297424,
+      "avg_ms": 1045.0686645842022,
+      "p50_ms": 810.0,
+      "p95_ms": 3400.0,
+      "p99_ms": 3700.0,
+      "max_ms": 3745.8976000198163
+    },
+    "Aggregated": {
+      "requests": 310,
+      "failures": 255,
+      "rps": 5.30403920790042,
+      "avg_ms": 4896.275052261133,
+      "p50_ms": 1800.0,
+      "p95_ms": 15000.0,
+      "p99_ms": 17000.0,
+      "max_ms": 17943.810499971732
+    }
+  },
+  "routing": [
+    {
+      "query": "trend.hourly",
+      "source": "raw",
+      "approximate": false,
+      "count": 55
+    }
+  ]
+}

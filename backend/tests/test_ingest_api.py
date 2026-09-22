@@ -21,6 +21,7 @@ from pulse.services import api_keys as api_keys_service
 from pulse.services import orgs as orgs_service
 from pulse.services import projects as projects_service
 from pulse.services.api_keys import resolve_api_key
+from tests.clickhouse_schema import drop_event_schema
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _MIGRATIONS_DIR = _BACKEND_ROOT / "pulse" / "clickhouse_migrations" / "migrations"
@@ -70,8 +71,7 @@ def _events_table():
     yield
 
     async def _teardown(client) -> None:
-        await client.command("DROP TABLE IF EXISTS events")
-        await client.command("ALTER TABLE schema_migrations DELETE WHERE version = 1")
+        await drop_event_schema(client)
 
     asyncio.run(_with_fresh_clickhouse_client(_teardown))
 

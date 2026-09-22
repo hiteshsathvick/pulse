@@ -28,7 +28,9 @@ export type RetentionRow = {
 };
 
 export type QueryResult =
-  | { kind: "trend"; results: TrendRow[]; cached: boolean }
+  // `approximate`: a unique-user count over a large range came from a sketch, not an
+  // exact scan. Counts are never approximate.
+  | { kind: "trend"; results: TrendRow[]; cached: boolean; approximate: boolean }
   | { kind: "funnel"; results: FunnelRow[]; cached: boolean }
   | { kind: "retention"; results: RetentionRow[]; cached: boolean; period: "day" | "week" };
 
@@ -119,5 +121,7 @@ export async function runInsightQuery(
   const result = { kind: spec.kind, results: body.results, cached: body.cached };
   // The retention grid needs the period length to tell "0% retained" from
   // "that period hasn't happened yet"; the response rows don't carry it.
-  return (spec.kind === "retention" ? { ...result, period: spec.period } : result) as QueryResult;
+  if (spec.kind === "retention") return { ...result, period: spec.period } as QueryResult;
+  if (spec.kind === "trend") return { ...result, approximate: body.approximate === true } as QueryResult;
+  return result as QueryResult;
 }

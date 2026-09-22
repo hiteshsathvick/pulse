@@ -10,6 +10,7 @@ describe("InsightResult renders each result type", () => {
     const result: QueryResult = {
       kind: "trend",
       cached: false,
+      approximate: false,
       results: [
         { bucket: "2026-01-01T00:00:00+00:00", value: 3 },
         { bucket: "2026-01-02T00:00:00+00:00", value: 7 },
@@ -35,6 +36,7 @@ describe("InsightResult renders each result type", () => {
         result={{
           kind: "trend",
           cached: false,
+          approximate: false,
           results: [
             { bucket: "2026-01-01T00:00:00+00:00", breakdown: "ios", value: 3 },
             { bucket: "2026-01-01T00:00:00+00:00", breakdown: "web", value: 9 },
@@ -47,8 +49,21 @@ describe("InsightResult renders each result type", () => {
     expect(screen.getByRole("columnheader", { name: "web" })).toBeInTheDocument();
   });
 
+  it("says when unique-user counts are estimates, and stays quiet when they are exact", () => {
+    const rows = [{ bucket: "2026-01-01T00:00:00+00:00", value: 100 }];
+    const { rerender } = render(
+      <InsightResult result={{ kind: "trend", cached: false, approximate: true, results: rows }} />
+    );
+    expect(screen.getByRole("note")).toHaveTextContent(/estimated/i);
+
+    rerender(
+      <InsightResult result={{ kind: "trend", cached: false, approximate: false, results: rows }} />
+    );
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
+  });
+
   it("trend with no rows: an empty state, not a blank chart", () => {
-    render(<InsightResult result={{ kind: "trend", cached: false, results: [] }} />);
+    render(<InsightResult result={{ kind: "trend", cached: false, approximate: false, results: [] }} />);
     expect(screen.getByText("No events matched this query.")).toBeInTheDocument();
   });
 
@@ -154,6 +169,7 @@ describe("InsightResult renders each result type", () => {
         result={{
           kind: "trend",
           cached: false,
+          approximate: false,
           results: [
             { bucket: "2026-01-01T00:00:00+00:00", value: 88.97999999999999 },
             { bucket: "2026-01-02T00:00:00+00:00", value: 1234 },

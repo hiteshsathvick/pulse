@@ -244,24 +244,53 @@ Design notes (be able to defend each in an interview):
   happens) — this table's `ReplacingMergeTree` engine is a backstop for whatever slips past that, not a
   substitute for it.
 
-### 5.2 Rollups (Phase 17)
+### 5.2 Rollups (implemented Phase 17)
+
+**As built, deviating from this section's original sketch in three ways** (see §6.14 for the full
+mechanism and the load-test evidence behind each):
 
 ```sql
--- daily unique users per event, per project (AggregatingMergeTree via MV)
-CREATE MATERIALIZED VIEW mv_event_daily
+-- hourly count + approximate unique users per event, per project (AggregatingMergeTree via MV)
+CREATE TABLE event_hourly
+(
+    org_id      UUID,
+    project_id  UUID,
+    event_name  LowCardinality(String),
+    hour        DateTime('UTC'),
+    events      SimpleAggregateFunction(sum, UInt64),
+    users_state AggregateFunction(uniqCombined64(15), String)
+)
 ENGINE = AggregatingMergeTree
-PARTITION BY (org_id, toYYYYMM(day))
-ORDER BY (org_id, project_id, event_name, day)
-AS SELECT
-    org_id, project_id, event_name,
-    toDate(timestamp) AS day,
-    uniqState(user_id)  AS users_state,
-    count()             AS events
+PARTITION BY (org_id, toYYYYMM(hour))
+ORDER BY (org_id, project_id, event_name, hour)
+TTL hour + INTERVAL 365 DAY;
+
+CREATE MATERIALIZED VIEW mv_event_hourly TO event_hourly AS
+SELECT org_id, project_id, event_name,
+    toStartOfHour(toDateTime(timestamp, 'UTC'), 'UTC') AS hour,
+    count() AS events,
+    uniqCombined64State(15)(if(user_id != '', user_id, anonymous_id)) AS users_state
 FROM events
-GROUP BY org_id, project_id, event_name, day;
+GROUP BY org_id, project_id, event_name, hour;
 ```
 
-Rollup-eligible insights read from the MV (`uniqMerge(users_state)`); everything else falls back to raw.
+- **HOURLY, not daily-UTC.** Trends bucket by the *project's* timezone (§5.3); a UTC-day rollup can only
+  answer for UTC projects. An hour bucket re-buckets into a correct local day/week/month for any timezone
+  whose UTC offset is a whole number of hours throughout the query's range — checked per query
+  (`is_rollup_eligible`), not assumed from the zone name, since some zones (Lord Howe) are whole-hour part
+  of the year and fractional the rest.
+- **Counts are exact; unique users are an approximate sketch, deliberately gated by data volume.** An exact
+  `uniqExactState` was measured 3-20× *slower to merge* than scanning raw events (merging exact per-hour
+  user sets costs more than the scan it replaces) — see §6.14. `uniqCombined64(15)` is used instead, and
+  only once a query's window holds enough events (`query_rollup_unique_min_events`, load-test-tuned to
+  5,000,000 — see `docs/PERFORMANCE.md`) that exact raw would be slow or refused; smaller windows stay on
+  exact raw. The response's `approximate` field says which happened.
+- **An explicit target table** (`TO event_hourly`), not the sketch's own implicit inner table, so it can be
+  backfilled, verified (`python -m pulse.rollups verify`), and rebuilt (`rebuild`) directly.
+
+Rollup-eligible trends (no filters, no breakdown, `count` or `unique_users`) read from `event_hourly`;
+everything else (funnels, retention, filtered/breakdown trends) always reads raw, by design — they need
+per-user event order or per-property data the rollup doesn't hold.
 
 ### 5.3 Query building (the engine)
 
@@ -965,6 +994,67 @@ lists it, but this spec assigns rollups to Phase 17 with their own parity tests 
 phase follows the spec. **Known risk until Phase 17:** a dashboard fires one query per tile at once (at
 most 20), and per-tenant query rate limits don't exist yet.
 
+### 6.14 Rollups + performance mechanism (implemented Phase 17)
+
+The dashboard risk §6.13 flagged is resolved here: rollups make the query type dashboards mostly use fast
+and cheap, and a per-org rate limit bounds how many queries any one tenant can fire at once.
+
+**Rollup and routing.** §5.2 has the schema and the three deviations from its original sketch (hourly not
+daily-UTC; exact counts / approximate gated unique users; an explicit target table). The router
+(`pulse/query/rollup.py`) decides per trend query: `is_rollup_eligible` checks the *shape* (count or
+unique_users, no filters, no breakdown, every point in the range at a whole-hour UTC offset); for an
+eligible count query, always the rollup. For an eligible unique-user query, `_plan_trend`
+(`pulse/query/service.py`) runs one cheap extra query (`build_event_total_query`, reading only the rollup's
+exact `events` column, never the sketch) to estimate the window's event volume, then picks exact raw below
+`query_rollup_unique_min_events` or the approximate sketch at or above it. This decision -- and the
+response's `source`/`approximate` fields -- are computed fresh on every call and also stored in the result
+cache (`pulse/query/cache.py`'s `CachedResult`), so a cache hit reports the same provenance a miss would
+have.
+
+**Rate limiting.** `check_query_rate_limit` (`pulse/core/rate_limit.py`) is a per-*org* fixed-window Redis
+counter, same pattern as the existing login/ingest limiters, called once a query is past the cache check
+(a cache hit costs nothing) and past `ProjectNotFound`. Over the limit: `429` with a `Retry-After` header
+computed from the key's actual TTL, re-arming the key if a crash ever left it without one (so a stuck
+counter can't lock an org out forever). Shared across trend/funnel/retention -- one budget per tenant, not
+one per insight kind.
+
+**A caps-aware query path.** Every ClickHouse call across all three insight kinds now goes through one
+helper (`_query` in `pulse/query/service.py`) that recognizes ClickHouse's own cap errors (row/time/memory
+limit codes) and raises `QueryTooExpensive`, mapped to a clean `422` with actionable advice -- instead of a
+generic `500`. Load testing is what surfaced how often this fires in practice (see `docs/PERFORMANCE.md`
+Finding 1): without the rollup, a large project's dashboard queries are refused by this path almost
+universally under concurrent load, never hang or crash.
+
+**Maintenance.** `pulse/rollups/maintenance.py` + `python -m pulse.rollups {verify,rebuild}`: `verify`
+diff-checks `events` against `event_hourly` (event counts exactly, unique-user sketches within a tolerance,
+since the sketch is approximate by design), optionally scoped to one project; `rebuild` truncates and
+backfills from raw with the ingestion workers stopped. Both were exercised live against a genuine drift
+(not staged) during the Phase 17 load tests -- see `docs/PERFORMANCE.md`'s ingestion section.
+
+**Load testing.** `backend/loadtests/` (`bench.py` + `locustfile.py`, committed): an isolated benchmark
+database/ClickHouse database/Redis DB, server-side event generation (millions of rows in seconds), a query
+scenario (nine insight types weighted like a real dashboard, `QUERY_SUBSET` to measure §1.4's two separate
+latency targets apart, `?refresh=true` so the cache never hides what's being measured) and an ingest
+scenario (accept rate and true end-to-end landing rate reported separately, since the buffer is deliberately
+decoupled from the endpoint, §3.2). Full method, results, and the two findings that changed a design
+decision (the unique-user threshold) or were deliberately left as documented, unfixed limitations (ad-hoc
+query latency under load) are in `docs/PERFORMANCE.md`, not restated here.
+
+**One shipped value changed by what load testing found, not by the original plan:**
+`query_rollup_unique_min_events` was planned and first measured (single query, uncontended) at 2,000,000;
+concurrent load testing showed that value routed wide weekly/monthly queries on a moderate-sized project
+into a sketch-merge cost that was *slower* than the raw scan it was meant to avoid (a sketch merge's cost is
+proportional to how many hourly rollup rows a query spans, not the event count). Raised to 5,000,000 based
+on that evidence, re-verified to fix the regression without breaking the large-project case that still
+needs the sketch. `docs/PERFORMANCE.md` Finding 2 has the numbers.
+
+**Deliberately not done:** the query-plan review (`EXPLAIN`) confirmed the existing Phase 6 sort key prunes
+effectively, so no index/sort-key change was made; a coarser (daily) rollup tier for very wide ranges, which
+would reduce the sketch-merge row count further, is a natural Phase 17 follow-on rather than something this
+phase's DoD asked for; and the root cause behind ad-hoc query latency under load (retention's Phase 13
+Python-side computation blocking its worker's event loop) is documented, not fixed -- it predates this
+phase and fixing it would mean moving that computation off the request path, out of scope here.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1032,8 +1122,11 @@ insights reload. See §6.12.
 **Phase 16 — Dashboards.** ☑ dashboard CRUD; ☑ arrange saved insights; ☑ per-dashboard range + refresh; ☑
 RBAC sharing. Tests: layout persistence; permission-scoped sharing; refresh correctness. See §6.13.
 
-**Phase 17 — Rollups + performance.** ☐ MVs per §5.2; ☐ router prefers rollups; ☐ per-tenant query rate
-limits; ☐ load tests. Tests: **rollup vs raw parity**; documented before/after benchmarks meeting §1.4 targets.
+**Phase 17 — Rollups + performance.** ☑ MVs per §5.2; ☑ router prefers rollups; ☑ per-tenant query rate
+limits; ☑ load tests. Tests: **rollup vs raw parity** (zero drift, 55.8M events); documented before/after
+benchmarks -- ingestion and pure-count dashboard queries meet their §1.4 targets, two targets are
+documented as not met under this environment's load with the reason identified, not hidden (see §6.14 and
+`docs/PERFORMANCE.md`).
 
 **Phase 18 — NL-to-query.** ☐ NL → **insight spec** (never raw SQL) → existing safe builder; ☐ interpreted
 spec shown before running; ☐ read-only/scope/cap guardrails; ☐ eval set gates regressions. Tests:
@@ -1355,3 +1448,25 @@ trace follows an event end to end.
   guide lists them under Phase 16, this spec under Phase 17; the spec was followed). 16 new backend tests
   (149 total pass); 59 new frontend tests (119 total pass); ruff / ruff format / mypy (`pulse`, strict) /
   eslint / tsc / `npm run build` all clean.
+- 2026-09-22 — Phase 17 — Added §6.14 (rollups + performance mechanism), corrected §5.2's original sketch
+  to match what was actually built, and ticked the Phase 17 DoD. Backend: an hourly `event_hourly` rollup
+  (ClickHouse migration `0002`) -- hourly not daily-UTC (trends bucket by project timezone), counts exact,
+  unique users an approximate `uniqCombined64(15)` sketch gated by event volume (an exact sketch measured
+  3-20x slower to merge than scanning raw); a router (`pulse/query/rollup.py`) that only uses the rollup for
+  query shapes it can answer exactly or within tolerance, checking whole-hour timezone offsets per query
+  range, not per zone name; a per-org query rate limit (429 + `Retry-After`, shared across trend/funnel/
+  retention, cache hits free); every ClickHouse call now recognizes cap errors and returns a clean `422`
+  instead of a `500`; `python -m pulse.rollups {verify,rebuild}` for drift checking and repair. Frontend:
+  the trend result carries `approximate`, shown as a note on the chart so an estimate is never presented as
+  exact. A committed Locust-based load-test harness (`backend/loadtests/`) generates events server-side
+  inside ClickHouse and measures query and ingest scenarios against an isolated benchmark database.
+  Ingestion (5,969 events/s accepted, zero loss) and pure-count dashboard queries meet their §1.4 targets
+  outright; two targets are documented as not met under this environment's concurrent load, with root
+  causes identified rather than papered over -- see `docs/PERFORMANCE.md`, which also documents a real
+  finding that changed a shipped value: the unique-user sketch threshold was planned and first measured
+  (single query) at 2,000,000, but concurrent load testing showed that value made wide weekly/monthly
+  queries on a moderate-sized project slower with the sketch than without it, so it was raised to
+  5,000,000 based on that evidence. A query-plan review (`EXPLAIN`) confirmed the existing Phase 6 sort key
+  needs no change. 43 new backend tests (192 total pass); 1 new frontend test covering the trend result's
+  new `approximate` note (120 total pass); ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc all
+  clean.

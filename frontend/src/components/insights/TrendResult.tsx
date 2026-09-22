@@ -29,7 +29,7 @@ const SERIES_COLORS = ["#2563eb", "#dc2626", "#16a34a", "#d97706", "#7c3aed", "#
 
 const tooltipValue = (value: unknown) => (typeof value === "number" ? formatValue(value) : String(value));
 
-export function TrendResult({ rows }: { rows: TrendRow[] }) {
+export function TrendResult({ rows, approximate = false }: { rows: TrendRow[]; approximate?: boolean }) {
   const [view, setView] = useState<View>("line");
 
   if (rows.length === 0) return <EmptyState>No events matched this query.</EmptyState>;
@@ -39,6 +39,11 @@ export function TrendResult({ rows }: { rows: TrendRow[] }) {
 
   return (
     <div className="flex flex-col gap-3">
+      {approximate && (
+        <p className="text-xs text-gray-500" role="note">
+          Unique-user counts for a range this large are estimated (typically within about 1%).
+        </p>
+      )}
       <div className="flex gap-2" role="group" aria-label="Trend view">
         {VIEWS.map((v) => (
           <Button

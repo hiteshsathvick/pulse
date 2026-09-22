@@ -1,0 +1,42 @@
+{
+  "label": "ingest_mv_on",
+  "scenario": "ingest",
+  "rollups": "on",
+  "mv": "on",
+  "subset": "mixed",
+  "users": 20,
+  "duration_s": 45,
+  "stats": {
+    "ingest": {
+      "requests": 1343,
+      "failures": 0,
+      "rps": 30.939261332757933,
+      "avg_ms": 640.4314749076777,
+      "p50_ms": 430.0,
+      "p95_ms": 1600.0,
+      "p99_ms": 2300.0,
+      "max_ms": 2838.9830999658443
+    },
+    "Aggregated": {
+      "requests": 1343,
+      "failures": 0,
+      "rps": 30.939261332757933,
+      "avg_ms": 640.4314749076777,
+      "p50_ms": 430.0,
+      "p95_ms": 1600.0,
+      "p99_ms": 2300.0,
+      "max_ms": 2838.9830999658443
+    }
+  },
+  "ingest": {
+    "batch": 200,
+    "workers": 3,
+    "accepted_events": 268600,
+    "landed_events": 268600,
+    "lost_events": 0,
+    "accept_events_per_s": 5968.888888888889,
+    "end_to_end_events_per_s": 835.3756391276593,
+    "seconds_until_fully_landed": 321.5320000000065
+  },
+  "routing": []
+}

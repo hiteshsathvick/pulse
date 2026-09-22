@@ -90,6 +90,26 @@ class Settings(BaseSettings):
     # someone re-running the same trend) without serving badly stale numbers.
     query_cache_ttl_seconds: int = 60
 
+    # Phase 17. Kill switch for the hourly rollup (pulse/query/rollup.py): off
+    # routes every query to the raw events table, which is also how the
+    # "before" numbers in docs/PERFORMANCE.md were taken.
+    query_rollups_enabled: bool = True
+    # Unique users are exact from raw events while the window is small (raw is
+    # fast there) and come from the rollup's compact approximate sketch once the
+    # window holds at least this many events (exact raw would be slow, or hit the
+    # row cap). Not simply "bigger is always faster": a sketch merge's cost is
+    # proportional to the number of *hourly rollup rows* a query spans, not the
+    # event count, so a wide date range with moderate volume can merge more
+    # sketch states than a raw scan would read. Load-tested (docs/PERFORMANCE.md,
+    # Phase 17) at 5M and 50M events: 2M put wide weekly/monthly trends over the
+    # merge-bound edge on the smaller dataset. Set very high to never approximate.
+    query_rollup_unique_min_events: int = 5_000_000
+    # Per-org, counting only queries that actually reach ClickHouse (a cache
+    # hit is nearly free and doesn't count) -- the resource being protected is
+    # ClickHouse time, not HTTP requests. A 20-tile dashboard refresh is 20.
+    query_rate_limit_max_queries: int = 120
+    query_rate_limit_window_seconds: int = 60
+
 
 @lru_cache
 def get_settings() -> Settings:

@@ -1,0 +1,75 @@
+{
+  "label": "adhoc_medium",
+  "scenario": "query",
+  "rollups": "on",
+  "mv": "on",
+  "subset": "adhoc",
+  "users": 30,
+  "duration_s": 60,
+  "stats": {
+    "funnel": {
+      "requests": 33,
+      "failures": 0,
+      "rps": 0.5597187366685343,
+      "avg_ms": 2915.5361636428897,
+      "p50_ms": 2700.0,
+      "p95_ms": 5900.0,
+      "p99_ms": 6700.0,
+      "max_ms": 6684.937100042589
+    },
+    "retention": {
+      "requests": 39,
+      "failures": 0,
+      "rps": 0.6614857796991769,
+      "avg_ms": 28579.499253844962,
+      "p50_ms": 23000.0,
+      "p95_ms": 54000.0,
+      "p99_ms": 54000.0,
+      "max_ms": 53801.55239999294
+    },
+    "trend.breakdown": {
+      "requests": 38,
+      "failures": 0,
+      "rps": 0.6445246058607365,
+      "avg_ms": 5275.051394740953,
+      "p50_ms": 2300.0,
+      "p95_ms": 42000.0,
+      "p99_ms": 42000.0,
+      "max_ms": 41930.94230000861
+    },
+    "trend.filtered": {
+      "requests": 50,
+      "failures": 0,
+      "rps": 0.8480586919220217,
+      "avg_ms": 3014.9092640005983,
+      "p50_ms": 1900.0,
+      "p95_ms": 11000.0,
+      "p99_ms": 15000.0,
+      "max_ms": 14819.395099999383
+    },
+    "Aggregated": {
+      "requests": 160,
+      "failures": 0,
+      "rps": 2.7137878141504697,
+      "avg_ms": 9762.566128127219,
+      "p50_ms": 2800.0,
+      "p95_ms": 51000.0,
+      "p99_ms": 54000.0,
+      "max_ms": 53801.55239999294
+    }
+  },
+  "routing": [
+    {
+      "query": "trend.breakdown",
+      "source": "raw",
+      "approximate": false,
+      "count": 40
+    },
+    {
+      "query": "trend.filtered",
+      "source": "raw",
+      "approximate": false,
+      "count": 54
+    }
+  ]
+}

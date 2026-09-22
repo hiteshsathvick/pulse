@@ -65,16 +65,18 @@ def _measure_expr(measure: str, parameters: dict[str, object]) -> str:
     raise ValueError(f"unknown measure kind: {kind}")
 
 
-def _bucket_expr(granularity: Granularity) -> str:
+def _bucket_expr(granularity: Granularity, column: str = "timestamp") -> str:
+    # `column` lets the rollup query bucket its own `hour` column with exactly
+    # the same functions, so the two paths can't drift apart.
     if granularity == Granularity.HOUR:
-        return "toStartOfHour(timestamp, {tz:String})"
+        return f"toStartOfHour({column}, {{tz:String}})"
     if granularity == Granularity.DAY:
-        return "toStartOfDay(timestamp, {tz:String})"
+        return f"toStartOfDay({column}, {{tz:String}})"
     if granularity == Granularity.WEEK:
         # mode=1: Monday-start ISO week, the common product-analytics default.
-        return "toStartOfWeek(timestamp, 1, {tz:String})"
+        return f"toStartOfWeek({column}, 1, {{tz:String}})"
     if granularity == Granularity.MONTH:
-        return "toStartOfMonth(timestamp, {tz:String})"
+        return f"toStartOfMonth({column}, {{tz:String}})"
     raise ValueError(f"unknown granularity: {granularity}")
 
 

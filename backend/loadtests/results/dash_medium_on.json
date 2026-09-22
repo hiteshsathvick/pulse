@@ -1,0 +1,103 @@
+{
+  "label": "dash_medium_on",
+  "scenario": "query",
+  "rollups": "on",
+  "mv": "on",
+  "subset": "dashboard",
+  "users": 30,
+  "duration_s": 60,
+  "stats": {
+    "trend.dau": {
+      "requests": 268,
+      "failures": 0,
+      "rps": 4.583441146233919,
+      "avg_ms": 2775.0870888064956,
+      "p50_ms": 2700.0,
+      "p95_ms": 4600.0,
+      "p99_ms": 5600.0,
+      "max_ms": 6461.303000047337
+    },
+    "trend.event_counts": {
+      "requests": 195,
+      "failures": 0,
+      "rps": 3.3349665056552764,
+      "avg_ms": 596.2323641019443,
+      "p50_ms": 530.0,
+      "p95_ms": 1100.0,
+      "p99_ms": 2500.0,
+      "max_ms": 2950.765300018247
+    },
+    "trend.hourly": {
+      "requests": 123,
+      "failures": 0,
+      "rps": 2.103594257413328,
+      "avg_ms": 606.5840991890641,
+      "p50_ms": 530.0,
+      "p95_ms": 1000.0,
+      "p99_ms": 2300.0,
+      "max_ms": 2869.011699978728
+    },
+    "trend.mau": {
+      "requests": 47,
+      "failures": 0,
+      "rps": 0.8038124398246052,
+      "avg_ms": 4132.606423401739,
+      "p50_ms": 3900.0,
+      "p95_ms": 6900.0,
+      "p99_ms": 7300.0,
+      "max_ms": 7253.608800005168
+    },
+    "trend.wau": {
+      "requests": 115,
+      "failures": 0,
+      "rps": 1.9667751187197786,
+      "avg_ms": 4554.778221735994,
+      "p50_ms": 4500.0,
+      "p95_ms": 6700.0,
+      "p99_ms": 9100.0,
+      "max_ms": 10347.122099949047
+    },
+    "Aggregated": {
+      "requests": 748,
+      "failures": 0,
+      "rps": 12.792589467846907,
+      "avg_ms": 2209.3990540104223,
+      "p50_ms": 2000.0,
+      "p95_ms": 5400.0,
+      "p99_ms": 6800.0,
+      "max_ms": 10347.122099949047
+    }
+  },
+  "routing": [
+    {
+      "query": "trend.dau",
+      "source": "raw",
+      "approximate": false,
+      "count": 269
+    },
+    {
+      "query": "trend.event_counts",
+      "source": "rollup",
+      "approximate": false,
+      "count": 199
+    },
+    {
+      "query": "trend.hourly",
+      "source": "rollup",
+      "approximate": false,
+      "count": 129
+    },
+    {
+      "query": "trend.mau",
+      "source": "raw",
+      "approximate": false,
+      "count": 47
+    },
+    {
+      "query": "trend.wau",
+      "source": "raw",
+      "approximate": false,
+      "count": 115
+    }
+  ]
+}

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from pulse.api.dependencies import resolve_query_scope
+from pulse.core.rate_limit import RateLimitExceeded
 from pulse.query import service as query_service
 from pulse.query.spec import FunnelSpec, RetentionSpec, TrendSpec
 
@@ -14,9 +15,25 @@ router = APIRouter(
 )
 
 
+def _too_many_queries(exc: RateLimitExceeded) -> HTTPException:
+    wait = exc.retry_after
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=(
+            "Too many queries for this organization right now"
+            + (f" -- try again in {wait} seconds." if wait else " -- try again shortly.")
+        ),
+        headers={"Retry-After": str(wait)} if wait else None,
+    )
+
+
 class TrendResponse(BaseModel):
     results: list[dict[str, object]]
     cached: bool
+    # "rollup" if answered from the hourly rollup, "raw" if from the events table.
+    source: str
+    # True when a unique-user count is the rollup's approximate sketch (large windows).
+    approximate: bool
 
 
 class FunnelResponse(BaseModel):
@@ -35,11 +52,22 @@ async def query_trend(
 ) -> TrendResponse:
     try:
         result = await query_service.run_trend(spec, org_id, project_id, refresh=refresh)
+    except RateLimitExceeded as exc:
+        raise _too_many_queries(exc) from exc
+    except query_service.QueryTooExpensive as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from exc
-    return TrendResponse(results=result.results, cached=result.cached)
+    return TrendResponse(
+        results=result.results,
+        cached=result.cached,
+        source=result.source,
+        approximate=result.approximate,
+    )
 
 
 @router.post("/funnel", response_model=FunnelResponse)
@@ -48,6 +76,12 @@ async def query_funnel(
 ) -> FunnelResponse:
     try:
         result = await query_service.run_funnel(spec, org_id, project_id, refresh=refresh)
+    except RateLimitExceeded as exc:
+        raise _too_many_queries(exc) from exc
+    except query_service.QueryTooExpensive as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
@@ -61,6 +95,12 @@ async def query_retention(
 ) -> RetentionResponse:
     try:
         result = await query_service.run_retention(spec, org_id, project_id, refresh=refresh)
+    except RateLimitExceeded as exc:
+        raise _too_many_queries(exc) from exc
+    except query_service.QueryTooExpensive as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"

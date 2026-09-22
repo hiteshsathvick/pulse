@@ -10,6 +10,7 @@ from pulse.core.config import get_settings
 from pulse.events.fixtures import generate_fake_event, generate_fake_events
 from pulse.events.repository import insert_events, query_events
 from pulse.repositories.clickhouse import get_client
+from tests.clickhouse_schema import drop_event_schema
 
 _MIGRATIONS_DIR = (
     Path(__file__).resolve().parent.parent / "pulse" / "clickhouse_migrations" / "migrations"
@@ -52,8 +53,7 @@ def _events_table():
     yield
 
     async def _teardown(client) -> None:
-        await client.command("DROP TABLE IF EXISTS events")
-        await client.command("ALTER TABLE schema_migrations DELETE WHERE version = 1")
+        await drop_event_schema(client)
 
     asyncio.run(_with_fresh_client(_teardown))
 

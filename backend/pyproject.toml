@@ -26,6 +26,10 @@ dev = [
     "ruff>=0.6,<0.7",
     "mypy>=1.11,<2",
 ]
+# Phase 17 load tests (loadtests/). Not part of `dev`, so CI's install is unchanged.
+loadtest = [
+    "locust>=2.29,<3",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
