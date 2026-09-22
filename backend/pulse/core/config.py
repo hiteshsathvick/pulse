@@ -126,6 +126,17 @@ class Settings(BaseSettings):
     ai_rate_limit_max_requests: int = 30
     ai_rate_limit_window_seconds: int = 60
 
+    # Phase 19: alerts (pulse/alerts/). The alert-worker (pulse/alerts/main.py)
+    # evaluates every enabled alert once per interval; each evaluation reuses
+    # the unchanged query engine, so it shares query_rate_limit_* with
+    # ordinary traffic rather than having a separate ClickHouse-side budget.
+    alert_evaluation_interval_seconds: int = 60
+    # HMAC-signs the outbound webhook body (X-Pulse-Signature: sha256=...)
+    # when set; unset (the default) sends unsigned, since a self-hosted
+    # deployment may have no receiver that checks a signature at all.
+    alert_webhook_secret: str | None = None
+    alert_webhook_timeout_seconds: float = 5.0
+
 
 @lru_cache
 def get_settings() -> Settings:

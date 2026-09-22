@@ -48,6 +48,16 @@ function ProjectHome() {
         <p className="text-gray-500">
           Arrange saved insights on a dashboard and share it with your team.
         </p>
+        <Link
+          href={`/orgs/${orgId}/projects/${projectId}/alerts`}
+          className="mt-2 text-lg font-medium underline"
+        >
+          Alerts
+        </Link>
+        <p className="text-gray-500">
+          Get notified by email, webhook, or in-app when a metric breaches a threshold or moves
+          anomalously.
+        </p>
       </div>
     </div>
   );

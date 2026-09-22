@@ -1,3 +1,4 @@
+from pulse.models.alert import Alert, AlertEvent
 from pulse.models.api_key import ApiKey, ApiKeyType
 from pulse.models.audit_log import AuditLog
 from pulse.models.base import Base
@@ -12,6 +13,8 @@ from pulse.models.schema_registry import EventSchema, PropertySchema, PropertyTy
 from pulse.models.user import User
 
 __all__ = [
+    "Alert",
+    "AlertEvent",
     "ApiKey",
     "ApiKeyType",
     "AuditLog",

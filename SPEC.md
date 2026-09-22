@@ -1123,6 +1123,89 @@ has no events), pressing Run executed a real `/trend` call and rendered "No even
 empty result is still a real, correct result), and a follow-up unrelated question ("What's the weather like
 today?") correctly returned a clarify message instead of guessing.
 
+### 6.16 Anomaly + alerts mechanism (implemented Phase 19)
+
+A new `pulse/alerts/` module (no tables of its own beyond `alerts`/`alert_events`, added this phase --
+composes `pulse/query/` and `pulse/insights/`, never reimplementing either), a new `alert-worker` process
+(`pulse/alerts/main.py`, its own docker-compose service -- confirmed with the user first, over an
+externally-cron'd one-shot CLI, to keep a self-hosted deploy cron-free), and `POST .../alerts` +
+`.../alerts/{id}/evaluate-now` + `.../alerts/events` routes (`pulse/api/alerts.py`).
+
+- **Two rule kinds, deliberately different insight-kind scope.** A `ThresholdRule` (`comparator`, `value`)
+  works against any insight kind -- trend's latest bucket, funnel's final-step conversion %, or retention's
+  most recent cohort's *period-1* value (the one unambiguous single number a 2D cohort grid has; picking the
+  furthest offset instead would conflate different cohorts' different measurement horizons as data
+  accumulates). An `AnomalyRule` (`method`, `window`, `sensitivity`) only ever validates against a trend
+  insight -- rejected at alert-creation time with a `422` otherwise (`pulse/alerts/service.py`'s
+  `AnomalyRequiresTrend`) -- because a bucketed time series is the one thing it needs that only a trend
+  query already produces; funnel/retention are snapshot-shaped, and inventing a new evaluation-history table
+  just to retrofit one was more than this phase's DoD asked for.
+- **An insight's own saved date range is a snapshot, not a live window.** Every evaluation shifts it to end
+  "today" (in the project's timezone) before reusing the exact same `run_trend`/`run_funnel`/`run_retention`
+  the query API calls -- `_shifted_range` preserves the saved spec's lookback *duration* but slides it
+  forward, and the anomaly path builds its own `window`-sized range instead. Nothing here is a second query
+  path: tenant scoping, caps, the result cache, and the per-org rate limiter are all inherited from the
+  unchanged query engine, exactly as Phase 18's NL translator inherited them for its own reason.
+- **Statistics: trailing z-score, and a same-weekday seasonal variant of it** (`pulse/alerts/anomaly.py`,
+  pure functions, hand-computed test fixtures -- SPEC.md #8's "known hand-computed expected answers," same
+  discipline as funnel/retention). Deliberately just this, not a full seasonal-decomposition model, per
+  CLAUDE.md's "robust statistical methods... before anything fancier." The seasonal variant exists because a
+  naive trailing window is demonstrably wrong the moment day-of-week seasonality is real: going into a
+  weekend, a short trailing window is weekday-heavy (only the most recent Sunday in a 6-day window), so its
+  mean/stdev are pulled toward weekday behavior and an entirely ordinary weekend number reads as an
+  outlier -- `test_anomaly.py` proves both halves of this (the naive method wrongly flags it; the seasonal
+  method, filtering history to the same weekday first, correctly doesn't) and that the seasonal method still
+  catches a real same-weekday anomaly, not just avoids false positives.
+- **Fires once per breach episode, not once per evaluation tick.** `Alert.is_breaching` is the evaluator's
+  own state (not user input): a breach only fires -- writes an `AlertEvent`, triggers delivery -- on the
+  `False -> True` transition; a still-breaching alert is silently re-evaluated and left alone; a `True ->
+  False` transition clears the flag (`recovered=True`) with no event of its own. Changing an alert's rule
+  resets `is_breaching` to `False`, so a changed rule starts a fresh episode rather than inheriting the old
+  rule's breach state.
+- **`evaluate_all_enabled` (the alert-worker's per-cycle entry point) cannot select across every org's
+  alerts in one query.** An unscoped `session_scope()` default-denies every RLS-protected table (SPEC.md
+  #4.1); `Organization` itself is the one exception (it carries no `org_id`; it *is* the tenant), so it's
+  the one table this lists unscoped, then loops `session_scope(org_id=...)`-scoped per org for everything
+  else -- a new pattern this codebase hadn't needed before, since nothing earlier was a background sweep
+  across every tenant at once. `test_alert_evaluation.py`'s own cross-org test proves this doesn't leak.
+- **Delivery: real webhook, real signing, no real email yet.** `EmailProvider` mirrors `pulse/ai/provider.py`'s
+  shape exactly -- an ABC + `ConsoleEmailProvider` (the only implementation that ships this phase, logs
+  instead of sending, the same stand-in Phase 4's invite emails already used: "no email provider chosen
+  yet") -- confirmed with the user first, since a real SMTP provider needs infra (a mail server for local
+  dev/testing) this phase doesn't add. The webhook sender IS real: an outbound `httpx` POST, HMAC-SHA256-signed
+  (`X-Pulse-Signature: sha256=...`, the Stripe/GitHub convention -- there was no existing signing pattern in
+  this codebase to mirror, so this establishes one) when `alert_webhook_secret` is set, unsigned otherwise
+  since a self-hosted deployment may have no receiver that checks a signature at all. In-app delivery has no
+  send step -- the `AlertEvent` row itself is the notification, polled via `GET .../alerts/events` and
+  dismissed via `POST .../alerts/events/{id}/ack`, the same client-timer-polling pattern Phase 16's dashboard
+  auto-refresh already established (no SSE/WebSockets, which would be a new architectural precedent this
+  codebase has never used). `deliver()` never raises -- one channel's failure is recorded and the others
+  still run, so a fire is never lost because email failed.
+- **Frontend** (`components/alerts/`): `AlertList` (create + list, mirrors `DashboardList`'s inline-form
+  pattern; the rule-type picker filters the insight dropdown to trend-only insights when "anomaly" is
+  selected, so the form can't even offer a combination the API would refuse) and `AlertDetail` (enable/
+  disable, delete, an "Evaluate now" button running the exact same `evaluate_alert()` path the worker's own
+  schedule uses -- not a second, lighter implementation -- plus the events feed with acknowledge). Linked
+  from the project home page alongside Insights/Dashboards, not nested inside the insight detail page --
+  an alert references one insight but is its own resource with its own lifecycle, the same relationship
+  `DashboardItem` has to `Insight`.
+
+**Deliberately not done:** a real SMTP provider (confirmed with the user first -- documented follow-up, same
+deferral Phase 4 already made); webhook retry/backoff (explicitly Phase 21's job per SPEC.md #7, which
+promises "signed, retried outbound webhooks" as its own deliverable -- this phase ships the signing, not the
+retry); anomaly detection on funnel/retention insights (no time-series history exists for either); a
+project-wide dashboard-style alert overview (each alert already has its own detail page with its own event
+feed).
+
+**Verified live** against the real API/Postgres/ClickHouse/Redis stack via the test suite's own live
+ClickHouse-backed integration tests (`test_alert_evaluation.py`): a threshold alert on real inserted events
+fired exactly once while the breach persisted across repeated evaluations, then recovered (no second event)
+once enough events pushed it back over the line; a funnel alert correctly used the final step's real
+conversion percentage; a retention alert correctly used the latest real cohort's period-1 percentage; an
+anomaly alert fired on a real 10x spike over a ten-day real baseline and did not fire on a normal day at the
+same baseline; and `evaluate_all_enabled` evaluated two real orgs' alerts against only their own real
+ClickHouse data, never leaking one into the other's result.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1200,9 +1283,9 @@ documented as not met under this environment's load with the reason identified, 
 spec shown before running; ☑ read-only/scope/cap guardrails; ☑ eval set gates regressions. Tests:
 injection attempts can't cross tenant or write; ambiguous → clarify; NL→spec eval thresholds. See §6.15.
 
-**Phase 19 — Anomaly + alerts.** ☐ threshold + statistical anomaly (moving avg + z-score / seasonal
-baseline); ☐ alert rules; ☐ email + in-app + outbound webhook. Tests: fires on breach not noise;
-seasonality handled; delivery honored.
+**Phase 19 — Anomaly + alerts.** ☑ threshold + statistical anomaly (moving avg + z-score / seasonal
+baseline); ☑ alert rules; ☑ email + in-app + outbound webhook. Tests: fires on breach not noise;
+seasonality handled; delivery honored. See §6.16.
 
 **Phase 20 — Billing/metering.** ☐ Stripe test mode; ☐ meter events/MTU from **real ingestion counts**; ☐
 quotas + soft/hard limits; ☐ invoices. Tests: metering accuracy vs ingested volume; quota enforcement;
@@ -1572,3 +1655,36 @@ trace follows an event end to end.
   instead of a guess. 26 new backend tests, 1 skipped by design (192 → 217 passed, 1 skipped); 5 new
   frontend tests (120 → 125 total pass); ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc all
   clean.
+- 2026-09-22 — Phase 19 — Added §6.16 (anomaly + alerts mechanism) and ticked the Phase 19 DoD. Backend: new
+  `pulse/alerts/` module -- `ThresholdRule` (any insight kind: trend's latest bucket, funnel's final-step
+  conversion %, retention's latest-cohort period-1 %) and `AnomalyRule` (trend insights only, rejected on
+  funnel/retention at creation with a 422 -- confirmed with the user first as the phase's scope boundary,
+  since only trend already produces the bucketed time series an anomaly rule needs); pure, hand-tested
+  trailing-z-score and same-weekday-seasonal-z-score functions (`pulse/alerts/anomaly.py`); an evaluator that
+  reuses the unchanged `run_trend`/`run_funnel`/`run_retention` query engine (never a second query path,
+  so tenant scoping/caps/cache/rate-limit are all inherited) against a freshly-shifted "ends today" range,
+  and fires an `AlertEvent` only on the breach transition -- a persisting breach re-evaluates silently, a
+  recovery clears the flag with no event of its own. A new `alert-worker` process (confirmed with the user
+  first, over an externally-cron'd one-shot CLI) sleep-loops evaluating every enabled alert; since an
+  unscoped Postgres session default-denies every RLS-protected table, it lists `Organization` (the one
+  table that isn't RLS-scoped) unscoped and then loops org-scoped for everything else -- a new
+  cross-tenant-sweep pattern this codebase hadn't needed before Phase 19. Delivery: a real, HMAC-signed
+  (`X-Pulse-Signature`) outbound webhook; a `ConsoleEmailProvider`-only email side (confirmed with the user
+  first -- the same "no provider chosen yet" deferral Phase 4's invite emails already made, no new mail-
+  server infra this phase); in-app delivery is just the `AlertEvent` row itself, polled via
+  `GET .../alerts/events` and dismissed via an ack endpoint, the same client-timer-polling pattern Phase
+  16's dashboard auto-refresh already used. New `POST .../alerts/{id}/evaluate-now` for on-demand testing,
+  running the identical evaluation path the worker uses on its own schedule. Frontend: `AlertList` (create +
+  list, mirrors `DashboardList`'s inline-form pattern; picking "anomaly" filters the insight dropdown to
+  trend-only insights so the form can't offer a combination the API would refuse) and `AlertDetail`
+  (enable/disable, delete, Evaluate now, the events feed with acknowledge), linked from the project home
+  page as a third sibling to Insights/Dashboards, not nested inside an insight's own page -- an alert is its
+  own resource with its own lifecycle, the same relationship `DashboardItem` has to `Insight`. Verified live
+  via the test suite's own real ClickHouse-backed integration tests (not mocked): a threshold alert fired
+  once on a real breach and stayed quiet through repeated re-evaluation of the same persisting breach, then
+  recovered once real data pushed it back over the line; funnel/retention alerts correctly read their
+  real, kind-specific single value; an anomaly alert fired on a real 10x spike over a real ten-day baseline
+  and stayed quiet on a normal day at the same baseline; `evaluate_all_enabled` evaluated two real orgs'
+  alerts without leaking one into the other's result. 46 new backend tests (217 → 263 passed, 1 skipped);
+  13 new frontend tests (125 → 138 total pass); ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc
+  all clean.

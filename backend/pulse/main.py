@@ -6,6 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from pulse.api.alerts import router as alerts_router
 from pulse.api.auth import router as auth_router
 from pulse.api.dashboards import router as dashboards_router
 from pulse.api.health import router as health_router
@@ -73,3 +74,4 @@ app.include_router(schema_registry_router)
 app.include_router(query_router)
 app.include_router(insights_router)
 app.include_router(dashboards_router)
+app.include_router(alerts_router)
