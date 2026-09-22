@@ -1206,6 +1206,79 @@ anomaly alert fired on a real 10x spike over a ten-day real baseline and did not
 same baseline; and `evaluate_all_enabled` evaluated two real orgs' alerts against only their own real
 ClickHouse data, never leaking one into the other's result.
 
+### 6.18 Billing & usage metering mechanism (Phase 20 -- built, not yet connected)
+
+A new `pulse/billing/` module and a new `billing-worker` process (`pulse/billing/main.py`, mirroring
+`pulse/alerts/main.py`'s shape exactly, including the same unscoped-`Organization`-then-per-org-scoped
+sweep Phase 19 established). Confirmed with the user first: Stripe test mode needs a real account, API
+keys, and at least one Product/Price created in the Stripe dashboard, none of which this session could set
+up itself -- so this phase was built and fully tested against mocks, gated behind optional settings that
+default to unset, the same "documented, not connected" pattern the Microsoft 365 integration used in the
+sibling Jarvis project. Every plan/quota/usage-metering feature works with zero Stripe setup at all; only
+Checkout/Portal/webhook/invoices need a real account, and each of those degrades to a clean `503` rather
+than ever attempting a call with no key.
+
+- **Plans are a static config, not a database table.** `pulse/billing/plans.py`'s `PLANS` dict is the only
+  place a plan's monthly event quota lives -- Stripe is the source of truth for *pricing* (a Price id,
+  `Settings.stripe_pro_price_id`, filled in only once the user creates one), but the quota number itself
+  never depends on Stripe being configured, which is what lets the free plan work fully offline.
+- **Every org gets a `Subscription` row (`plan=free`, `status=active`) in the same transaction that creates
+  the org** (`pulse/services/orgs.py::create_organization`, alongside the owner `Membership` -- the same
+  atomicity reasoning: a crash between separate commits could otherwise leave an org with no billing
+  record at all). This is what lets the ingest-path quota check assume a `Subscription` always exists,
+  never a `None` case on the hot path.
+- **Metering is org-wide, not per-project or per-spec, and reads the `event_hourly` rollup, never raw
+  events** (`pulse/billing/usage.py`) -- unlike the query engine's own rollup queries
+  (`pulse/query/rollup.py`), which are always scoped to one project and one spec's event list. Event counts
+  are an exact `sum`; MTU merges the rollup's per-(project, event_name, hour) `uniqCombined64` sketch states
+  across *everything* for the org, the same sketch type the query engine already uses for a single trend's
+  unique-user count, just merged more broadly. `test_billing_usage.py` proves this against real inserted
+  ClickHouse events, including that counts stay exact across multiple projects and event names and that a
+  prior month's events are correctly excluded.
+- **The billing-worker recomputes and upserts (never increments) each org's current-period `UsageRecord`
+  every `billing_usage_interval_seconds`** (default 5 minutes) -- a fresh `sum`/merge from ClickHouse each
+  cycle, not an accumulator, so a worker restart or a double-run can never double-count.
+- **The ingest-path quota check reads the last-computed `UsageRecord`, not a live ClickHouse query per
+  request** (`pulse/billing/service.py::check_ingest_quota`, called from `pulse/ingest/router.py` right
+  after the existing per-key rate limiter -- a different resource: request rate vs. monthly volume). Quota
+  freshness lags by at most one worker cycle; the buffer, not this check, is `/ingest`'s real durability
+  guarantee, so that lag is an acceptable trade-off. Soft (`>=` `billing_soft_limit_ratio`, default 80%,
+  of the plan's quota) still returns `202` with a new `quota_warning` field on `IngestBatchResponse`; hard
+  (`>=` the quota) returns `402 Payment Required` before the batch ever reaches the buffer -- a real,
+  literal use of the HTTP status code's original meaning.
+- **Stripe SDK access goes through one thin wrapper** (`pulse/billing/stripe_client.py`), mirroring
+  `pulse/repositories/object_storage.py`'s shape for a sync-only third-party client: cheap, non-blocking
+  construction, every actual I/O call wrapped in `asyncio.to_thread`. A Stripe Customer is created lazily,
+  on first Checkout -- not at org-creation time, since most orgs never upgrade and creating a Customer for
+  every signup regardless would be pointless traffic against a real account. Checkout and the Billing
+  Portal are both Stripe-hosted redirects; card details and plan changes never happen inside Pulse's own
+  UI at all, by construction, not just by convention.
+- **The webhook route's verified signature is the boundary, not RBAC** (`POST /api/v1/webhooks/stripe`,
+  unscoped by org since Stripe calls it directly with no Pulse-issued credential) -- the same
+  token-is-the-boundary reasoning `RefreshToken`/`Invite`/`ApiKey` already use, just via HMAC instead of a
+  stored hash. `customer.subscription.created`/`updated` upgrades the org to Pro only on a genuinely
+  `active`/`trialing` Stripe status; `past_due`/`incomplete` update the stored status without silently
+  downgrading the plan Stripe itself might still recover. `customer.subscription.deleted` reverts to Free.
+  `invoice.*` events are acknowledged but change no local state -- invoices are read live from Stripe
+  (`GET .../billing/invoices`), never mirrored into Postgres. `test_billing_webhooks.py` verifies both
+  halves: the pure event-handling logic against plain dict fixtures, and the real route's signature
+  verification against a payload this test suite signs itself with a locally-known secret (Stripe's HMAC
+  scheme needs nothing but the shared secret to verify, so this never touches a real account or the
+  network) -- including that a tampered payload with an otherwise-valid signature header is still rejected.
+
+**Deliberately not done (this phase):** a real Stripe connection (the point of this section -- confirmed
+with the user first, tracked as the reason Phase 20 stays open); mirroring invoices into Postgres (read
+live instead); proration logic (Stripe's own job); multi-currency and seat-based billing (SPEC.md only
+asks for usage-based).
+
+**Verified live** (the parts that need zero Stripe credentials): org creation auto-creating a free
+`Subscription`; real quota soft/hard enforcement against real ClickHouse ingestion counts inserted directly
+(bypassing the SDK, the same fixture pattern every other integration test here uses); `compute_and_store_
+usage` upserting a real `UsageRecord`, re-summed correctly after more events arrived. **Not yet verified
+live**: Checkout, the Billing Portal, real webhook delivery from Stripe's servers, and real invoices --
+blocked on connecting a real Stripe test-mode account, at which point this section (and the Phase 20 DoD
+line) will be updated to reflect it.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1287,9 +1360,14 @@ injection attempts can't cross tenant or write; ambiguous → clarify; NL→spec
 baseline); ☑ alert rules; ☑ email + in-app + outbound webhook. Tests: fires on breach not noise;
 seasonality handled; delivery honored. See §6.16.
 
-**Phase 20 — Billing/metering.** ☐ Stripe test mode; ☐ meter events/MTU from **real ingestion counts**; ☐
-quotas + soft/hard limits; ☐ invoices. Tests: metering accuracy vs ingested volume; quota enforcement;
-webhook handling.
+**Phase 20 — Billing/metering.** ☐ Stripe test mode (built and tested against mocks; not yet connected to
+a real Stripe account -- confirmed with the user first, see §6.18); ☑ meter events/MTU from **real
+ingestion counts**; ☑ quotas + soft/hard limits; ☐ invoices (reads through Stripe; blocked on the same
+connection). Tests: ☑ metering accuracy vs ingested volume; ☑ quota enforcement; ☑ webhook handling
+(signature verification + event processing, against a locally HMAC-signed payload -- needs no real Stripe
+account either). See §6.18. **Not yet closed out**: this phase stays open per CLAUDE.md #1.4 ("a phase is
+done only when its DoD checkboxes are all true") until a real Stripe test-mode account is connected and the
+Checkout/webhook/invoice flow is verified live, the same way every other phase here has been.
 
 **Phase 21 — Public API/exports/webhooks.** ☐ scoped read API; ☐ streamed CSV/JSON export (results + raw
 events); ☐ signed, retried outbound webhooks. Tests: key scoping; export completeness; webhook signing/retry.
@@ -1688,3 +1766,36 @@ trace follows an event end to end.
   alerts without leaking one into the other's result. 46 new backend tests (217 → 263 passed, 1 skipped);
   13 new frontend tests (125 → 138 total pass); ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc
   all clean.
+- 2026-09-22 — Phase 20 (started, not closed out) — Added §6.18 (billing & usage metering mechanism) and
+  partially ticked the Phase 20 DoD -- confirmed with the user first that Stripe test mode would be built
+  and fully tested against mocks this session ("build now, connect later," the same pattern the Microsoft
+  365 integration used in the sibling Jarvis project), leaving the phase open per CLAUDE.md #1.4 until a
+  real Stripe account is connected and Checkout/webhook/invoices are verified live. Backend: new
+  `pulse/billing/` module -- a static plan/quota config (`pulse/billing/plans.py`, no database table: Stripe
+  owns pricing, Pulse only needs the quota number, which needs no Stripe setup at all); every org gets a
+  `plan=free` `Subscription` row in the same transaction that creates the org (alongside the owner
+  `Membership`, the same atomicity reasoning); org-wide usage metering from the `event_hourly` rollup, never
+  raw events (`pulse/billing/usage.py`) -- an exact event-count sum and an MTU merge of the rollup's
+  per-(project, event_name, hour) `uniqCombined64` sketch states across everything for the org, unlike the
+  query engine's own rollup queries, which stay scoped to one project and one spec. A new `billing-worker`
+  process (mirroring `pulse/alerts/main.py`'s shape exactly) recomputes and upserts each org's current-period
+  usage every 5 minutes; the ingest-path quota check (`pulse/billing/service.py`, called from
+  `pulse/ingest/router.py` right after the existing per-key rate limiter) reads that cached value rather than
+  querying ClickHouse per request, and returns a new `quota_warning` field on soft breach or a real
+  `402 Payment Required` -- before the batch ever reaches the buffer -- on hard breach. Stripe SDK access
+  goes through one thin wrapper (`pulse/billing/stripe_client.py`, mirroring `object_storage.py`'s
+  sync-client-in-a-thread shape) gated entirely behind optional settings that default to unset, so every
+  Stripe-backed endpoint degrades to a clean `503` instead of ever attempting a call with no key; a Stripe
+  Customer is created lazily on first Checkout, not at org-creation time. `POST /api/v1/webhooks/stripe`
+  verifies the signature as the boundary (not RBAC, the same token-is-the-boundary reasoning
+  `RefreshToken`/`Invite`/`ApiKey` already use) and only upgrades an org to Pro on a genuinely
+  active/trialing Stripe status, never silently downgrading on a `past_due` payment hiccup Stripe itself
+  might still resolve. Frontend: `lib/billing-api.ts` + a `BillingPage` (current plan, a usage-vs-quota bar,
+  Upgrade/Manage buttons that redirect to Stripe-hosted pages -- card details never enter Pulse's own UI at
+  all, by construction -- and an invoice list), linked from the org's projects page for Admin+ members only.
+  A real pre-existing test's exact-dict assertion on `/ingest`'s response broke from the new `quota_warning`
+  field and was fixed to check fields independently rather than weakened. 35 new backend tests (263 → 298
+  passed, 1 skipped) -- including `test_billing_webhooks.py` verifying real HMAC signature verification
+  (valid, invalid, and a tampered-payload-with-a-valid-header case) against a payload the suite signs itself,
+  needing no real Stripe account; 7 new frontend tests (138 → 145 total pass); ruff / ruff format / mypy
+  (`pulse`, strict) / eslint / tsc all clean.

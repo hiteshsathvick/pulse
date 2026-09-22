@@ -137,6 +137,29 @@ class Settings(BaseSettings):
     alert_webhook_secret: str | None = None
     alert_webhook_timeout_seconds: float = 5.0
 
+    # Phase 20: billing (pulse/billing/). Unset (the default) means Stripe
+    # is simply not connected yet -- confirmed with the user first as this
+    # phase's starting state ("build now, connect later"): every plan/quota/
+    # usage-metering feature works with zero Stripe setup, and every
+    # Stripe-backed endpoint degrades to a clean 503 instead of ever
+    # attempting a call with no key.
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    # The Price (not Product) id for the Pro plan, created in the Stripe
+    # dashboard -- account-specific, so it can never be hardcoded here.
+    stripe_pro_price_id: str | None = None
+    billing_checkout_success_url: str = "http://localhost:3000/billing?checkout=success"
+    billing_checkout_cancel_url: str = "http://localhost:3000/billing?checkout=cancelled"
+    billing_portal_return_url: str = "http://localhost:3000/billing"
+    # The billing-worker (pulse/billing/main.py) recomputes every org's
+    # current-period usage from real ClickHouse ingestion counts on this
+    # interval; the ingest-path quota check (pulse/billing/service.py) reads
+    # whatever it last computed rather than querying ClickHouse per request.
+    billing_usage_interval_seconds: int = 300
+    # A quota check reports "soft" once usage crosses this fraction of the
+    # plan's hard limit -- still accepted, just flagged in the response.
+    billing_soft_limit_ratio: float = 0.8
+
 
 @lru_cache
 def get_settings() -> Settings:

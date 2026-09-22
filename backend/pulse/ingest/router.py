@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from pulse.api.dependencies import require_write_key
+from pulse.billing import service as billing_service
 from pulse.core import rate_limit
 from pulse.core.config import get_settings
 from pulse.ingest.schemas import IngestBatchRequest, IngestBatchResponse
@@ -55,5 +56,15 @@ async def ingest(
             detail=f"Batch exceeds the {settings.ingest_max_batch_size}-event limit",
         )
 
+    # Phase 20: a request-rate limiter (above) and a monthly-volume quota
+    # are different resources -- this reads the billing-worker's last
+    # computed usage, not a live ClickHouse query on every call.
+    quota = await billing_service.check_ingest_quota(api_key.org_id)
+    if quota.level == billing_service.QuotaLevel.HARD:
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=quota.message)
+
     accepted = await buffer_batch(get_client(), settings.ingest_stream_key, api_key, body.batch)
-    return IngestBatchResponse(accepted=accepted)
+    return IngestBatchResponse(
+        accepted=accepted,
+        quota_warning=quota.message if quota.level == billing_service.QuotaLevel.SOFT else None,
+    )

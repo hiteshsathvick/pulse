@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 
-from pulse.models import Membership, MembershipRole, Organization
+from pulse.models import Membership, MembershipRole, Organization, Subscription
 from pulse.repositories.postgres import session_scope, set_session_scope
 from pulse.services import audit
 
@@ -14,10 +14,14 @@ class SlugAlreadyTaken(Exception):
 
 async def create_organization(name: str, slug: str, creator_user_id: uuid.UUID) -> Organization:
     """Atomic: creates the org (unscoped -- Organization carries no org_id,
-    so RLS doesn't apply to it) and its owner Membership (RLS-protected) in
-    one transaction, re-scoping the GUC mid-transaction once the org's id
-    exists, rather than two commits that could leave an ownerless org on a
-    crash in between."""
+    so RLS doesn't apply to it), its owner Membership, and its default
+    (free-plan) Subscription (both RLS-protected) in one transaction,
+    re-scoping the GUC mid-transaction once the org's id exists, rather than
+    separate commits that could leave an ownerless or subscription-less org
+    on a crash in between. Every org having a Subscription row from the
+    moment it exists is what lets the ingest-path quota check
+    (pulse/billing/service.py) assume one always exists, never a None case
+    to special-case on the hot path."""
     async with session_scope() as session:
         existing = await session.scalar(select(Organization).where(Organization.slug == slug))
         if existing is not None:
@@ -29,6 +33,7 @@ async def create_organization(name: str, slug: str, creator_user_id: uuid.UUID) 
 
         await set_session_scope(session, org_id=org.id)
         session.add(Membership(org_id=org.id, user_id=creator_user_id, role=MembershipRole.OWNER))
+        session.add(Subscription(org_id=org.id))
         audit.record(
             session,
             org_id=org.id,

@@ -17,6 +17,7 @@ dependencies = [
     "pyjwt>=2.9,<3",
     "minio>=7.2,<8",
     "anthropic>=0.40,<1",
+    "stripe>=11,<12",
 ]
 
 [project.optional-dependencies]

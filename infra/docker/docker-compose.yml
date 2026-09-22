@@ -147,6 +147,34 @@ services:
       redis:
         condition: service_healthy
 
+  billing-worker:
+    # Phase 20: a separate long-lived process, like alert-worker -- a
+    # sleep-loop recomputing every org's current-period usage from real
+    # ClickHouse ingestion counts. No Stripe env vars here: like
+    # ANTHROPIC_API_KEY/ALERT_WEBHOOK_SECRET, an unset Stripe key is a valid,
+    # fully-functional default (billing simply isn't connected yet), picked
+    # up from a real .env file or the container's own environment, never
+    # wired through docker-compose itself.
+    build:
+      context: ../../backend
+    command: ["python", "-m", "pulse.billing.main"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_APP_USER:-pulse_app}:${POSTGRES_APP_PASSWORD:-pulse_app}@postgres:5432/${POSTGRES_DB:-pulse}
+      DATABASE_BOOTSTRAP_URL: postgresql+asyncpg://${POSTGRES_USER:-pulse}:${POSTGRES_PASSWORD:-pulse}@postgres:5432/${POSTGRES_DB:-pulse}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-pulse}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-pulse}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DB:-pulse}
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   frontend:
     build:
       context: ../../frontend

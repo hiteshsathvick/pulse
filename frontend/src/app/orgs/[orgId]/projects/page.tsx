@@ -8,6 +8,7 @@ import { AppShell } from "@/components/AppShell";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { Alert, Button, EmptyState, Input, Spinner } from "@/components/ui";
 import { useAuth } from "@/lib/auth-context";
+import { listMyOrgs } from "@/lib/orgs-api";
 import { createProject, listProjects } from "@/lib/projects-api";
 
 function ProjectsList() {
@@ -22,6 +23,17 @@ function ProjectsList() {
     queryFn: () => listProjects(accessToken!, orgId),
     enabled: !!accessToken,
   });
+
+  // Billing is Admin+ on the API too -- hiding the link for anyone else
+  // avoids a click that only leads to a 403. Shares the switcher's ["orgs"]
+  // query, so this is usually already cached.
+  const orgsQuery = useQuery({
+    queryKey: ["orgs"],
+    queryFn: () => listMyOrgs(accessToken!),
+    enabled: !!accessToken,
+  });
+  const role = orgsQuery.data?.find((org) => org.id === orgId)?.role;
+  const canViewBilling = role === "owner" || role === "admin";
 
   const createProjectMutation = useMutation({
     mutationFn: () => createProject(accessToken!, orgId, name, slug),
@@ -40,7 +52,14 @@ function ProjectsList() {
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-col gap-8">
       <div>
-        <h1 className="text-2xl font-semibold">Projects</h1>
+        <div className="flex items-center justify-between gap-4">
+          <h1 className="text-2xl font-semibold">Projects</h1>
+          {canViewBilling && (
+            <Link href={`/orgs/${orgId}/billing`} className="text-sm underline">
+              Billing
+            </Link>
+          )}
+        </div>
         {projectsQuery.isLoading && <Spinner />}
         {projectsQuery.isError && <Alert>Failed to load projects.</Alert>}
         {projectsQuery.data?.length === 0 && <EmptyState>No projects yet.</EmptyState>}

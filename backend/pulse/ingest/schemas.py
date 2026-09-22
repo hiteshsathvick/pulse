@@ -34,3 +34,7 @@ class IngestBatchRequest(BaseModel):
 
 class IngestBatchResponse(BaseModel):
     accepted: int
+    # Set once this org's ingested-events-this-month has crossed the soft
+    # limit (Settings.billing_soft_limit_ratio) -- the batch is still
+    # accepted; this is only a heads-up before the hard limit rejects one.
+    quota_warning: str | None = None

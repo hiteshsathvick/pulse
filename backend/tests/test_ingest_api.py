@@ -130,7 +130,11 @@ async def test_valid_batch_is_accepted_and_buffered_not_written_to_clickhouse() 
         )
 
     assert response.status_code == 202
-    assert response.json() == {"accepted": 5}
+    # Phase 20: quota_warning is a new, unrelated field (None on a fresh,
+    # nowhere-near-quota org) -- asserted separately from "accepted" so this
+    # test doesn't have to know about billing at all.
+    assert response.json()["accepted"] == 5
+    assert response.json()["quota_warning"] is None
 
     after = await redis_client.xlen(settings.ingest_stream_key)
     assert after - before == 5
