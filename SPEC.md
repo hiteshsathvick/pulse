@@ -1055,6 +1055,74 @@ phase's DoD asked for; and the root cause behind ad-hoc query latency under load
 Python-side computation blocking its worker's event loop) is documented, not fixed -- it predates this
 phase and fixing it would mean moving that computation off the request path, out of scope here.
 
+### 6.15 NL-to-query mechanism (implemented Phase 18)
+
+A new `pulse/ai/` module (no tables of its own -- composes `pulse/registry/` and `pulse/query/spec.py`),
+plus one new route, `POST .../query/nl`, added to the existing `pulse/api/query.py` router (so it inherits
+`resolve_query_scope`'s JWT-or-read-key auth for free, the same as trend/funnel/retention).
+
+- **Translate and run are two separate requests, not one.** `/query/nl` only ever returns
+  `{status, spec | message, warnings}` -- it never executes a ClickHouse query itself. The DoD's
+  "interpreted spec shown before running" is true by construction: the frontend shows the spec, and only a
+  second, ordinary call to `/trend`/`/funnel`/`/retention` (ClickHouse-side, this section's exact same
+  build_trend_query et al.) runs it. There is no auto-run code path to have gotten wrong.
+- **`LLMProvider` (`pulse/ai/provider.py`)** is the one abstraction the rest of the app depends on --
+  matching SPEC.md #2's "AI: provider abstraction," rebuilt fresh here since Pulse has no sibling project to
+  port it from. `MockProvider` (deterministic, offline, free) is `Settings.ai_provider`'s default and the
+  only one CI ever calls; `AnthropicProvider` is real, gated behind `ai_provider=anthropic` +
+  `anthropic_api_key`, and forces the one tool call via Anthropic's `tool_choice` so a prompt-injection
+  attempt in the question has no free-text channel to answer through.
+- **The only thing a provider is trusted to produce is a JSON dict for one tool, `submit_insight_query`**
+  (`pulse/ai/schema.py`). `pulse/ai/translator.py` re-parses that dict through
+  `pulse.query.spec.DiscriminatedInsightSpec` -- the exact same discriminated union `pulse/api/insights.py`
+  already used for a human-built spec (moved into `pulse/query/spec.py` this phase so both share one
+  definition rather than duplicating it). A spec type has no `org_id`/`project_id`/SQL field at all, so
+  there is nothing for a provider to smuggle a tenant override or a raw query through even if it tried --
+  proven by `test_nl_translator.py`'s "smuggled tenant field" test and the dedicated
+  `tests/test_nl_injection.py` adversarial suite (SPEC.md #8's injection-suite requirement).
+- **Grounding is read-only and pre-scoped.** The prompt embeds this one project's active, most-seen event
+  names (`registry.service.list_events`, already `org_id`/`project_id`-scoped) and today's date resolved in
+  the project's own timezone, so relative phrases ("last week") resolve the same way a human builder's
+  range would. An event name outside the registry is a soft, non-blocking warning shown next to the spec,
+  not a rejection -- Phase 9's own precedent ("unknown events still ingest") applies here too.
+- **Ambiguous -> clarify, not a guess.** The tool schema's `status` is `"ok"` (with a `spec`) or `"clarify"`
+  (with a short `message`); the system prompt tells the model to prefer clarifying over guessing when the
+  question doesn't map cleanly to a trend/funnel/retention shape, and `translator.py` rejects anything that
+  is neither -- a malformed or missing-message response raises `TranslationFailed`, mapped to a clean `422`,
+  never passed through.
+- **A separate, per-org rate limit** (`ai:translations:{org_id}`, `pulse/core/rate_limit.py`'s
+  `check_ai_rate_limit`) budgets the translate call itself, independent of `query_rate_limit_*` -- a
+  clarify response still cost a model call, so it isn't shielded by the ClickHouse-side limiter the way a
+  cache hit is.
+- **The eval set is one fixture list, two tests** (`backend/tests/nl_eval/`). `test_mock_eval_set_meets_its_
+  accuracy_threshold` runs unconditionally in CI against `MockProvider` at a 100% threshold (mock matching
+  is exact-or-broken, not approximate -- this is the harness that actually gates every push, per the DoD's
+  "eval set gates regressions"). `test_live_eval_set_meets_its_accuracy_threshold` runs the identical
+  fixtures against the real Anthropic provider at an 80% threshold, but only when you set
+  `PULSE_TEST_LLM_LIVE=1` and `ANTHROPIC_API_KEY` -- confirmed with the user first: CI stays free and
+  deterministic, and a true accuracy check against the real model is available on demand rather than run
+  (and paid for) on every push.
+- **`MockProvider`'s phrase-matching (`pulse/ai/mock_patterns.py`) anchors its trailing "when" clause to a
+  finite set of known phrases, not a generic `(.+)`.** A generic capture left a real ambiguity: a
+  multi-word event name immediately followed by a time phrase (e.g. "onboarding finished last week") could
+  be split in the wrong place by regex backtracking. Anchoring the date-phrase alternation forces the
+  event-name group to absorb everything else unambiguously -- caught and fixed while building the eval
+  fixtures, not by a test written after the fact.
+
+**Deliberately not done:** OpenAI/local providers (SPEC.md #2 lists them as pinned intentions; the provider
+abstraction is built to add them later without touching `translator.py`, but only Anthropic is wired up now
+-- confirmed with the user first); saving a translated spec directly as an `Insight` from the NL box (the
+existing manual builder's Save already covers this once a spec exists, and duplicating that flow wasn't
+part of this phase's DoD); property-key grounding/warnings (only event names are checked against the
+registry, matching what the DoD's tests actually asked for).
+
+**Verified live** against a real API, Postgres, ClickHouse, and Redis: registered an account, created an
+org and project, and asked the NL box "How many times did checkout completed happen last week?" -- it
+returned an interpreted trend spec plus the expected "hasn't been recorded yet" warning (a fresh project
+has no events), pressing Run executed a real `/trend` call and rendered "No events matched this query" (an
+empty result is still a real, correct result), and a follow-up unrelated question ("What's the weather like
+today?") correctly returned a clarify message instead of guessing.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1128,9 +1196,9 @@ benchmarks -- ingestion and pure-count dashboard queries meet their §1.4 target
 documented as not met under this environment's load with the reason identified, not hidden (see §6.14 and
 `docs/PERFORMANCE.md`).
 
-**Phase 18 — NL-to-query.** ☐ NL → **insight spec** (never raw SQL) → existing safe builder; ☐ interpreted
-spec shown before running; ☐ read-only/scope/cap guardrails; ☐ eval set gates regressions. Tests:
-injection attempts can't cross tenant or write; ambiguous → clarify; NL→spec eval thresholds.
+**Phase 18 — NL-to-query.** ☑ NL → **insight spec** (never raw SQL) → existing safe builder; ☑ interpreted
+spec shown before running; ☑ read-only/scope/cap guardrails; ☑ eval set gates regressions. Tests:
+injection attempts can't cross tenant or write; ambiguous → clarify; NL→spec eval thresholds. See §6.15.
 
 **Phase 19 — Anomaly + alerts.** ☐ threshold + statistical anomaly (moving avg + z-score / seasonal
 baseline); ☐ alert rules; ☐ email + in-app + outbound webhook. Tests: fires on breach not noise;
@@ -1469,4 +1537,38 @@ trace follows an event end to end.
   5,000,000 based on that evidence. A query-plan review (`EXPLAIN`) confirmed the existing Phase 6 sort key
   needs no change. 43 new backend tests (192 total pass); 1 new frontend test covering the trend result's
   new `approximate` note (120 total pass); ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc all
+  clean.
+- 2026-09-22 — Phase 18 — Added §6.15 (NL-to-query mechanism) and ticked the Phase 18 DoD. Backend: new
+  `pulse/ai/` module -- `LLMProvider` abstraction (`MockProvider`, deterministic/free/the default; real
+  `AnthropicProvider` gated behind `ai_provider=anthropic` + `anthropic_api_key`, confirmed with the user
+  first as the one real provider to wire up now, OpenAI/local deferred); `pulse/ai/translator.py` re-parses
+  a provider's tool-call JSON through the exact same `DiscriminatedInsightSpec` union `pulse/api/insights.py`
+  already used (moved into `pulse/query/spec.py` this phase so both share it instead of duplicating it) --
+  a spec type has no tenant/SQL field at all, so there's nothing to smuggle through even if a provider
+  tried. New `POST .../query/nl` route (added to the existing query router, so it inherits JWT-or-read-key
+  auth for free) only translates and returns the interpreted spec; it never executes -- running it is a
+  second, ordinary call to the unchanged `/trend`/`/funnel`/`/retention` endpoints, which is what makes
+  "interpreted spec shown before running" true by construction rather than a flag. Grounding reads only the
+  asking project's own registered event names (already org/project-scoped); an unregistered event name is a
+  soft warning, never a rejection, matching Phase 9's "unknown events still ingest" precedent. A separate
+  per-org rate limit (`ai_rate_limit_*`) budgets the translate call itself, independent of the ClickHouse
+  query limiter. Eval set/regression gate: confirmed with the user first that CI runs `tests/nl_eval/`'s
+  fixed NL→spec fixtures only against the free `MockProvider` (100% threshold, since mock matching is
+  exact-or-broken); the identical fixtures also run against the real Anthropic provider at an 80% threshold,
+  but only opt-in locally (`PULSE_TEST_LLM_LIVE=1` + a real key), never in ordinary CI. Dedicated
+  `tests/test_nl_injection.py` runs ten adversarial questions (prompt-injection, SQL-injection-shaped
+  strings, cross-tenant asks) through the real translation path and proves every one lands as either a
+  same-project spec or a clarify -- never anything else. A real regex-ambiguity bug in the mock's own
+  phrase-matcher (a multi-word event name could be mis-split from a trailing "last week"-style clause) was
+  caught and fixed while building the eval fixtures, before it ever reached a test failure. Frontend: a new
+  `NLQueryBox` (ask a question, see the interpreted spec plus any warnings, Run reuses the existing
+  `runInsightQuery`/`InsightResult` exactly as the manual builder does) mounted alongside, not replacing,
+  the existing insight builder on the "New insight" page; a small `warning` `Alert` variant was added
+  (previously only error/success existed) since a grounding warning is a different severity than a
+  translation failure. Verified live against a real API/Postgres/ClickHouse/Redis, not just tests: asked
+  "How many times did checkout completed happen last week?" against a fresh project, got back the
+  interpreted spec plus the expected "hasn't been recorded yet" warning, pressed Run and got a real
+  (empty, correctly so) result from `/trend`, then asked an unrelated question and got a clarify message
+  instead of a guess. 26 new backend tests, 1 skipped by design (192 → 217 passed, 1 skipped); 5 new
+  frontend tests (120 → 125 total pass); ruff / ruff format / mypy (`pulse`, strict) / eslint / tsc all
   clean.

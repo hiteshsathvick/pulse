@@ -125,3 +125,29 @@ export async function runInsightQuery(
   if (spec.kind === "trend") return { ...result, approximate: body.approximate === true } as QueryResult;
   return result as QueryResult;
 }
+
+// Phase 18: translates only, never executes -- the caller shows `spec` to
+// the user and, if they want to run it, passes it straight to
+// runInsightQuery above. Mirrors the backend's NLQueryResponse
+// (pulse/api/query.py) exactly.
+export type NLQueryResponse = {
+  status: "ok" | "clarify";
+  spec: InsightSpec | null;
+  message: string | null;
+  warnings: string[];
+};
+
+export async function translateNLQuery(
+  accessToken: string,
+  orgId: string,
+  projectId: string,
+  question: string
+): Promise<NLQueryResponse> {
+  const response = await authedFetch(
+    `/api/v1/orgs/${orgId}/projects/${projectId}/query/nl`,
+    accessToken,
+    { method: "POST", body: JSON.stringify({ question }) }
+  );
+  if (!response.ok) throw await toApiError(response);
+  return response.json();
+}

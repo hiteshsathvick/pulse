@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime
-from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field, model_validator
@@ -8,14 +7,10 @@ from pydantic import BaseModel, Field, model_validator
 from pulse.api.dependencies import require_role
 from pulse.insights import service as insights_service
 from pulse.models import Insight, InsightKind, Membership, MembershipRole
-from pulse.query.spec import InsightSpec
+from pulse.query.spec import DiscriminatedInsightSpec as DiscriminatedSpec
 from pulse.services import projects as projects_service
 
 router = APIRouter(prefix="/api/v1/orgs/{org_id}/projects/{project_id}/insights", tags=["insights"])
-
-# `kind` is the discriminator, so an unknown/mismatched spec is rejected with a
-# clean 422 naming the bad field rather than a wall of per-union-member errors.
-DiscriminatedSpec = Annotated[InsightSpec, Field(discriminator="kind")]
 
 
 class CreateInsightRequest(BaseModel):

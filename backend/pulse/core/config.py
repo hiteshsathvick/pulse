@@ -110,6 +110,22 @@ class Settings(BaseSettings):
     query_rate_limit_max_queries: int = 120
     query_rate_limit_window_seconds: int = 60
 
+    # Phase 18: NL-to-query (pulse/ai/). "mock" is deterministic, free, and
+    # offline -- the default, matching this app's cost-aware posture. Only
+    # "anthropic" ever makes a real network call, and only once
+    # anthropic_api_key is set; nothing here is a secret to commit (None just
+    # means "the real provider is off").
+    ai_provider: Literal["mock", "anthropic"] = "mock"
+    anthropic_api_key: str | None = None
+    ai_model: str = "claude-sonnet-5"
+    ai_max_output_tokens: int = 1024
+    # A separate budget from query_rate_limit_* above: this counts every
+    # translate call (a cost-bearing LLM request when ai_provider=anthropic),
+    # not just ones that reach ClickHouse -- a clarify response still cost a
+    # model call.
+    ai_rate_limit_max_requests: int = 30
+    ai_rate_limit_window_seconds: int = 60
+
 
 @lru_cache
 def get_settings() -> Settings:

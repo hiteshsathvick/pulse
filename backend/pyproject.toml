@@ -16,6 +16,7 @@ dependencies = [
     "argon2-cffi>=23.1,<26",
     "pyjwt>=2.9,<3",
     "minio>=7.2,<8",
+    "anthropic>=0.40,<1",
 ]
 
 [project.optional-dependencies]
@@ -56,3 +57,6 @@ disallow_untyped_defs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "llm_live: runs against the real Anthropic provider; skipped unless PULSE_TEST_LLM_LIVE=1 and ANTHROPIC_API_KEY are set (see tests/nl_eval/test_nl_eval.py).",
+]

@@ -1,6 +1,6 @@
 import enum
 from datetime import date
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -131,3 +131,10 @@ class RetentionSpec(BaseModel):
 
 # Every insight kind the query engine can compile (Phase 11/12/13).
 InsightSpec = TrendSpec | FunnelSpec | RetentionSpec
+
+# `kind` is the discriminator, so an unknown/mismatched spec is rejected with a
+# clean error naming the bad field rather than a wall of per-union-member
+# errors. Shared here (not just pulse/api/insights.py, its original home)
+# since Phase 18's NL translator validates a model-produced spec through the
+# exact same union.
+DiscriminatedInsightSpec = Annotated[InsightSpec, Field(discriminator="kind")]

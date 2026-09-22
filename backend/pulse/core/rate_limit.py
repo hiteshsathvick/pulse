@@ -72,3 +72,25 @@ async def check_query_rate_limit(org_id: str) -> None:
             await client.expire(key, settings.query_rate_limit_window_seconds)
             remaining = settings.query_rate_limit_window_seconds
         raise RateLimitExceeded(retry_after=max(remaining, 1))
+
+
+async def check_ai_rate_limit(org_id: str) -> None:
+    """Same per-org fixed-window pattern as check_query_rate_limit, but a
+    separate budget (pulse/ai/, Phase 18): a translate call is a cost-bearing
+    LLM request regardless of whether it results in a spec that goes on to
+    run a ClickHouse query, so it isn't counted against, or shielded by,
+    query_rate_limit_* at all."""
+    settings = get_settings()
+    client = get_client()
+    key = f"ai:translations:{org_id}"
+
+    count = await client.incr(key)
+    if count == 1:
+        await client.expire(key, settings.ai_rate_limit_window_seconds)
+
+    if count > settings.ai_rate_limit_max_requests:
+        remaining = await client.ttl(key)
+        if remaining < 0:
+            await client.expire(key, settings.ai_rate_limit_window_seconds)
+            remaining = settings.ai_rate_limit_window_seconds
+        raise RateLimitExceeded(retry_after=max(remaining, 1))

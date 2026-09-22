@@ -1,10 +1,11 @@
 import type { HTMLAttributes } from "react";
 
-type Variant = "error" | "success";
+type Variant = "error" | "success" | "warning";
 
 const VARIANT_CLASSES: Record<Variant, string> = {
   error: "text-red-600",
   success: "text-green-700",
+  warning: "text-amber-600",
 };
 
 type AlertProps = HTMLAttributes<HTMLParagraphElement> & {
