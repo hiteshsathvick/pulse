@@ -1,13 +1,18 @@
+import hashlib
+import hmac
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from clickhouse_connect.driver.asyncclient import AsyncClient
 from redis.asyncio import Redis
 
+from pulse.core.config import get_settings
 from pulse.events.repository import insert_events
+from pulse.models import PiiAction
 from pulse.registry import service as registry
 from pulse.repositories import object_storage
 from pulse.worker.consumer import StreamEntry, ack
@@ -15,6 +20,14 @@ from pulse.worker.consumer import StreamEntry, ack
 logger = logging.getLogger("pulse.worker")
 
 PropertyValue = str | float | bool | None
+
+# Fetches one project's current PII rules (property_key -> action). Injected
+# rather than called directly, so process_batch's existing tests (pure
+# Redis+ClickHouse, no Postgres at all today) need no changes: the default
+# `None` below means "no rules for anything in this batch," not "fetch and
+# find none" -- it never touches Postgres unless a caller actually wires one
+# in (pulse/worker/main.py wires the real pii_rules service).
+PiiRuleFetcher = Callable[[uuid.UUID, uuid.UUID], Awaitable[dict[str, PiiAction]]]
 
 
 class PoisonEvent(Exception):
@@ -101,6 +114,46 @@ def parse_stream_entry(fields: dict[bytes, bytes]) -> ParsedEvent:
         raise PoisonEvent(str(exc)) from exc
 
 
+def _hash_pii_value(value: str, secret: str) -> str:
+    """Keyed HMAC, not a plain hash: deterministic (the same input always
+    hashes the same, so a hashed property still supports unique-user-style
+    grouping) but not reversible or rainbow-table-able without the secret."""
+    return hmac.new(secret.encode(), value.encode(), hashlib.sha256).hexdigest()
+
+
+def apply_pii_rules(parsed: ParsedEvent, rules: dict[str, PiiAction]) -> ParsedEvent:
+    """Enforced here, before to_clickhouse_row/insert_events and before the
+    schema registry ever sees the property (register_events is called on
+    `raw_properties` too) -- so a rule protects a property from the very
+    first ingested event, not just after the registry has already seen it
+    once unprotected. `drop` removes the key from both `properties` (the
+    ClickHouse-bound Map) and `raw_properties` (the registry's type-inference
+    input), so it never lands in ClickHouse *or* the query UI's property
+    autocomplete. `hash` replaces both with the same HMAC'd string -- the
+    registry then correctly sees "string", not whatever type the property
+    had before hashing. Scoped to ClickHouse and the registry only: the raw
+    batch archive (object storage) is batch-shaped, not per-property-editable
+    without rewriting archive files, and is a documented, deliberate gap --
+    the same reasoning already applied to GDPR deletion's scope."""
+    if not rules or not any(key in rules for key in parsed.properties):
+        return parsed
+    secret = get_settings().pii_hash_secret
+    properties = dict(parsed.properties)
+    raw_properties = dict(parsed.raw_properties)
+    for key, action in rules.items():
+        if key not in properties:
+            continue
+        if action == PiiAction.DROP:
+            del properties[key]
+            raw_properties.pop(key, None)
+        elif action == PiiAction.HASH:
+            hashed = _hash_pii_value(properties[key], secret)
+            properties[key] = hashed
+            if key in raw_properties:
+                raw_properties[key] = hashed
+    return replace(parsed, properties=properties, raw_properties=raw_properties)
+
+
 def to_clickhouse_row(parsed: ParsedEvent, ingest_batch: uuid.UUID) -> dict[str, object]:
     return {
         "org_id": parsed.org_id,
@@ -179,6 +232,7 @@ async def process_batch(
     group: str,
     dlq_stream_key: str,
     dedup_ttl_seconds: int,
+    pii_rules_fetcher: PiiRuleFetcher | None = None,
 ) -> BatchResult:
     """One worker batch, per SPEC.md #6.4-adjacent Phase 8 design: parse (a
     parse failure -> DLQ) -> dedup-check (read-only) to filter -> bulk
@@ -199,6 +253,15 @@ async def process_batch(
     ack_ids: list[bytes] = []
     raw_archive: list[dict[str, str]] = []
     observations: list[registry.RegistryObservation] = []
+    pii_rules_cache: dict[tuple[uuid.UUID, uuid.UUID], dict[str, PiiAction]] = {}
+
+    async def _pii_rules_for(org_id: uuid.UUID, project_id: uuid.UUID) -> dict[str, PiiAction]:
+        if pii_rules_fetcher is None:
+            return {}
+        cache_key = (org_id, project_id)
+        if cache_key not in pii_rules_cache:
+            pii_rules_cache[cache_key] = await pii_rules_fetcher(org_id, project_id)
+        return pii_rules_cache[cache_key]
 
     for entry_id, fields in entries:
         ack_ids.append(entry_id)
@@ -214,6 +277,9 @@ async def process_batch(
         if await is_duplicate(redis_client, parsed.event_id):
             result.duplicates += 1
             continue
+
+        pii_rules = await _pii_rules_for(parsed.org_id, parsed.project_id)
+        parsed = apply_pii_rules(parsed, pii_rules)
 
         good_rows.append(to_clickhouse_row(parsed, ingest_batch))
         fresh_event_ids.append(parsed.event_id)

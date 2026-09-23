@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pulse.api.dependencies import require_role
 from pulse.core.security import get_current_user
@@ -14,7 +14,7 @@ invites_router = APIRouter(prefix="/api/v1/invites", tags=["invites"])
 
 
 class CreateInviteRequest(BaseModel):
-    email: str
+    email: str = Field(max_length=320)
     role: MembershipRole = MembershipRole.MEMBER
 
 
@@ -34,7 +34,7 @@ class InviteCreatedResponse(InviteResponse):
 
 
 class AcceptInviteRequest(BaseModel):
-    token: str
+    token: str = Field(max_length=512)
 
 
 class MembershipResponse(BaseModel):

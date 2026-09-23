@@ -15,12 +15,12 @@ router = APIRouter(prefix="/api/v1/orgs", tags=["organizations"])
 
 
 class CreateOrgRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     slug: str = Field(min_length=1, max_length=63)
 
 
 class UpdateOrgRequest(BaseModel):
-    name: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=200)
     retention_days: int | None = Field(default=None, ge=1)
 
 

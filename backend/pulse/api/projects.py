@@ -11,14 +11,18 @@ router = APIRouter(prefix="/api/v1/orgs/{org_id}/projects", tags=["projects"])
 
 
 class CreateProjectRequest(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     slug: str = Field(min_length=1, max_length=63)
-    timezone: str = "UTC"
+    timezone: str = Field(default="UTC", max_length=64)
 
 
 class UpdateProjectRequest(BaseModel):
-    name: str | None = None
-    timezone: str | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    timezone: str | None = Field(default=None, max_length=64)
+    # Phase 22: null explicitly clears an override back to the org default
+    # (Organization.retention_days) -- distinguished from "field omitted
+    # entirely" via model_fields_set at the call site, not by this default.
+    retention_days: int | None = Field(default=None, ge=1)
 
 
 class ProjectResponse(BaseModel):
@@ -27,6 +31,7 @@ class ProjectResponse(BaseModel):
     name: str
     slug: str
     timezone: str
+    retention_days: int | None
 
 
 def _project_response(project: Project) -> ProjectResponse:
@@ -36,6 +41,7 @@ def _project_response(project: Project) -> ProjectResponse:
         name=project.name,
         slug=project.slug,
         timezone=project.timezone,
+        retention_days=project.retention_days,
     )
 
 
@@ -85,6 +91,9 @@ async def update_project(
         membership.user_id,
         name=body.name,
         timezone=body.timezone,
+        retention_days=body.retention_days
+        if "retention_days" in body.model_fields_set
+        else projects_service.UNSET,
     )
     if project is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")

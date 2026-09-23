@@ -4,6 +4,7 @@ import logging
 from pulse.core.config import get_settings
 from pulse.repositories import clickhouse, object_storage
 from pulse.repositories import redis as redis_repo
+from pulse.services.pii_rules import get_rules_for_project
 from pulse.worker.consumer import ensure_consumer_group, read_batch
 from pulse.worker.processing import process_batch
 
@@ -36,6 +37,7 @@ async def run_cycle() -> None:
             group=settings.worker_consumer_group,
             dlq_stream_key=settings.worker_dlq_stream_key,
             dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+            pii_rules_fetcher=get_rules_for_project,
         )
     except Exception:
         # Not acked -- entries stay pending and are reclaimed next cycle.

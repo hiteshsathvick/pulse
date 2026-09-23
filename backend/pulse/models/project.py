@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import ForeignKey, String, UniqueConstraint
+from sqlalchemy import ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -21,3 +21,8 @@ class Project(IdMixin, TimestampMixin, SoftDeleteMixin, Base):
     name: Mapped[str] = mapped_column(String)
     slug: Mapped[str] = mapped_column(String)
     timezone: Mapped[str] = mapped_column(String, default="UTC")
+    # Phase 22: null means "use Organization.retention_days" -- an explicit
+    # override is only stored here when a project actually diverges from its
+    # org's default, so the org-level default still applies for anyone who's
+    # never touched this setting.
+    retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)

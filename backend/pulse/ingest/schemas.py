@@ -16,10 +16,13 @@ class IngestEvent(BaseModel):
 
     event_id: uuid.UUID
     event: str = Field(min_length=1, max_length=200)
-    user_id: str | None = None
-    anonymous_id: str | None = None
+    # Phase 22 input-validation sweep: these were previously fully
+    # unbounded -- a legitimate (if unusual) gap for a public, write-key-only
+    # endpoint meant to accept arbitrary customer app traffic.
+    user_id: str | None = Field(default=None, max_length=200)
+    anonymous_id: str | None = Field(default=None, max_length=200)
     timestamp: datetime | None = None
-    properties: dict[str, PropertyValue] | None = None
+    properties: dict[str, PropertyValue] | None = Field(default=None, max_length=500)
 
     @model_validator(mode="after")
     def _requires_a_user_or_anonymous_id(self) -> "IngestEvent":

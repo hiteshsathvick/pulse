@@ -8,6 +8,7 @@ from pulse.models.insight import Insight, InsightKind
 from pulse.models.invite import Invite
 from pulse.models.membership import Membership, MembershipRole
 from pulse.models.organization import Organization
+from pulse.models.pii_rule import PiiAction, PiiRule
 from pulse.models.project import Project
 from pulse.models.refresh_token import RefreshToken
 from pulse.models.schema_registry import EventSchema, PropertySchema, PropertyType, SchemaStatus
@@ -30,6 +31,8 @@ __all__ = [
     "Membership",
     "MembershipRole",
     "Organization",
+    "PiiAction",
+    "PiiRule",
     "Project",
     "PropertySchema",
     "PropertyType",

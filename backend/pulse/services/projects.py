@@ -12,6 +12,13 @@ class ProjectSlugAlreadyTaken(Exception):
     pass
 
 
+# Distinguishes "retention_days wasn't in this PATCH body at all" (leave
+# unchanged) from "it was explicitly sent as null" (clear an override, fall
+# back to Organization.retention_days) -- plain `None` can't carry both
+# meanings for a field whose real value IS `int | None`.
+UNSET = object()
+
+
 async def create_project(
     org_id: uuid.UUID, name: str, slug: str, timezone: str, actor_id: uuid.UUID
 ) -> Project:
@@ -57,6 +64,7 @@ async def update_project(
     *,
     name: str | None = None,
     timezone: str | None = None,
+    retention_days: int | None | object = UNSET,
 ) -> Project | None:
     async with session_scope(org_id=org_id) as session:
         project = await session.get(Project, project_id)
@@ -66,6 +74,8 @@ async def update_project(
             project.name = name
         if timezone is not None:
             project.timezone = timezone
+        if retention_days is not UNSET:
+            project.retention_days = retention_days  # type: ignore[assignment]
         audit.record(
             session,
             org_id=org_id,

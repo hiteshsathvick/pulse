@@ -185,6 +185,40 @@ jobs:
         working-directory: packages/sdk-js
         run: npm run build
 
+  dependency-scan:
+    # Phase 22. Advisory, not blocking: pip-audit/npm audit found real,
+    # currently-unfixable findings when this job was added (starlette has no
+    # newer version resolvable in this environment's index at all; pytest's
+    # and vitest's fixes are both major-version bumps of dev-only tooling,
+    # each needing its own full regression pass before landing, not a Phase
+    # 22 side effect). A blocking gate here would leave CI permanently red
+    # over things this run can't fix, which defeats "CI stays green" as a
+    # signal. Findings are tracked in docs/THREAT_MODEL.md; each step still
+    # runs and prints its report every time, so new findings stay visible.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: pip-audit (backend)
+        working-directory: backend
+        run: pip install pip-audit && pip-audit || true
+      - name: pip-audit (sdk-python)
+        working-directory: packages/sdk-python
+        run: pip-audit || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: npm audit (frontend)
+        working-directory: frontend
+        run: npm ci && npm audit --audit-level=high || true
+      - name: npm audit (sdk-js)
+        working-directory: packages/sdk-js
+        run: npm ci && npm audit --audit-level=high || true
+
   test-sdk-python:
     runs-on: ubuntu-latest
     steps:

@@ -12,9 +12,13 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 
 class RegisterRequest(BaseModel):
-    email: str
-    password: str = Field(min_length=8)
-    name: str
+    # Phase 22 input-validation sweep: bounded lengths on every auth field --
+    # an unbounded password in particular would let a request drive an
+    # expensive Argon2 hash over an arbitrarily large string, a real (if
+    # minor) DoS vector on a deliberately unauthenticated endpoint.
+    email: str = Field(max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+    name: str = Field(min_length=1, max_length=200)
 
 
 class UserResponse(BaseModel):
@@ -25,8 +29,8 @@ class UserResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(max_length=320)
+    password: str = Field(max_length=128)
 
 
 class TokenResponse(BaseModel):

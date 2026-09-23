@@ -35,3 +35,22 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
             },
         )
         return response
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Phase 22. Applied app-wide, including /ingest -- these headers don't
+    conflict with /ingest's deliberately open CORS (SPEC.md #6.4), which is
+    about *who* can call the API, not how a browser should treat the
+    response body. No Content-Security-Policy or HSTS here: this is a JSON
+    API with no HTML of its own to scope a CSP against, and HSTS is a
+    deployment-level concern (only meaningful once TLS termination is
+    actually in front of this, which is outside this app's own config)."""
+
+    async def dispatch(
+        self, request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response

@@ -11,12 +11,14 @@ from pulse.api.auth import router as auth_router
 from pulse.api.billing import router as billing_router
 from pulse.api.billing import webhook_router as billing_webhook_router
 from pulse.api.dashboards import router as dashboards_router
+from pulse.api.deletion import router as deletion_router
 from pulse.api.export import router as export_router
 from pulse.api.health import router as health_router
 from pulse.api.insights import router as insights_router
 from pulse.api.invites import invites_router, org_invites_router
 from pulse.api.keys import router as keys_router
 from pulse.api.orgs import router as orgs_router
+from pulse.api.pii_rules import router as pii_rules_router
 from pulse.api.projects import router as projects_router
 from pulse.api.query import router as query_router
 from pulse.api.schema_registry import router as schema_registry_router
@@ -28,7 +30,7 @@ from pulse.core.error_handlers import (
     validation_exception_handler,
 )
 from pulse.core.logging import configure_logging
-from pulse.core.middleware import RequestIdMiddleware
+from pulse.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
 from pulse.ingest.router import router as ingest_router
 from pulse.repositories import clickhouse, postgres
 from pulse.repositories import redis as redis_repo
@@ -47,6 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Pulse API", lifespan=lifespan)
 
 app.add_middleware(RequestIdMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
 # Applied app-wide for simplicity rather than scoped to just /ingest --
 # Starlette's CORSMiddleware has no per-route scoping, and hand-rolling one
 # to avoid opening CORS on the JWT-bearer console endpoints would reinvent
@@ -83,3 +86,5 @@ app.include_router(billing_router)
 app.include_router(billing_webhook_router)
 app.include_router(webhooks_router)
 app.include_router(export_router)
+app.include_router(pii_rules_router)
+app.include_router(deletion_router)

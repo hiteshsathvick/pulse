@@ -147,6 +147,17 @@ class Settings(BaseSettings):
     # an interactive query, but still shouldn't be unbounded.
     export_max_rows: int = 5_000_000
 
+    # Phase 22: PII enforcement at ingest (pulse/worker/processing.py). A
+    # keyed HMAC, not a plain hash -- deterministic (so a hashed property
+    # still supports unique-user-style grouping) but not reversible or
+    # rainbow-table-able without this secret. A fixed insecure default so
+    # dev/CI/tests need no setup; change it for any real deployment, same
+    # convention as jwt_secret.
+    pii_hash_secret: str = "dev-insecure-pii-hash-secret-change-me"
+
+    # Phase 22: retention (pulse/retention/). Mirrors alert_evaluation_interval_seconds.
+    retention_sweep_interval_seconds: int = 3600
+
     # Phase 20: billing (pulse/billing/). Confirmed with the user first:
     # Stripe test mode needed a real account this session couldn't set up,
     # and a paid/external dependency wasn't wanted for this piece either --
