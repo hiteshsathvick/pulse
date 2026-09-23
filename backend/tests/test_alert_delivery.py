@@ -123,6 +123,7 @@ async def test_deliver_sends_a_webhook_and_records_success(monkeypatch: pytest.M
 async def test_deliver_records_failure_on_a_non_2xx_webhook_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(get_settings(), "alert_webhook_retry_backoff_seconds", 0.0)
     transport = _RecordingTransport(status_code=500)
     _patch_transport(monkeypatch, transport)
     alert = _fake_alert()
@@ -135,6 +136,8 @@ async def test_deliver_records_failure_on_a_non_2xx_webhook_response(
 async def test_deliver_records_failure_without_raising_on_a_connection_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(get_settings(), "alert_webhook_retry_backoff_seconds", 0.0)
+
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("boom", request=request)
 
@@ -187,3 +190,99 @@ async def test_email_and_webhook_and_in_app_all_deliver_independently(
 
     delivered = await delivery.deliver(alert, "message", channels)
     assert delivered == {"email": "sent", "webhook": "sent", "in_app": "recorded"}
+
+
+class _FlakyTransport(httpx.MockTransport):
+    """Fails with a transient error/status the first `fail_times` requests,
+    then succeeds -- for proving retry actually recovers, not just that it
+    eventually gives up."""
+
+    def __init__(self, fail_times: int, fail_status: int | None = None) -> None:
+        self.requests: list[httpx.Request] = []
+        self._remaining_failures = fail_times
+        self._fail_status = fail_status
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if self._remaining_failures > 0:
+                self._remaining_failures -= 1
+                if self._fail_status is not None:
+                    return httpx.Response(self._fail_status)
+                raise httpx.ConnectError("boom", request=request)
+            return httpx.Response(200)
+
+        super().__init__(handler)
+
+
+async def test_a_connection_error_retries_and_eventually_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "alert_webhook_retry_backoff_seconds", 0.0)
+    transport = _FlakyTransport(fail_times=2)
+    _patch_transport(monkeypatch, transport)
+
+    result = await delivery.send_webhook_with_result("https://example.com/hook", {"a": 1})
+
+    assert result == delivery.WebhookDeliveryResult(delivered=True, status_code=200)
+    assert len(transport.requests) == 3
+
+
+async def test_a_5xx_response_retries_and_eventually_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "alert_webhook_retry_backoff_seconds", 0.0)
+    transport = _FlakyTransport(fail_times=2, fail_status=503)
+    _patch_transport(monkeypatch, transport)
+
+    result = await delivery.send_webhook_with_result("https://example.com/hook", {"a": 1})
+
+    assert result == delivery.WebhookDeliveryResult(delivered=True, status_code=200)
+    assert len(transport.requests) == 3
+
+
+async def test_a_4xx_response_fails_immediately_without_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "alert_webhook_retry_backoff_seconds", 0.0)
+    transport = _RecordingTransport(status_code=400)
+    _patch_transport(monkeypatch, transport)
+
+    result = await delivery.send_webhook_with_result("https://example.com/hook", {"a": 1})
+
+    assert result == delivery.WebhookDeliveryResult(delivered=False, status_code=400)
+    assert len(transport.requests) == 1
+
+
+async def test_exhausting_all_retries_reports_failure_with_the_last_status_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "alert_webhook_retry_backoff_seconds", 0.0)
+    monkeypatch.setattr(settings, "alert_webhook_max_retries", 2)
+    transport = _RecordingTransport(status_code=503)
+    _patch_transport(monkeypatch, transport)
+
+    result = await delivery.send_webhook_with_result("https://example.com/hook", {"a": 1})
+
+    assert result == delivery.WebhookDeliveryResult(delivered=False, status_code=503)
+    assert len(transport.requests) == 3  # 1 initial attempt + 2 retries
+
+
+async def test_exhausting_all_retries_on_connection_errors_reports_no_status_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "alert_webhook_retry_backoff_seconds", 0.0)
+    monkeypatch.setattr(settings, "alert_webhook_max_retries", 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    _patch_transport(monkeypatch, httpx.MockTransport(handler))
+
+    result = await delivery.send_webhook_with_result("https://example.com/hook", {"a": 1})
+
+    assert result == delivery.WebhookDeliveryResult(delivered=False, status_code=None)

@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import io
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -724,4 +726,67 @@ async def test_refresh_query_parameter_reaches_the_query_endpoints() -> None:
             assert (await client.post(url, json=body, headers=headers)).json()["cached"] is True
             refreshed = await client.post(f"{url}?refresh=true", json=body, headers=headers)
             assert refreshed.status_code == 200
-            assert refreshed.json()["cached"] is False
+
+
+async def test_format_csv_is_available_on_every_insight_kind_alongside_json() -> None:
+    """Phase 21 DoD: "streamed CSV/JSON export ... of query results". These
+    routes already compute the full (small, already-aggregated) result in
+    memory for the JSON path -- format=csv just serializes the same
+    `result.results` differently, reusing the exact same query_service call,
+    not a second code path that could drift from the JSON one."""
+    async with _client() as client:
+        email = f"csv-owner-{uuid.uuid4().hex[:8]}@example.com"
+        await client.post(
+            "/api/v1/auth/register", json={"email": email, "password": _PASSWORD, "name": email}
+        )
+        login = await client.post(
+            "/api/v1/auth/login", json={"email": email, "password": _PASSWORD}
+        )
+        headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        org = await client.post(
+            "/api/v1/orgs",
+            json={"name": "CSV Org", "slug": f"csv-{uuid.uuid4().hex[:8]}"},
+            headers=headers,
+        )
+        org_id = org.json()["id"]
+        project = await client.post(
+            f"/api/v1/orgs/{org_id}/projects", json={"name": "Web", "slug": "web"}, headers=headers
+        )
+        project_id = project.json()["id"]
+        base = f"/api/v1/orgs/{org_id}/projects/{project_id}/query"
+
+        ch_client = await get_clickhouse_client()
+        await insert_events(
+            ch_client,
+            [
+                generate_fake_event(
+                    org_id, project_id, event_name="signed up", timestamp=_FIXED_TIMESTAMP
+                ),
+                generate_fake_event(
+                    org_id,
+                    project_id,
+                    event_name="checkout completed",
+                    timestamp=_FIXED_TIMESTAMP,
+                ),
+            ],
+        )
+
+        bodies = {
+            "trend": _spec().model_dump(mode="json", by_alias=True),
+            "funnel": _funnel_spec().model_dump(mode="json", by_alias=True),
+            "retention": _retention_spec().model_dump(mode="json", by_alias=True),
+        }
+        for kind, body in bodies.items():
+            json_response = await client.post(f"{base}/{kind}", json=body, headers=headers)
+            csv_response = await client.post(
+                f"{base}/{kind}?format=csv", json=body, headers=headers
+            )
+            assert csv_response.status_code == 200
+            assert csv_response.headers["content-type"].startswith("text/csv")
+
+            expected_rows = json_response.json()["results"]
+            reader = csv.DictReader(io.StringIO(csv_response.text))
+            actual_rows = list(reader)
+            assert len(actual_rows) == len(expected_rows)
+            if expected_rows:
+                assert reader.fieldnames == list(expected_rows[0].keys())

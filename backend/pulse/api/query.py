@@ -1,6 +1,9 @@
+import csv
+import io
 import uuid
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 
 from pulse.ai import translator as ai_translator
@@ -8,6 +11,27 @@ from pulse.api.dependencies import resolve_query_scope
 from pulse.core.rate_limit import RateLimitExceeded, check_ai_rate_limit
 from pulse.query import service as query_service
 from pulse.query.spec import DiscriminatedInsightSpec, FunnelSpec, RetentionSpec, TrendSpec
+
+QueryFormat = Literal["json", "csv"]
+
+
+def _csv_response(results: list[dict[str, object]], filename: str) -> Response:
+    """SPEC.md's "export of query results" -- these results are already
+    small and fully materialized (unlike raw-event export, which streams),
+    so an ordinary in-memory CSV body is enough; no new route needed, since
+    this just adds a response format to the routes that already compute the
+    result. Column set comes from the first row: every row in one result
+    list is the same shape (one insight kind per call)."""
+    fieldnames = list(results[0].keys()) if results else []
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(results)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 router = APIRouter(
     prefix="/api/v1/orgs/{org_id}/projects/{project_id}/query",
@@ -78,8 +102,12 @@ class NLQueryResponse(BaseModel):
 
 @router.post("/trend", response_model=TrendResponse)
 async def query_trend(
-    org_id: uuid.UUID, project_id: uuid.UUID, spec: TrendSpec, refresh: bool = False
-) -> TrendResponse:
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    spec: TrendSpec,
+    refresh: bool = False,
+    format: QueryFormat = "json",
+) -> TrendResponse | Response:
     try:
         result = await query_service.run_trend(spec, org_id, project_id, refresh=refresh)
     except RateLimitExceeded as exc:
@@ -92,6 +120,8 @@ async def query_trend(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from exc
+    if format == "csv":
+        return _csv_response(result.results, "trend.csv")
     return TrendResponse(
         results=result.results,
         cached=result.cached,
@@ -102,8 +132,12 @@ async def query_trend(
 
 @router.post("/funnel", response_model=FunnelResponse)
 async def query_funnel(
-    org_id: uuid.UUID, project_id: uuid.UUID, spec: FunnelSpec, refresh: bool = False
-) -> FunnelResponse:
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    spec: FunnelSpec,
+    refresh: bool = False,
+    format: QueryFormat = "json",
+) -> FunnelResponse | Response:
     try:
         result = await query_service.run_funnel(spec, org_id, project_id, refresh=refresh)
     except RateLimitExceeded as exc:
@@ -116,13 +150,19 @@ async def query_funnel(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from exc
+    if format == "csv":
+        return _csv_response(result.results, "funnel.csv")
     return FunnelResponse(results=result.results, cached=result.cached)
 
 
 @router.post("/retention", response_model=RetentionResponse)
 async def query_retention(
-    org_id: uuid.UUID, project_id: uuid.UUID, spec: RetentionSpec, refresh: bool = False
-) -> RetentionResponse:
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    spec: RetentionSpec,
+    refresh: bool = False,
+    format: QueryFormat = "json",
+) -> RetentionResponse | Response:
     try:
         result = await query_service.run_retention(spec, org_id, project_id, refresh=refresh)
     except RateLimitExceeded as exc:
@@ -135,6 +175,8 @@ async def query_retention(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
         ) from exc
+    if format == "csv":
+        return _csv_response(result.results, "retention.csv")
     return RetentionResponse(results=result.results, cached=result.cached)
 
 

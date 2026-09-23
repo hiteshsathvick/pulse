@@ -11,6 +11,7 @@ from pulse.api.auth import router as auth_router
 from pulse.api.billing import router as billing_router
 from pulse.api.billing import webhook_router as billing_webhook_router
 from pulse.api.dashboards import router as dashboards_router
+from pulse.api.export import router as export_router
 from pulse.api.health import router as health_router
 from pulse.api.insights import router as insights_router
 from pulse.api.invites import invites_router, org_invites_router
@@ -19,6 +20,7 @@ from pulse.api.orgs import router as orgs_router
 from pulse.api.projects import router as projects_router
 from pulse.api.query import router as query_router
 from pulse.api.schema_registry import router as schema_registry_router
+from pulse.api.webhooks import router as webhooks_router
 from pulse.core.config import get_settings
 from pulse.core.error_handlers import (
     http_exception_handler,
@@ -79,3 +81,5 @@ app.include_router(dashboards_router)
 app.include_router(alerts_router)
 app.include_router(billing_router)
 app.include_router(billing_webhook_router)
+app.include_router(webhooks_router)
+app.include_router(export_router)

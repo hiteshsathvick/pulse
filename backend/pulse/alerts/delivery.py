@@ -14,10 +14,12 @@ after this returns IS the in-app notification."""
 from __future__ import annotations
 
 import abc
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -59,19 +61,60 @@ def sign_webhook_payload(payload: bytes, secret: str) -> str:
     return "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
 
-async def _send_webhook(url: str, payload: dict[str, Any]) -> bool:
+@dataclass
+class WebhookDeliveryResult:
+    delivered: bool
+    status_code: int | None
+
+
+async def send_webhook_with_result(url: str, payload: dict[str, Any]) -> WebhookDeliveryResult:
+    """One attempt, then retries with doubling backoff -- but only on a
+    transient failure (timeout, connection error, 5xx). A 4xx means the
+    receiver itself rejected the request; retrying the identical payload
+    won't change that, so it fails immediately instead of wasting attempts.
+    `status_code` is the last response actually received (None if every
+    attempt raised, e.g. connection refused/timeout throughout)."""
     settings = get_settings()
     body = json.dumps(payload, sort_keys=True).encode()
     headers = {"Content-Type": "application/json"}
     if settings.alert_webhook_secret:
         headers["X-Pulse-Signature"] = sign_webhook_payload(body, settings.alert_webhook_secret)
-    try:
-        async with httpx.AsyncClient(timeout=settings.alert_webhook_timeout_seconds) as client:
-            response = await client.post(url, content=body, headers=headers)
-        return response.status_code < 300
-    except httpx.HTTPError:
-        logger.warning("webhook delivery failed for %s", url, exc_info=True)
-        return False
+
+    attempts = settings.alert_webhook_max_retries + 1
+    backoff = settings.alert_webhook_retry_backoff_seconds
+    last_status: int | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=settings.alert_webhook_timeout_seconds) as client:
+                response = await client.post(url, content=body, headers=headers)
+            last_status = response.status_code
+            if response.status_code < 300:
+                return WebhookDeliveryResult(delivered=True, status_code=last_status)
+            if response.status_code < 500:
+                logger.warning(
+                    "webhook delivery to %s rejected with %s, not retrying",
+                    url,
+                    response.status_code,
+                )
+                return WebhookDeliveryResult(delivered=False, status_code=last_status)
+        except httpx.HTTPError:
+            logger.warning(
+                "webhook delivery attempt %s/%s failed for %s",
+                attempt,
+                attempts,
+                url,
+                exc_info=True,
+            )
+
+        if attempt < attempts:
+            await asyncio.sleep(backoff * (2 ** (attempt - 1)))
+
+    logger.warning("webhook delivery to %s failed after %s attempts", url, attempts)
+    return WebhookDeliveryResult(delivered=False, status_code=last_status)
+
+
+async def _send_webhook(url: str, payload: dict[str, Any]) -> bool:
+    return (await send_webhook_with_result(url, payload)).delivered
 
 
 async def deliver(alert: Alert, message: str, channels: AlertChannels) -> dict[str, str]:

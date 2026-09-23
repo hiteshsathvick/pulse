@@ -136,6 +136,16 @@ class Settings(BaseSettings):
     # deployment may have no receiver that checks a signature at all.
     alert_webhook_secret: str | None = None
     alert_webhook_timeout_seconds: float = 5.0
+    # Phase 21: retried on timeout/connection error/5xx (transient), never on
+    # 4xx (the receiver's own rejection -- retrying a bad URL or payload
+    # doesn't help). Backoff doubles each attempt: 1s, 2s, 4s by default.
+    alert_webhook_max_retries: int = 3
+    alert_webhook_retry_backoff_seconds: float = 1.0
+
+    # Phase 21: export (pulse/api/export.py). A hard ceiling independent of
+    # query_max_rows_to_read -- exports are expected to read more rows than
+    # an interactive query, but still shouldn't be unbounded.
+    export_max_rows: int = 5_000_000
 
     # Phase 20: billing (pulse/billing/). Confirmed with the user first:
     # Stripe test mode needed a real account this session couldn't set up,

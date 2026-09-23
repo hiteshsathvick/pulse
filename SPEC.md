@@ -1313,6 +1313,66 @@ Reproduced with a plain reload before the fix (label corrected itself once the 3
 it was a cache-timing bug and not a backend defect) and confirmed fixed afterward: the label now updates
 immediately on both the Confirm and Cancel transitions, no reload needed.
 
+### 6.19 Public API, exports & webhook reliability mechanism (Phase 21)
+
+Three additions, all reusing existing mechanisms rather than inventing new auth, query, or delivery layers.
+
+**Raw event export** (`GET .../export/events`, `pulse/api/export.py`, new): the route table's one new route.
+Reuses `resolve_query_scope` unchanged -- a read API key or a JWT, the exact same auth the query routes
+have accepted since Phase 11, so this needed zero new auth code. Streams rows directly out of ClickHouse via
+`clickhouse_connect`'s `query_rows_stream` into a `StreamingResponse`, so memory stays flat regardless of
+export size -- unlike every other ClickHouse read in this codebase, which materializes its (small,
+aggregated) result in memory. JSON output is **newline-delimited** (one JSON object per line,
+`application/x-ndjson`), not a single JSON array: an array needs the whole body buffered to close its
+brackets, which would defeat streaming entirely. `ORDER BY timestamp` costs a real sort when the range spans
+more than one event name (the table's own physical order is `(org_id, project_id, event_name, timestamp,
+...)`), accepted because a chronological export is what a data-ownership export is for, and it's bounded by
+a new `export_max_rows` setting (a literal SQL `LIMIT`, so the stream can never emit more than that many rows
+no matter how large the underlying range) and by `max_execution_time`. Unlike interactive queries
+(`query_service.QueryTooExpensive` -> a clean 422), a cap hit *mid-stream* has no clean way to change an
+already-started 200 response's status code -- documented as an accepted, honest limitation of any streamed
+HTTP export, not one this phase solves.
+
+**Query-result CSV export** (`format=csv` on the existing `POST .../query/{trend,funnel,retention}`
+routes, `pulse/api/query.py`): no new route, since these results are already small and fully materialized in
+memory for the JSON path -- `format=csv` just serializes the identical `result.results` differently, calling
+the exact same `query_service` function either way, so the two output formats can never drift apart. Returning
+a `Response` directly from a route bypasses its declared `response_model` (documented FastAPI behavior), so
+the JSON path keeps its Pydantic-validated schema unchanged.
+
+**Webhook retry/backoff** (`pulse/alerts/delivery.py`): Phase 19 shipped HMAC signing but deliberately
+deferred retry to this phase (SPEC.md said so explicitly). `send_webhook_with_result` now retries with
+doubling backoff (`alert_webhook_max_retries`, `alert_webhook_retry_backoff_seconds`; defaults 3 retries,
+1s/2s/4s) -- but only on a *transient* failure (timeout, connection error, 5xx). A 4xx fails immediately
+without retrying: the receiver itself rejected the request, and retrying the identical payload won't change
+that. `_send_webhook` (used by `deliver()`) is now a thin wrapper over this, so alert delivery's existing
+behavior and tests needed no changes beyond the retry itself.
+
+**Webhook test-send** (`POST .../webhooks/test`, `pulse/api/webhooks.py`, new; Admin+ only). **Design fork,
+confirmed with the user first:** SPEC.md's route table lists a bare `POST /api/v1/webhooks (mgmt)`, ambiguous
+between (a) making the existing alert webhook reliable plus a way to verify a URL before relying on it, or
+(b) a whole new generic webhook-subscription system decoupled from alerts. Chose (a) -- Phase 21's own DoD
+line says verbatim "alert webhooks deliver reliably," nothing about other event types, and nothing in the
+roadmap needs a second event source today. Sends one synthetic signed payload through the same
+`send_webhook_with_result` retry path and reports `{delivered, status_code}`, so a user finds out their
+receiver is misconfigured before a real alert ever depends on it, not the first time one fires.
+
+**Deliberately not done:** pagination/continuation past `export_max_rows` (not asked for by this phase's
+DoD); a generic webhook-subscription model for non-alert event types (see the design fork above); mirroring
+export activity into an audit log (exports are reads, not mutations -- `docs/SPEC.md #6` already scopes
+audit logging to mutating actions only).
+
+**Tests:** `test_export_api.py` (10) -- tenant isolation, a wrong-project read key rejected with 404 (same
+convention `test_query_auth_accepts_jwt_or_read_key...` already established), NDJSON and CSV structure and
+properties round-tripping, the `event_name` filter, an empty range streaming zero rows cleanly, and the row
+cap actually truncating a 5-event seed down to 2. `test_query_engine.py` gained one new test proving
+`format=csv` is available on all three insight kinds and its row count/columns match the JSON path exactly.
+`test_alert_delivery.py` gained retry-specific tests: a connection error and a 5xx each retrying and
+recovering, a 4xx failing on the first attempt with no retry at all, and exhausting every retry reporting the
+last real status code (or `None` when every attempt raised rather than got a response). `test_webhooks_api.py`
+(new) covers the test-send endpoint's RBAC (Admin allowed, Member forbidden, another org's member 404) and
+both its success and failure result shapes, again against a mocked transport, never a real network.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1404,8 +1464,9 @@ Tests: ☑ metering accuracy vs ingested volume; ☑ quota enforcement; ☑ webh
 verification + event processing, against a locally HMAC-signed payload -- needs no real account of any
 kind). See §6.18.
 
-**Phase 21 — Public API/exports/webhooks.** ☐ scoped read API; ☐ streamed CSV/JSON export (results + raw
-events); ☐ signed, retried outbound webhooks. Tests: key scoping; export completeness; webhook signing/retry.
+**Phase 21 — Public API/exports/webhooks.** ☑ scoped read API; ☑ streamed CSV/JSON export (results + raw
+events); ☑ signed, retried outbound webhooks. Tests: ☑ key scoping; ☑ export completeness; ☑ webhook
+signing/retry. See §6.19.
 
 **Phase 22 — Security/retention/PII.** ☐ per-project TTL retention; ☐ PII allow/deny + hash/drop at ingest;
 ☐ user-deletion across partitions; ☐ input-validation sweep, headers, dep scan; ☐ threat model. Tests: TTL
@@ -1866,3 +1927,25 @@ trace follows an event end to end.
   plan label showing stale "Free" for up to 30 seconds immediately after a real upgrade, fixed by invalidating
   the three billing query keys in both mutations' `onSuccess`). Phase 20 DoD (§7) now fully ticked; no
   outstanding Stripe-account dependency remains for this phase to be considered done.
+- 2026-09-23 — Phase 21 (`10d0724`'s successor, not yet tagged) — Added §6.19 (public API, exports & webhook
+  reliability mechanism) and ticked the Phase 21 DoD. **Design fork, confirmed with the user first:**
+  SPEC.md's route table lists a bare `POST /api/v1/webhooks (mgmt)`, ambiguous between making the existing
+  Phase 19 alert webhook reliable (retry/backoff, deliberately deferred from that phase) plus a way to test a
+  URL before relying on it, versus a whole new generic webhook-subscription system for arbitrary event types.
+  Chose the former -- Phase 21's own DoD line says verbatim "alert webhooks deliver reliably," and nothing in
+  the roadmap needs a second event source today. New `pulse/api/export.py`: `GET .../export/events` streams
+  raw events straight out of ClickHouse (`clickhouse_connect`'s `query_rows_stream`) as newline-delimited
+  JSON or CSV, reusing `resolve_query_scope` (Phase 11's read-key-or-JWT auth) unchanged. Existing
+  `POST .../query/{trend,funnel,retention}` routes gained a `format=csv` option, reusing the same
+  `query_service` call as the JSON path so the two can't drift. `pulse/alerts/delivery.py`'s
+  `send_webhook_with_result` now retries transient failures (timeout/connection error/5xx) with doubling
+  backoff, never retrying a 4xx; new `POST .../webhooks/test` (Admin+) sends one synthetic signed payload
+  through the same path. 21 new backend tests (311 → 332 passed, 1 skipped): `test_export_api.py` (10,
+  new -- tenant isolation, key scoping, NDJSON/CSV structure, the row cap actually truncating), one new test
+  in `test_query_engine.py` (CSV matches JSON on all three insight kinds), 5 new retry-specific tests in
+  `test_alert_delivery.py`, `test_webhooks_api.py` (5, new -- RBAC + success/failure result shapes). No
+  frontend work this phase -- unlike every UI-touching phase before it, Phase 21's own DoD is written purely
+  in terms of external/API-level access ("an external client can query insights and export raw events via
+  the API"), not a console feature; a "Test webhook" button on the alert form and an "Export" button on the
+  project page are natural follow-ups if wanted, not required by this phase's DoD. ruff / mypy (`pulse`,
+  strict) all clean.
