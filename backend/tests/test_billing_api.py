@@ -1,7 +1,7 @@
-"""RBAC, the "not configured yet" degradation, and the Stripe-mocked happy
-paths for pulse/api/billing.py. Every Stripe SDK call is monkeypatched --
-this file proves the API wiring, not the Stripe SDK itself (which
-pulse/billing/stripe_client.py is a thin, untested-here pass-through over)."""
+"""RBAC and the real happy paths for pulse/api/billing.py against the
+default MockPaymentProvider (needs zero external account -- confirmed with
+the user first, see pulse/billing/providers.py), plus the "not configured"
+degradation for the optional real-Stripe swap-in path."""
 
 import uuid
 from pathlib import Path
@@ -12,7 +12,7 @@ import pytest
 
 from alembic import command
 from alembic.config import Config
-from pulse.billing import stripe_client
+from pulse.core.config import get_settings
 from pulse.main import app
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -109,16 +109,47 @@ async def test_a_member_of_another_org_gets_404_not_403() -> None:
         assert response.status_code == 404
 
 
-async def test_checkout_is_a_clean_503_when_stripe_is_not_configured() -> None:
+# --- the default mock provider: no external account needed at all --------
+
+
+async def test_checkout_returns_a_local_mock_checkout_url_by_default() -> None:
     async with _client() as client:
         ctx = await _org(client)
         response = await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
-        assert response.status_code == 503
+        assert response.status_code == 200
+        url = response.json()["url"]
+        assert url == f"http://localhost:3000/orgs/{ctx['org_id']}/billing/mock-checkout"
 
 
-async def test_invoices_is_an_empty_list_with_no_stripe_customer_yet() -> None:
-    """No customer_id at all means no Stripe call is even attempted -- this
-    is a 200/[] "nothing to show yet", not a 503."""
+async def test_checkout_persists_a_customer_id_so_a_second_call_reuses_it() -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        first = await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        second = await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        assert first.status_code == second.status_code == 200
+        assert first.json()["url"] == second.json()["url"]
+
+
+async def test_portal_is_a_404_with_no_customer_yet() -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        response = await client.post(f"{ctx['base']}/portal", headers=ctx["headers"])
+        assert response.status_code == 404
+
+
+async def test_portal_returns_a_local_mock_url_once_a_customer_exists() -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        response = await client.post(f"{ctx['base']}/portal", headers=ctx["headers"])
+        assert response.status_code == 200
+        assert (
+            response.json()["url"]
+            == f"http://localhost:3000/orgs/{ctx['org_id']}/billing/mock-checkout"
+        )
+
+
+async def test_invoices_is_an_empty_list_with_no_customer_yet() -> None:
     async with _client() as client:
         ctx = await _org(client)
         response = await client.get(f"{ctx['base']}/invoices", headers=ctx["headers"])
@@ -126,98 +157,118 @@ async def test_invoices_is_an_empty_list_with_no_stripe_customer_yet() -> None:
         assert response.json() == []
 
 
-async def test_portal_is_a_404_with_no_stripe_customer_yet() -> None:
+async def test_invoices_is_still_empty_on_the_free_plan_even_with_a_customer_id() -> None:
+    """A customer id alone (created the moment "Upgrade" is first clicked)
+    isn't proof of a paid period -- only mock/subscribe (or a real
+    completed checkout) moving the org to Pro should produce an invoice."""
     async with _client() as client:
         ctx = await _org(client)
-        response = await client.post(f"{ctx['base']}/portal", headers=ctx["headers"])
-        assert response.status_code == 404
-
-
-async def test_checkout_succeeds_end_to_end_with_stripe_mocked(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _fake_create_customer(**kwargs: Any) -> str:
-        assert kwargs["org_name"] == "Billing Org"
-        return "cus_fake_123"
-
-    async def _fake_create_checkout_session(**kwargs: Any) -> str:
-        assert kwargs["customer_id"] == "cus_fake_123"
-        return "https://checkout.stripe.com/fake-session"
-
-    monkeypatch.setattr(stripe_client, "create_customer", _fake_create_customer)
-    monkeypatch.setattr(stripe_client, "create_checkout_session", _fake_create_checkout_session)
-
-    async with _client() as client:
-        ctx = await _org(client)
-        response = await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        response = await client.get(f"{ctx['base']}/invoices", headers=ctx["headers"])
         assert response.status_code == 200
-        assert response.json()["url"] == "https://checkout.stripe.com/fake-session"
+        assert response.json() == []
 
-        # The customer id is persisted -- a second checkout doesn't re-create one.
+
+async def test_mock_subscribe_upgrades_the_org_to_pro() -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+
+        response = await client.post(f"{ctx['base']}/mock/subscribe", headers=ctx["headers"])
+        assert response.status_code == 200
+        assert response.json() == {"plan": "pro", "status": "active"}
+
         subscription = await client.get(f"{ctx['base']}/subscription", headers=ctx["headers"])
-        assert subscription.status_code == 200
+        body = subscription.json()
+        assert body["plan"] == "pro"
+        assert body["current_period_start"] is not None
+        assert body["current_period_end"] is not None
 
 
-async def test_portal_succeeds_end_to_end_once_a_customer_exists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _fake_create_customer(**kwargs: Any) -> str:
-        return "cus_fake_456"
-
-    async def _fake_create_checkout_session(**kwargs: Any) -> str:
-        return "https://checkout.stripe.com/fake-session"
-
-    async def _fake_create_portal_session(**kwargs: Any) -> str:
-        assert kwargs["customer_id"] == "cus_fake_456"
-        return "https://billing.stripe.com/fake-portal"
-
-    monkeypatch.setattr(stripe_client, "create_customer", _fake_create_customer)
-    monkeypatch.setattr(stripe_client, "create_checkout_session", _fake_create_checkout_session)
-    monkeypatch.setattr(stripe_client, "create_portal_session", _fake_create_portal_session)
-
+async def test_mock_subscribe_works_even_without_a_prior_checkout() -> None:
+    """mock/subscribe only needs the (always-present) Subscription row, not
+    a customer id -- unlike a real provider, there's no separate "create a
+    customer" step it depends on."""
     async with _client() as client:
         ctx = await _org(client)
-        # First a checkout, to give the org a stripe_customer_id.
-        await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
-
-        response = await client.post(f"{ctx['base']}/portal", headers=ctx["headers"])
+        response = await client.post(f"{ctx['base']}/mock/subscribe", headers=ctx["headers"])
         assert response.status_code == 200
-        assert response.json()["url"] == "https://billing.stripe.com/fake-portal"
 
 
-async def test_invoices_succeeds_end_to_end_once_a_customer_exists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def _fake_create_customer(**kwargs: Any) -> str:
-        return "cus_fake_789"
-
-    async def _fake_create_checkout_session(**kwargs: Any) -> str:
-        return "https://checkout.stripe.com/fake-session"
-
-    async def _fake_list_invoices(**kwargs: Any) -> list[dict[str, Any]]:
-        assert kwargs["customer_id"] == "cus_fake_789"
-        return [
-            {
-                "id": "in_1",
-                "status": "paid",
-                "amount_due": 2000,
-                "currency": "usd",
-                "hosted_invoice_url": "https://invoice.stripe.com/fake",
-                "created": 1_700_000_000,
-            }
-        ]
-
-    monkeypatch.setattr(stripe_client, "create_customer", _fake_create_customer)
-    monkeypatch.setattr(stripe_client, "create_checkout_session", _fake_create_checkout_session)
-    monkeypatch.setattr(stripe_client, "list_invoices", _fake_list_invoices)
-
+async def test_invoices_shows_one_after_mock_subscribing() -> None:
     async with _client() as client:
         ctx = await _org(client)
         await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        await client.post(f"{ctx['base']}/mock/subscribe", headers=ctx["headers"])
 
         response = await client.get(f"{ctx['base']}/invoices", headers=ctx["headers"])
         assert response.status_code == 200
         invoices = response.json()
         assert len(invoices) == 1
-        assert invoices[0]["id"] == "in_1"
-        assert invoices[0]["amount_due"] == 2000
+        assert invoices[0]["status"] == "paid"
+        assert invoices[0]["amount_due"] == 2900
+        assert invoices[0]["currency"] == "usd"
+
+
+async def test_mock_cancel_reverts_to_free() -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        await client.post(f"{ctx['base']}/mock/subscribe", headers=ctx["headers"])
+
+        response = await client.post(f"{ctx['base']}/mock/cancel", headers=ctx["headers"])
+        assert response.status_code == 200
+        assert response.json() == {"plan": "free", "status": "canceled"}
+
+        subscription = await client.get(f"{ctx['base']}/subscription", headers=ctx["headers"])
+        assert subscription.json()["plan"] == "free"
+
+        # And invoices go back to empty -- no longer on Pro.
+        invoices = await client.get(f"{ctx['base']}/invoices", headers=ctx["headers"])
+        assert invoices.json() == []
+
+
+async def test_a_member_cannot_call_mock_subscribe_only_an_admin_can() -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        member_email = f"member-{uuid.uuid4().hex[:8]}@example.com"
+        member_headers = await _register_and_login(client, member_email)
+        invite = await client.post(
+            f"/api/v1/orgs/{ctx['org_id']}/invites",
+            json={"email": member_email, "role": "member"},
+            headers=ctx["headers"],
+        )
+        await client.post(
+            "/api/v1/invites/accept",
+            json={"token": invite.json()["token"]},
+            headers=member_headers,
+        )
+
+        response = await client.post(f"{ctx['base']}/mock/subscribe", headers=member_headers)
+        assert response.status_code == 403
+
+
+# --- the optional real-Stripe swap-in path --------------------------------
+
+
+@pytest.fixture
+def stripe_provider_selected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(get_settings(), "payment_provider", "stripe")
+
+
+async def test_checkout_is_a_clean_503_when_stripe_is_selected_but_not_configured(
+    stripe_provider_selected: None,
+) -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        response = await client.post(f"{ctx['base']}/checkout", headers=ctx["headers"])
+        assert response.status_code == 503
+
+
+async def test_mock_actions_are_disabled_when_stripe_is_selected(
+    stripe_provider_selected: None,
+) -> None:
+    async with _client() as client:
+        ctx = await _org(client)
+        response = await client.post(f"{ctx['base']}/mock/subscribe", headers=ctx["headers"])
+        assert response.status_code == 400

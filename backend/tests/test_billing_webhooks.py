@@ -71,9 +71,9 @@ async def _get_subscription(org_id: uuid.UUID) -> Subscription:
 
 
 def _subscription_event(event_type: str, **data_overrides: Any) -> dict[str, Any]:
-    # `id` (the Stripe subscription id) is unique per call, not a shared
-    # literal -- subscriptions.stripe_subscription_id has a real unique
-    # constraint (two Stripe subscriptions never share an id), and this
+    # `id` (the provider's subscription id) is unique per call, not a shared
+    # literal -- subscriptions.payment_subscription_id has a real unique
+    # constraint (two provider subscriptions never share an id), and this
     # module-scoped test file's Postgres rows persist across every test in
     # it, so a hardcoded id here would collide with an earlier test's row.
     data: dict[str, Any] = {
@@ -101,7 +101,7 @@ async def test_a_subscription_updated_event_upgrades_the_org_to_pro() -> None:
     subscription = await _get_subscription(org_id)
     assert subscription.plan == SubscriptionPlan.PRO
     assert subscription.status == SubscriptionStatus.ACTIVE
-    assert subscription.stripe_subscription_id == event["data"]["object"]["id"]
+    assert subscription.payment_subscription_id == event["data"]["object"]["id"]
     assert subscription.current_period_start is not None
     assert subscription.current_period_end is not None
 

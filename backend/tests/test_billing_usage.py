@@ -92,7 +92,7 @@ async def test_org_creation_auto_creates_a_free_subscription() -> None:
     assert subscription is not None
     assert subscription.plan.value == "free"
     assert subscription.status.value == "active"
-    assert subscription.stripe_customer_id is None
+    assert subscription.payment_customer_id is None
 
 
 async def test_event_count_is_exact() -> None:

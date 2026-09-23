@@ -28,10 +28,14 @@ class Subscription(IdMixin, TimestampMixin, Base):
     check (pulse/billing/service.py) never has to handle "no subscription
     yet". RLS-protected like Project/Dashboard -- carries org_id, reached by
     a member of that org browsing their own billing, never by token
-    redemption. `stripe_customer_id` is created lazily on first checkout,
-    not at org-creation time -- most orgs never upgrade, and creating a
-    Stripe Customer for every signup regardless would be pointless API
-    traffic against a real (if test-mode) account. See SPEC.md #6.17."""
+    redemption. `payment_customer_id`/`payment_subscription_id` hold
+    whichever payment provider's ids (`pulse/billing/providers.py` --
+    `MockPaymentProvider` by default, a real `StripePaymentProvider` as an
+    optional swap-in), not necessarily Stripe's, hence the provider-neutral
+    names. The customer id is created lazily on first checkout, not at
+    org-creation time -- most orgs never upgrade, and creating one for every
+    signup regardless would be pointless traffic against a real account
+    once one is connected. See SPEC.md #6.18."""
 
     __tablename__ = "subscriptions"
 
@@ -44,8 +48,8 @@ class Subscription(IdMixin, TimestampMixin, Base):
     status: Mapped[SubscriptionStatus] = mapped_column(
         ENUM(SubscriptionStatus, name="subscription_status"), default=SubscriptionStatus.ACTIVE
     )
-    stripe_customer_id: Mapped[str | None] = mapped_column(String, default=None)
-    stripe_subscription_id: Mapped[str | None] = mapped_column(String, unique=True, default=None)
+    payment_customer_id: Mapped[str | None] = mapped_column(String, default=None)
+    payment_subscription_id: Mapped[str | None] = mapped_column(String, unique=True, default=None)
     current_period_start: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )
@@ -61,7 +65,7 @@ class UsageRecord(IdMixin, TimestampMixin, Base):
     `updated_at` (from TimestampMixin) doubles as "last computed at": unlike
     AuditLog, a period's row is expected to be overwritten in place as more
     events arrive throughout the month. RLS-protected like Subscription.
-    See SPEC.md #4 and #6.17."""
+    See SPEC.md #4 and #6.18."""
 
     __tablename__ = "usage_records"
     __table_args__ = (UniqueConstraint("org_id", "period", name="uq_usage_records_org_period"),)

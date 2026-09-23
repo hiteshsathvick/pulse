@@ -137,12 +137,22 @@ class Settings(BaseSettings):
     alert_webhook_secret: str | None = None
     alert_webhook_timeout_seconds: float = 5.0
 
-    # Phase 20: billing (pulse/billing/). Unset (the default) means Stripe
-    # is simply not connected yet -- confirmed with the user first as this
-    # phase's starting state ("build now, connect later"): every plan/quota/
-    # usage-metering feature works with zero Stripe setup, and every
-    # Stripe-backed endpoint degrades to a clean 503 instead of ever
-    # attempting a call with no key.
+    # Phase 20: billing (pulse/billing/). Confirmed with the user first:
+    # Stripe test mode needed a real account this session couldn't set up,
+    # and a paid/external dependency wasn't wanted for this piece either --
+    # so "mock" (pulse/billing/providers.py's MockPaymentProvider) is the
+    # real default, needing zero external setup at all. "stripe" is an
+    # optional swap-in behind the same interface for later.
+    payment_provider: Literal["mock", "stripe"] = "mock"
+    # The frontend origin the mock provider builds its local checkout/portal
+    # URLs against (e.g. "http://localhost:3000/orgs/{id}/billing/mock-checkout").
+    frontend_base_url: str = "http://localhost:3000"
+    # Nominal Pro-plan price the mock provider stamps onto its synthesized
+    # invoices ($29.00) -- there's no real charge behind it.
+    mock_pro_price_cents: int = 2900
+    # Only read when payment_provider="stripe". Unset (the default) means
+    # Stripe is simply not connected -- every Stripe-backed call degrades to
+    # a clean 503 instead of ever attempting a call with no key.
     stripe_secret_key: str | None = None
     stripe_webhook_secret: str | None = None
     # The Price (not Product) id for the Pro plan, created in the Stripe

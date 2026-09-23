@@ -71,3 +71,24 @@ export async function listInvoices(accessToken: string, orgId: string): Promise<
   if (!response.ok) throw await toApiError(response);
   return response.json();
 }
+
+export type MockAction = { plan: SubscriptionPlan; status: SubscriptionStatus };
+
+// Only meaningful while the server's payment_provider is "mock" (the
+// default) -- the local /billing/mock-checkout page calls these to
+// simulate what a real payment provider's webhook would eventually apply.
+export async function mockSubscribe(accessToken: string, orgId: string): Promise<MockAction> {
+  const response = await authedFetch(`${billingPath(orgId)}/mock/subscribe`, accessToken, {
+    method: "POST",
+  });
+  if (!response.ok) throw await toApiError(response);
+  return response.json();
+}
+
+export async function mockCancel(accessToken: string, orgId: string): Promise<MockAction> {
+  const response = await authedFetch(`${billingPath(orgId)}/mock/cancel`, accessToken, {
+    method: "POST",
+  });
+  if (!response.ok) throw await toApiError(response);
+  return response.json();
+}

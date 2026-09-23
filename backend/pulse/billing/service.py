@@ -30,13 +30,13 @@ async def get_subscription(org_id: uuid.UUID) -> Subscription | None:
         return subscription
 
 
-async def set_stripe_customer_id(org_id: uuid.UUID, stripe_customer_id: str) -> None:
+async def set_payment_customer_id(org_id: uuid.UUID, payment_customer_id: str) -> None:
     async with session_scope(org_id=org_id) as session:
         subscription = await session.scalar(
             select(Subscription).where(Subscription.org_id == org_id)
         )
         if subscription is not None:
-            subscription.stripe_customer_id = stripe_customer_id
+            subscription.payment_customer_id = payment_customer_id
             await session.commit()
 
 

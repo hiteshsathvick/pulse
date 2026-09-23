@@ -1206,22 +1206,40 @@ anomaly alert fired on a real 10x spike over a ten-day real baseline and did not
 same baseline; and `evaluate_all_enabled` evaluated two real orgs' alerts against only their own real
 ClickHouse data, never leaking one into the other's result.
 
-### 6.18 Billing & usage metering mechanism (Phase 20 -- built, not yet connected)
+### 6.18 Billing & usage metering mechanism (Phase 20)
 
 A new `pulse/billing/` module and a new `billing-worker` process (`pulse/billing/main.py`, mirroring
 `pulse/alerts/main.py`'s shape exactly, including the same unscoped-`Organization`-then-per-org-scoped
-sweep Phase 19 established). Confirmed with the user first: Stripe test mode needs a real account, API
-keys, and at least one Product/Price created in the Stripe dashboard, none of which this session could set
-up itself -- so this phase was built and fully tested against mocks, gated behind optional settings that
-default to unset, the same "documented, not connected" pattern the Microsoft 365 integration used in the
-sibling Jarvis project. Every plan/quota/usage-metering feature works with zero Stripe setup at all; only
-Checkout/Portal/webhook/invoices need a real account, and each of those degrades to a clean `503` rather
-than ever attempting a call with no key.
+sweep Phase 19 established). **Design fork, confirmed with the user first, mid-phase:** Stripe test mode
+turned out to need a real account this session couldn't set up, and separately the user didn't want a
+paid/external dependency for this piece at all -- so a self-hosted `MockPaymentProvider`
+(`pulse/billing/providers.py`) is the real default and the only payment path CI or a fresh clone ever
+exercises, needing zero external account, ever. A real `StripePaymentProvider` is kept behind the exact
+same interface as an optional swap-in (`Settings.payment_provider = "stripe"`) for whenever a real
+processor is wanted later -- this is what makes the phase fully closeable today rather than staying in the
+"built, not connected" limbo an earlier version of this section described.
 
+- **A `PaymentProvider` interface, not a Stripe-specific one.** `pulse/billing/providers.py` defines
+  `create_customer`/`create_checkout_session`/`create_portal_session`/`list_invoices` as an ABC, mirroring
+  `pulse/ai/provider.py`'s own provider-abstraction shape. `MockPaymentProvider` implements all four purely
+  locally (no network); `StripePaymentProvider` (`pulse/billing/stripe_client.py`) wraps the real Stripe SDK
+  behind the identical interface, so `pulse/api/billing.py`'s route handlers call `provider.xxx(...)`
+  without knowing or caring which one is configured. `Subscription.payment_customer_id` /
+  `payment_subscription_id` (migration `0012`, renamed from `stripe_customer_id`/`stripe_subscription_id`
+  the moment this fork was decided) hold whichever provider's ids, honestly, not Stripe's specifically.
+- **Checkout and the Portal both redirect to Pulse's own `/orgs/{id}/billing/mock-checkout` page** under
+  the mock provider -- the same one page doubles as "upgrade" (shows Confirm, on the free plan) and "manage"
+  (shows Cancel, on Pro), so there's no separate mock portal page to maintain in parallel. Its Confirm/Cancel
+  actions call `POST .../billing/mock/subscribe` and `.../mock/cancel`, which build the exact same
+  event shape a real Stripe webhook payload would carry and hand it to `pulse/billing/webhooks.py`'s
+  `handle_event()` -- the one and only place "how does a subscription change get applied" is implemented,
+  never duplicated between the real-webhook path and the mock-action path. `mock/*` routes are disabled
+  (`400`) whenever `payment_provider` is switched to `"stripe"`, so the two paths can never be exercised
+  against each other by mistake.
 - **Plans are a static config, not a database table.** `pulse/billing/plans.py`'s `PLANS` dict is the only
-  place a plan's monthly event quota lives -- Stripe is the source of truth for *pricing* (a Price id,
-  `Settings.stripe_pro_price_id`, filled in only once the user creates one), but the quota number itself
-  never depends on Stripe being configured, which is what lets the free plan work fully offline.
+  place a plan's monthly event quota lives -- a real processor would own *pricing* (a Price id,
+  `Settings.stripe_pro_price_id`, only meaningful for the Stripe path), but the quota number itself never
+  depends on any payment provider being configured, which is what lets the free plan work fully offline.
 - **Every org gets a `Subscription` row (`plan=free`, `status=active`) in the same transaction that creates
   the org** (`pulse/services/orgs.py::create_organization`, alongside the owner `Membership` -- the same
   atomicity reasoning: a crash between separate commits could otherwise leave an org with no billing
@@ -1234,7 +1252,8 @@ than ever attempting a call with no key.
   across *everything* for the org, the same sketch type the query engine already uses for a single trend's
   unique-user count, just merged more broadly. `test_billing_usage.py` proves this against real inserted
   ClickHouse events, including that counts stay exact across multiple projects and event names and that a
-  prior month's events are correctly excluded.
+  prior month's events are correctly excluded. This half of the phase never depended on any payment
+  provider at all, mock or real.
 - **The billing-worker recomputes and upserts (never increments) each org's current-period `UsageRecord`
   every `billing_usage_interval_seconds`** (default 5 minutes) -- a fresh `sum`/merge from ClickHouse each
   cycle, not an accumulator, so a worker restart or a double-run can never double-count.
@@ -1243,41 +1262,56 @@ than ever attempting a call with no key.
   after the existing per-key rate limiter -- a different resource: request rate vs. monthly volume). Quota
   freshness lags by at most one worker cycle; the buffer, not this check, is `/ingest`'s real durability
   guarantee, so that lag is an acceptable trade-off. Soft (`>=` `billing_soft_limit_ratio`, default 80%,
-  of the plan's quota) still returns `202` with a new `quota_warning` field on `IngestBatchResponse`; hard
+  of the plan's quota) still returns `202` with a `quota_warning` field on `IngestBatchResponse`; hard
   (`>=` the quota) returns `402 Payment Required` before the batch ever reaches the buffer -- a real,
-  literal use of the HTTP status code's original meaning.
-- **Stripe SDK access goes through one thin wrapper** (`pulse/billing/stripe_client.py`), mirroring
-  `pulse/repositories/object_storage.py`'s shape for a sync-only third-party client: cheap, non-blocking
-  construction, every actual I/O call wrapped in `asyncio.to_thread`. A Stripe Customer is created lazily,
-  on first Checkout -- not at org-creation time, since most orgs never upgrade and creating a Customer for
-  every signup regardless would be pointless traffic against a real account. Checkout and the Billing
-  Portal are both Stripe-hosted redirects; card details and plan changes never happen inside Pulse's own
-  UI at all, by construction, not just by convention.
-- **The webhook route's verified signature is the boundary, not RBAC** (`POST /api/v1/webhooks/stripe`,
-  unscoped by org since Stripe calls it directly with no Pulse-issued credential) -- the same
+  literal use of the HTTP status code's original meaning. **Verified live directly against the running
+  `/ingest` endpoint via curl, not just tests**: a genuine `402` once at quota, and a genuine `202` with a
+  populated `quota_warning` once past the soft threshold.
+- **Invoices are synthesized, not mirrored.** The mock provider returns one representative "paid" invoice
+  (`Settings.mock_pro_price_cents`) once an org is actually on Pro -- a customer id alone (created the
+  moment Upgrade is first clicked) isn't proof of a paid period, so `GET .../billing/invoices` returns `[]`
+  until `mock/subscribe` (or, on the real path, a completed Stripe checkout) moves the plan to Pro. A real
+  `StripePaymentProvider` reads Stripe's own invoice list live instead; neither path ever mirrors invoice
+  data into Postgres.
+- **The real webhook route's verified signature is the boundary, not RBAC** (`POST /api/v1/webhooks/stripe`,
+  unscoped by org since a real processor calls it directly with no Pulse-issued credential) -- the same
   token-is-the-boundary reasoning `RefreshToken`/`Invite`/`ApiKey` already use, just via HMAC instead of a
-  stored hash. `customer.subscription.created`/`updated` upgrades the org to Pro only on a genuinely
-  `active`/`trialing` Stripe status; `past_due`/`incomplete` update the stored status without silently
-  downgrading the plan Stripe itself might still recover. `customer.subscription.deleted` reverts to Free.
-  `invoice.*` events are acknowledged but change no local state -- invoices are read live from Stripe
-  (`GET .../billing/invoices`), never mirrored into Postgres. `test_billing_webhooks.py` verifies both
-  halves: the pure event-handling logic against plain dict fixtures, and the real route's signature
-  verification against a payload this test suite signs itself with a locally-known secret (Stripe's HMAC
-  scheme needs nothing but the shared secret to verify, so this never touches a real account or the
-  network) -- including that a tampered payload with an otherwise-valid signature header is still rejected.
+  stored hash. This route is unused while `payment_provider` is `"mock"` (the default) -- nothing external
+  ever calls it in that mode -- but its logic is fully exercised anyway, since the mock actions call the
+  exact same `handle_event()`. `customer.subscription.created`/`updated` upgrades an org to Pro only on a
+  genuinely `active`/`trialing` status; `past_due`/`incomplete` update the stored status without silently
+  downgrading the plan. `customer.subscription.deleted` reverts to Free. `test_billing_webhooks.py` verifies
+  both halves: the pure event-handling logic against plain dict fixtures, and the real route's signature
+  verification against a payload the test suite signs itself with a locally-known secret (this scheme needs
+  nothing but the shared secret to verify, so it never touches a real account or the network) -- including
+  that a tampered payload with an otherwise-valid signature header is still rejected.
 
-**Deliberately not done (this phase):** a real Stripe connection (the point of this section -- confirmed
-with the user first, tracked as the reason Phase 20 stays open); mirroring invoices into Postgres (read
-live instead); proration logic (Stripe's own job); multi-currency and seat-based billing (SPEC.md only
-asks for usage-based).
+**Deliberately not done:** a real Stripe connection (available as a documented swap-in behind
+`payment_provider="stripe"` whenever wanted, not required); mirroring invoices into Postgres (read live
+instead); proration logic; multi-currency and seat-based billing (SPEC.md only asks for usage-based).
 
-**Verified live** (the parts that need zero Stripe credentials): org creation auto-creating a free
-`Subscription`; real quota soft/hard enforcement against real ClickHouse ingestion counts inserted directly
-(bypassing the SDK, the same fixture pattern every other integration test here uses); `compute_and_store_
-usage` upserting a real `UsageRecord`, re-summed correctly after more events arrived. **Not yet verified
-live**: Checkout, the Billing Portal, real webhook delivery from Stripe's servers, and real invoices --
-blocked on connecting a real Stripe test-mode account, at which point this section (and the Phase 20 DoD
-line) will be updated to reflect it.
+**Verified live** against the real API/Postgres/ClickHouse/Redis stack: org creation auto-creating a free
+`Subscription`; the usage bar against real Postgres state in the browser; and, directly against the running
+`/ingest` endpoint via curl, a real quota `402` once at the limit and a real `quota_warning`-bearing `202`
+once past the soft threshold. The full mock Checkout -> Confirm -> Pro -> Invoice -> Cancel -> Free loop was
+then clicked through end to end in the browser: Free plan (0/10,000, no invoices) -> "Upgrade to Pro"
+redirecting to a same-origin `/billing/mock-checkout` page (never a stripe.com domain) -> "Confirm
+subscription" -> Pro plan (0/1,000,000, one $29.00 paid invoice) -> "Manage billing" -> "Cancel subscription"
+-> back to Free plan (0/10,000, invoices empty again).
+
+**Real bug caught live, not by a test first:** the first click-through showed a genuinely inconsistent
+page after "Confirm subscription" -- the heading still read "Free plan" while the quota line correctly
+showed Pro's 1,000,000 limit and the new invoice had already appeared. The backend was right (the quota and
+invoice queries had refetched); only the plan label was stale. Root cause: `query-client.tsx` sets a global
+`staleTime` of 30s, and `MockCheckoutPage` runs its own `useQuery` for the same `["billing-subscription",
+orgId]` key the billing page reads -- so navigating back within 30s of that fetch served the pre-upgrade
+cached value instead of refetching. `["billing-usage", orgId]` looked fine only because the billing page's
+own earlier fetch of it happened to be more than 30s stale by the time of the redirect. Fixed by having both
+`subscribeMutation` and `cancelMutation` call `queryClient.invalidateQueries()` on all three billing query
+keys (`billing-subscription`, `billing-usage`, `billing-invoices`) in `onSuccess`, before navigating back.
+Reproduced with a plain reload before the fix (label corrected itself once the 30s window passed, confirming
+it was a cache-timing bug and not a backend defect) and confirmed fixed afterward: the label now updates
+immediately on both the Confirm and Cancel transitions, no reload needed.
 
 ---
 
@@ -1360,14 +1394,15 @@ injection attempts can't cross tenant or write; ambiguous → clarify; NL→spec
 baseline); ☑ alert rules; ☑ email + in-app + outbound webhook. Tests: fires on breach not noise;
 seasonality handled; delivery honored. See §6.16.
 
-**Phase 20 — Billing/metering.** ☐ Stripe test mode (built and tested against mocks; not yet connected to
-a real Stripe account -- confirmed with the user first, see §6.18); ☑ meter events/MTU from **real
-ingestion counts**; ☑ quotas + soft/hard limits; ☐ invoices (reads through Stripe; blocked on the same
-connection). Tests: ☑ metering accuracy vs ingested volume; ☑ quota enforcement; ☑ webhook handling
-(signature verification + event processing, against a locally HMAC-signed payload -- needs no real Stripe
-account either). See §6.18. **Not yet closed out**: this phase stays open per CLAUDE.md #1.4 ("a phase is
-done only when its DoD checkboxes are all true") until a real Stripe test-mode account is connected and the
-Checkout/webhook/invoice flow is verified live, the same way every other phase here has been.
+**Phase 20 — Billing/metering.** ☑ payment-provider test mode (a self-hosted `MockPaymentProvider` by
+default -- design fork confirmed with the user first, mid-phase: Stripe test mode needed a real account
+this session couldn't set up, and a paid/external dependency wasn't wanted for this piece either, so the
+mock provider is the real default and real Stripe an optional swap-in behind the same interface, see §6.18);
+☑ meter events/MTU from **real ingestion counts**; ☑ quotas + soft/hard limits; ☑ invoices (synthesized by
+the mock provider once an org is actually on Pro; a real provider reads its own invoice list live instead).
+Tests: ☑ metering accuracy vs ingested volume; ☑ quota enforcement; ☑ webhook handling (signature
+verification + event processing, against a locally HMAC-signed payload -- needs no real account of any
+kind). See §6.18.
 
 **Phase 21 — Public API/exports/webhooks.** ☐ scoped read API; ☐ streamed CSV/JSON export (results + raw
 events); ☐ signed, retried outbound webhooks. Tests: key scoping; export completeness; webhook signing/retry.
@@ -1799,3 +1834,35 @@ trace follows an event end to end.
   (valid, invalid, and a tampered-payload-with-a-valid-header case) against a payload the suite signs itself,
   needing no real Stripe account; 7 new frontend tests (138 → 145 total pass); ruff / ruff format / mypy
   (`pulse`, strict) / eslint / tsc all clean.
+- 2026-09-22 — Phase 20 (pivot, now closed out) — The prior entry's "build now, connect later" plan hit a
+  real wall: the user could not get a usable Stripe account set up in this session, and separately did not
+  want a paid/external SaaS dependency for this piece at all (both confirmed explicitly, not assumed). Rather
+  than keep the phase blocked on an account that might never materialize, pivoted to a **self-hosted mock
+  payment gateway as the real default**, with Stripe demoted to an optional swap-in -- confirmed with the
+  user first among several options, this one chosen specifically because it required no external account of
+  any kind and kept the phase's architectural story (customer creation, hosted-checkout-style redirect,
+  webhook-driven subscription sync, invoice listing) fully intact rather than stubbing it out. New
+  `pulse/billing/providers.py`: a `PaymentProvider` ABC (mirroring the `pulse/ai/provider.py` pattern from
+  Phase 18) with `MockPaymentProvider` as the unconditional default and `stripe_client.py`'s Stripe calls
+  rewrapped as `StripePaymentProvider`, selected via `payment_provider: Literal["mock", "stripe"]` (default
+  `"mock"`). The mock provider's "checkout" and "portal" URLs point at a new same-origin
+  `/orgs/{orgId}/billing/mock-checkout` page (`MockCheckoutPage.tsx`) rather than a stripe.com domain; its
+  "Confirm subscription" and "Cancel subscription" actions hit new `POST .../billing/mock/subscribe` and
+  `.../mock/cancel` routes that build a Stripe-event-shaped dict and hand it to the **exact same**
+  `handle_event()` the real webhook route uses -- so there remains only one implementation of "how a
+  subscription change gets applied," regardless of whether a real Stripe webhook or the mock UI triggered it.
+  Columns `subscriptions.stripe_customer_id`/`stripe_subscription_id` renamed to
+  `payment_customer_id`/`payment_subscription_id` via a new migration (`0012_payment_provider_rename.py`,
+  verified upgrade/downgrade/upgrade against the dev DB) rather than editing the already-written
+  `0011_billing.py` in place, consistent with not rewriting migration history even pre-push. `test_billing_api.py`
+  rewritten around the mock path as the primary case (checkout/portal never touch a network, `mock_subscribe`/
+  `mock_cancel` drive real plan transitions through real route tests) plus a `stripe_provider_selected` fixture
+  covering the real-Stripe path stays exercised (503-when-unconfigured, mock actions correctly disabled once
+  Stripe is selected); new `test_billing_providers.py` (6 pure unit tests, no DB) covers the provider
+  factory directly. 311 backend tests pass, 1 skipped (298 → 311); 150 frontend tests pass (145 → 150,
+  including new `MockCheckoutPage.test.tsx`). **Verified live end-to-end in the browser**, including a real
+  bug caught live and fixed -- see §6.18's "Real bug caught live" paragraph for the full account (a 30s
+  React Query `staleTime` plus a query-key collision between `MockCheckoutPage` and `BillingPage` left the
+  plan label showing stale "Free" for up to 30 seconds immediately after a real upgrade, fixed by invalidating
+  the three billing query keys in both mutations' `onSuccess`). Phase 20 DoD (§7) now fully ticked; no
+  outstanding Stripe-account dependency remains for this phase to be considered done.

@@ -1,7 +1,12 @@
-"""Stripe webhook event handling (POST /api/v1/webhooks/stripe,
-pulse/api/billing.py). The verified signature IS the boundary here -- like
-a write key on /ingest, not RBAC: Stripe calls this endpoint directly, with
-no Pulse-issued credential at all. See SPEC.md #6.17."""
+"""Event-application logic shared by both payment-change paths
+(pulse/api/billing.py): the real Stripe webhook route
+(POST /api/v1/webhooks/stripe, verified signature as the boundary -- like a
+write key on /ingest, not RBAC, since Stripe calls it directly with no
+Pulse-issued credential at all) and the mock provider's
+POST .../billing/mock/{subscribe,cancel} actions, which build the same
+event shape and hand it to the exact same handle_event() below -- "how does
+a subscription change get applied" has one implementation regardless of
+which path triggered it. See SPEC.md #6.18."""
 
 from __future__ import annotations
 
@@ -74,7 +79,7 @@ async def _handle_subscription_upsert(data: dict[str, Any]) -> None:
     async with session_scope(org_id=org_id) as session:
         row = await session.get(Subscription, subscription.id)
         assert row is not None
-        row.stripe_subscription_id = data.get("id")
+        row.payment_subscription_id = data.get("id")
         row.status = status
         # Only a truly active/trialing Stripe subscription counts as Pro --
         # past_due/incomplete keeps whatever plan the row already had rather
