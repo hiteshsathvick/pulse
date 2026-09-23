@@ -33,6 +33,7 @@ def _csv_response(results: list[dict[str, object]], filename: str) -> Response:
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+
 router = APIRouter(
     prefix="/api/v1/orgs/{org_id}/projects/{project_id}/query",
     tags=["query"],
