@@ -1,6 +1,7 @@
 # Render Blueprint for the staging environment (Phase 23).
 #
-# Compute only: the API, the four background workers and the frontend. Every
+# Compute only: the API, the four workers (private services, so they can be scraped),
+# Prometheus + Grafana, and the frontend. Every
 # data service (Postgres, Redis/Key Value, ClickHouse Cloud, S3) and every
 # secret is owned by infra/terraform, which writes the connection strings into
 # the Render environment group `pulse-staging-managed` that each service pulls in
@@ -44,8 +45,8 @@ services:
       - key: OTEL_EXPORTER_OTLP_ENDPOINT
         sync: false
 
-  # -- Workers ------------------------------------------------------------------
-  - type: worker
+  # -- Workers (private services: see the note on each) --------------------------
+  - type: pserv
     name: pulse-staging-ingest-worker
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
@@ -56,6 +57,13 @@ services:
     autoDeployTrigger: checksPass
     envVars:
       - fromGroup: pulse-staging-managed
+      # A private service (not a background worker) because Render workers cannot
+      # receive private-network traffic, so Prometheus could never scrape them.
+      # PORT is the port Render routes to; the metrics server binds the same one.
+      - key: PORT
+        value: "9100"
+      - key: METRICS_PORT
+        value: "9100"
       - key: SENTRY_ENVIRONMENT
         value: staging
       - key: SENTRY_DSN
@@ -63,7 +71,7 @@ services:
       - key: OTEL_EXPORTER_OTLP_ENDPOINT
         sync: false
 
-  - type: worker
+  - type: pserv
     name: pulse-staging-alert-worker
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
@@ -74,12 +82,19 @@ services:
     autoDeployTrigger: checksPass
     envVars:
       - fromGroup: pulse-staging-managed
+      # A private service (not a background worker) because Render workers cannot
+      # receive private-network traffic, so Prometheus could never scrape them.
+      # PORT is the port Render routes to; the metrics server binds the same one.
+      - key: PORT
+        value: "9100"
+      - key: METRICS_PORT
+        value: "9100"
       - key: SENTRY_ENVIRONMENT
         value: staging
       - key: SENTRY_DSN
         sync: false
 
-  - type: worker
+  - type: pserv
     name: pulse-staging-billing-worker
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
@@ -90,12 +105,19 @@ services:
     autoDeployTrigger: checksPass
     envVars:
       - fromGroup: pulse-staging-managed
+      # A private service (not a background worker) because Render workers cannot
+      # receive private-network traffic, so Prometheus could never scrape them.
+      # PORT is the port Render routes to; the metrics server binds the same one.
+      - key: PORT
+        value: "9100"
+      - key: METRICS_PORT
+        value: "9100"
       - key: SENTRY_ENVIRONMENT
         value: staging
       - key: SENTRY_DSN
         sync: false
 
-  - type: worker
+  - type: pserv
     name: pulse-staging-retention-worker
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
@@ -106,10 +128,94 @@ services:
     autoDeployTrigger: checksPass
     envVars:
       - fromGroup: pulse-staging-managed
+      # A private service (not a background worker) because Render workers cannot
+      # receive private-network traffic, so Prometheus could never scrape them.
+      # PORT is the port Render routes to; the metrics server binds the same one.
+      - key: PORT
+        value: "9100"
+      - key: METRICS_PORT
+        value: "9100"
       - key: SENTRY_ENVIRONMENT
         value: staging
       - key: SENTRY_DSN
         sync: false
+
+  # -- Observability -------------------------------------------------------------
+  # Prometheus scrapes the API and the four workers over the private network;
+  # Grafana reads Prometheus. Render gives each service a random-suffixed hostname,
+  # so the targets are handed in with `fromService` and scraped through their
+  # `-discovery` names (one address per running instance) -- see
+  # infra/observability/prometheus.render.yml. Traces are not hosted here: there is
+  # no Tempo, so set OTEL_EXPORTER_OTLP_ENDPOINT (above) to an external collector or
+  # leave it unset (docs/DEPLOYMENT.md).
+  - type: pserv
+    name: pulse-staging-prometheus
+    runtime: docker
+    dockerfilePath: ./infra/observability/prometheus.render.Dockerfile
+    dockerContext: ./infra/observability
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    disk:
+      name: prometheus-data
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      # Only the metrics token -- deliberately NOT the managed group's database and
+      # signing secrets, which Prometheus has no use for.
+      - fromGroup: pulse-staging-observability
+      - key: PORT
+        value: "9090"
+      - key: HOST_API
+        fromService:
+          type: web
+          name: pulse-staging-api
+          property: host
+      - key: HOST_INGEST_WORKER
+        fromService:
+          type: pserv
+          name: pulse-staging-ingest-worker
+          property: host
+      - key: HOST_ALERT_WORKER
+        fromService:
+          type: pserv
+          name: pulse-staging-alert-worker
+          property: host
+      - key: HOST_BILLING_WORKER
+        fromService:
+          type: pserv
+          name: pulse-staging-billing-worker
+          property: host
+      - key: HOST_RETENTION_WORKER
+        fromService:
+          type: pserv
+          name: pulse-staging-retention-worker
+          property: host
+
+  - type: web
+    name: pulse-staging-grafana
+    runtime: docker
+    dockerfilePath: ./infra/observability/grafana.render.Dockerfile
+    dockerContext: ./infra/observability
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: PORT
+        value: "3000"
+      - key: GF_SERVER_HTTP_PORT
+        value: "3000"
+      - key: GF_AUTH_ANONYMOUS_ENABLED
+        value: "false"
+      - key: GF_USERS_ALLOW_SIGN_UP
+        value: "false"
+      - key: GF_SECURITY_ADMIN_PASSWORD
+        sync: false
+      - key: PROMETHEUS_HOSTPORT
+        fromService:
+          type: pserv
+          name: pulse-staging-prometheus
+          property: hostport
 
   # -- Frontend -----------------------------------------------------------------
   - type: web

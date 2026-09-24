@@ -1,0 +1,4 @@
+# Shell scripts run inside Linux containers, so they must stay LF even when
+# core.autocrlf checks the working tree out as CRLF (a CRLF shebang line fails
+# with "not found").
+*.sh text eol=lf

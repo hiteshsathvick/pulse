@@ -107,29 +107,43 @@ this codebase ever interpolates such a value into SQL, a shell command, or a tru
 
 ## Residual risks — open, not hidden
 
-- **GDPR subject deletion is scoped to ClickHouse `events` only** (confirmed with the user first, Phase 22
-  design fork). `event_hourly`'s aggregated sketches retain a deleted subject's contribution until an
-  operator next runs the existing, global, ingestion-must-be-stopped `python -m pulse.rollups rebuild` — not
-  something a live API call can safely trigger inline. The raw batch archive in object storage (Phase 8) is
-  batch-shaped (many users per file), not per-subject-editable without rewriting archive files. Both are
-  documented gaps, not oversights.
-- **PII rules don't protect the raw batch archive either**, for the same batch-shaped reason — a dropped or
-  hashed property is kept out of ClickHouse and the schema registry, but the original raw JSON batch (before
-  any Phase 22 transform) still lands in object storage as Phase 8 always intended it to (the
-  "replay/backfill source of truth"). A customer relying on PII rules for full compliance needs to know this
-  boundary exists.
+- **GDPR subject deletion now reaches every store, with three scope limits left** (Phase 24 closed the
+  ClickHouse-`events`-only gap that Phase 22 documented). One call removes the subject from `events`,
+  recomputes the touched `event_hourly` buckets from what remains (a unique-users sketch can't have one user
+  subtracted, but a bucket can be rebuilt -- scoped, so it needs neither the global `rebuild` nor stopped
+  ingestion; a concurrent-ingest double count is detected by an exact event-count comparison and the repair
+  re-run, and a repair that can't converge fails loudly rather than reporting success), and rewrites the raw
+  archive without the subject's entries (the archive is now partitioned per org/project, so this reads one
+  project's prefix; objects from the old tenant-mixed layout are still scanned). What is still **not**
+  covered: (1) an event the API has *accepted* but the worker has not yet landed sits in the Redis stream and
+  will land after the deletion -- a deletion is a point-in-time act, not a block on future events with that
+  id; (2) archive entries whose org/project could not be parsed (poison entries with garbage tenant fields)
+  live under `raw/_unattributed/` and cannot be tied to a tenant, so erasure leaves them; (3) backups and
+  point-in-time copies of ClickHouse/Postgres/S3 are outside the application's reach. An archive object that
+  cannot be read is reported in the response (`unreadable_objects`), never silently skipped.
+- **PII rules still don't protect the raw batch archive** -- a dropped or hashed property is kept out of
+  ClickHouse and the schema registry, but the original raw JSON (before any Phase 22 transform) still lands
+  in object storage as Phase 8 always intended it to (the "replay/backfill source of truth"). Subject
+  *deletion* now reaches the archive; property-level PII *rules* do not. A customer relying on PII rules for
+  full compliance needs to know this boundary exists.
 - **`pii_hash_secret` has an insecure default** (`dev-insecure-pii-hash-secret-change-me`, matching
   `jwt_secret`'s own convention) — fine for dev/CI, a real deployment must set a real one via `.env`, same
   operational requirement as every other secret this app has.
-- **Known, currently-unfixable dependency vulnerabilities** (Phase 22's `dependency-scan` CI job, advisory
-  not blocking — see below for why): `starlette` (FastAPI's core dependency) has several CVEs with no newer
-  version resolvable in this environment's package index at the fastapi version this app is pinned to;
-  `pytest` (backend and sdk-python) and the `vite`/`esbuild`/`vitest` chain (sdk-js, dev-only tooling) each
-  have a fix available but only via a breaking major-version bump that needs its own full regression pass —
-  deliberately not done as an unrelated side effect of this phase. Tracked here, not silently ignored.
-- **The dependency-scan CI job is advisory, not a blocking gate.** Given the finding above, a blocking gate
-  today would leave CI permanently red over things this run can't fix, defeating "CI stays green" as a
-  meaningful signal. It still runs and reports every push, so a *new* finding stays visible.
+- **Dependency and image scans are blocking gates, and that has a cost.** Phase 22 added them as advisory
+  because starlette, pytest and the vite/esbuild/vitest chain had findings that couldn't be fixed then;
+  the starlette one was the app's own `fastapi<0.116` pin (that range caps starlette below the fixed
+  versions); relaxing the pin resolves it. Phase 24 fixed all of them (fastapi 0.141 with starlette 1.7, pytest 9, pytest-asyncio 1,
+  vitest 4) and made the scans block: `pip-audit` (any finding), `npm audit` (high and above) and Trivy
+  (fixable HIGH/CRITICAL in the backend image). The cost: CI installs the newest version each range
+  allows, so a *newly published* advisory can turn a push red with no change of ours. That is the gate
+  working -- fix it by bumping the dependency, or, if no fix exists, `--ignore-vuln <ID>` with the
+  reasoning recorded here. The Python audits used to run on a runner where nothing was installed, so they
+  audited almost nothing; they now install the project into their own virtualenv first.
+- **The image scan found real, fixable issues on its first honest run** -- 16 HIGH/CRITICAL findings in
+  the Debian base (perl, openssl, sqlite, pcre2), all with published fixes. The Dockerfile now runs
+  `apt-get upgrade`. Not scanned: the frontend image. Observed, not changed: the backend image also
+  installs the `dev` extras and copies `tests/` (CI runs the suite inside it), which is more than a
+  production image needs.
 - **No Content-Security-Policy or HSTS.** This is a JSON API with no HTML of its own to scope a CSP
   against; HSTS is a deployment-level concern (only meaningful once real TLS termination sits in front of
   this) that's out of this app's own config, not something code here can decide.
@@ -163,8 +177,12 @@ this codebase ever interpolates such a value into SQL, a shell command, or a tru
   account-wide, so a leak of that secret is a leak of both environments.
 - **Deployment has never been exercised against real accounts** (`docs/DEPLOYMENT.md`, "Not yet proven").
   The configuration is validated, not proven; expect first-deploy surprises.
-- **The image scan is advisory**, for the same reason the dependency scan is: known starlette CVEs with no
-  resolvable fix would keep a blocking gate permanently red.
+- **The API's `/metrics` route sits on the public port when enabled** (Phase 24; off unless `METRICS_TOKEN`
+  is set). It is bearer-token gated with a constant-time comparison and a 401 that leaks nothing, but a
+  token is a shared secret: anyone holding it sees route names and traffic shape (never event data or
+  tenant identifiers -- route *templates* are labelled, not raw paths), and it is not rate-limited. It
+  lives in a Render env group readable by anyone with access to that group. Rotate it by re-applying
+  Terraform with a tainted `random_password.metrics_token`.
 - **Backpressure is a 5xx, by design.** With `noeviction`, a Redis that fills (a worker outage long enough
   to exhaust memory) makes `/ingest` fail rather than silently drop events. The ingest stream is now bounded
   in steady state (acked entries are deleted -- previously it grew forever, found by the Phase 23

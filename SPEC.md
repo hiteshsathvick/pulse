@@ -1427,6 +1427,9 @@ audit-log write (`subject.deleted`) follows the ClickHouse mutation -- not atomi
 databases), but "every mutating action writes an audit log" still applies to the app's single most
 destructive one.
 
+> **Superseded by Phase 24 (§6.22):** deletion now also recomputes the touched rollup buckets and
+> rewrites the raw archive. The "events only" scope above is the Phase 22 state, kept for the record.
+
 **Input-validation sweep.** Every request-body free-text field across auth, orgs, projects, invites, PII
 rules, and subject deletion gained an explicit `max_length` (and `min_length` where empty is meaningless) --
 several had none at all, including `LoginRequest.password`, which meant an unbounded string could drive a
@@ -1449,6 +1452,8 @@ unrelated side effect of this phase. A blocking gate today would leave CI perman
 run genuinely can't fix, defeating "CI stays green" as a signal; the job still runs and reports every push,
 so a *new* finding stays visible. All tracked honestly in `docs/THREAT_MODEL.md` rather than the CI job being
 quietly made toothless with no record of why.
+
+> **Superseded by Phase 24 (§6.22):** every finding above is fixed and the scans are now blocking gates.
 
 **NL-to-query injection tests**: the existing Phase 18 suite (`test_nl_injection.py`) still passes
 unchanged; extended with four PII/deletion-flavored adversarial questions ("show me every user's raw
@@ -1568,6 +1573,102 @@ metric actually exported, Prometheus targets matching the metrics-serving servic
 ordering/failure/timeout behaviour with a fake Render client. Plus one stream-growth regression test in
 `test_worker.py`, one traceparent test in each SDK (JS 19, Python 8 pass), ruff / ruff format / mypy clean.
 
+### 6.22 Residual-risk hardening mechanism (Phase 24)
+
+Not a numbered phase in the original roadmap: after Phase 23 the user asked for a Phase 24 and, with nothing
+defined for it, chose "close the documented residual risks" (proposed and approved before any work). Four
+items, each taken from a gap the earlier phases had written down rather than fixed.
+
+**1. GDPR subject deletion now reaches every store** (`pulse/services/deletion.py`, `pulse/archive.py`,
+`pulse/rollups/maintenance.py::repair_buckets`). Phase 22 deleted from `events` only and documented two gaps.
+
+- *The rollup.* `event_hourly` holds a per-hour unique-users sketch, which cannot have one user subtracted;
+  Phase 22 believed the only remedy was the global, ingestion-stopped `rebuild`. It isn't: the (event name x
+  hour) buckets a subject touched can be **recomputed from the rows that remain**. `delete_subject` reads
+  which buckets the subject is in *before* deleting (afterwards there is nothing to ask), deletes from
+  `events`, then `repair_buckets` deletes and reinserts only those buckets, scoped to one project. Ingestion
+  keeps running, so an event can land in a bucket between the delete and the reinsert and be counted twice
+  (the materialized view counts it, and so does the recompute). Event counts are exact, so the existing
+  `verify` comparison, scoped to the same buckets, detects it and the (idempotent) repair runs again, up to
+  four attempts; if it still doesn't verify, `RollupRepairFailed` is raised rather than reporting success.
+- *The archive.* Objects were one-per-batch (`raw/YYYY/MM/DD/<batch>.json`), mixing every tenant, so finding a
+  subject meant reading everything. The worker now writes one object per (org, project) per batch under
+  `raw/<org>/<project>/YYYY/MM/DD/<batch>.json`, with keys built only from parsed UUIDs so an entry cannot
+  choose its path; erasure reads one project's prefix, and an object left empty is deleted, otherwise
+  rewritten without the subject. Old-layout objects are still scanned and filtered per entry, so another
+  tenant's events in a legacy mixed object are never lost. An unreadable object is counted in the response
+  (`unreadable_objects`), never silently skipped.
+- *The API* now returns 200 with a report (`rollup_buckets_recomputed`, `rollup_verified`, archive counts)
+  instead of an empty 204 -- a deletion should say what it did. Nothing else called it.
+- *Still not covered* (docs/THREAT_MODEL.md): an event accepted but not yet landed (in the Redis stream) lands
+  after the deletion; archive entries whose tenant fields don't parse (`raw/_unattributed/`); backups. PII
+  *rules* still don't rewrite the archive (deletion does; per-property rules don't).
+
+**2. Dependencies and scans.** The starlette "no fix resolvable" finding was the app's own `fastapi<0.116`
+pin, not the ecosystem: relaxing it resolves FastAPI 0.141 with starlette 1.7 (past every listed fix).
+pytest 8 -> 9 required `pytest-asyncio` 0.24 -> 1.x, the change most likely to disturb this suite's
+event-loop scoping; the full suite passed unchanged (409 -> 409). sdk-js moved to vitest 4, the version the
+frontend already runs cleanly on Node 20 (5 findings -> 0; build, type-check and 19 tests pass). Deprecated
+starlette status constants (`HTTP_422_UNPROCESSABLE_ENTITY`, `HTTP_413_REQUEST_ENTITY_TOO_LARGE`) were
+replaced. The scans are now **blocking**: `pip-audit`, `npm audit --audit-level=high`, and Trivy on the
+backend image (fixable HIGH/CRITICAL). Two things this uncovered: the Python audits had been running on a
+runner where the project was never installed, so they audited almost nothing (each now installs into its own
+virtualenv first; verified with fresh unlocked installs the way CI does them); and Trivy's first honest run
+found 16 HIGH/CRITICAL findings in the Debian base image, all already fixed upstream, so the Dockerfile now
+runs `apt-get upgrade` (rescan: 0). The cost of blocking is documented: a newly published advisory can turn CI
+red with no change of ours.
+
+**3. Deployed observability** (`infra/observability/*.render.*`, `pulse/observability/metrics_route.py`,
+Blueprints). Render workers can't receive private-network traffic, so they became private services (`pserv`)
+serving `/metrics` on 9100; the API, a web service, can only be reached on its primary port, so it gained
+`GET /metrics` -- **absent (plain 404) unless `METRICS_TOKEN` is set**, otherwise bearer-token only,
+constant-time compared. Render hostnames have random suffixes, so Prometheus gets each as an env var via
+`fromService` and scrapes its `<host>-discovery` name (Render's per-instance DNS, following Render's own
+Prometheus guide), which also makes a 2-instance API scrape correctly instead of alternating between
+instances through a load balancer. Prometheus (persistent disk) and Grafana (login required) are in both
+Blueprints; Prometheus pulls a new one-secret env group rather than the managed group's database
+credentials. Terraform generates the token. There is no Tempo in the deployment (traces need an external OTLP
+endpoint).
+
+**4. Terraform remote state and release rollback.** Remote state is an opt-in `*_override.tf` (an example
+file, git-ignored copy) so the default stays local and no bucket name is committed; CI validates the example.
+`render_release.py` now records each service's live deploy first and, on any failure, waits for in-flight
+deploys to settle then rolls back the ones that had gone live (workers first, API last), reporting a failed
+rollback, a first release with nothing to roll back to, and that **migrations are forward-only and not undone**.
+
+**Verified beyond the tests:** the Render Prometheus and Grafana images were built and run -- the API and an
+ingest worker given Render-style `-discovery` DNS aliases were both discovered and scraped `up` (the API with
+its bearer token on its primary port), the entrypoint refused missing, non-alphanumeric and slash-containing
+values, data landed on the mounted volume, and Grafana required login, provisioned its datasource from the
+environment and the dashboard, and queried Prometheus. Terraform (fmt, validate) and both Blueprints (against
+Render's published schema, with a negative control) validate; promtool accepts the rendered config and
+rejects a typo'd one. `terraform init` with the remote-state recipe selected the S3 backend and wrote a
+workspace's state to a bucket (MinIO); `encrypt = true` was honored (MinIO refused it without a KMS, so the
+write proof used `encrypt=false` on MinIO only). A negative control on the repair: with the scoped
+verification disabled, exactly the two race tests that depend on it fail.
+
+**Not proven:** anything on real Render (whether `fromService ... property: host` yields the name the
+`-discovery` hostname is built from, that a private service's `PORT` picks the routed port, a root-writable
+disk), rollback against the real Render API (tested against a fake client and Render's documented endpoints),
+DynamoDB state locking, real AWS. The rollup repair's race handling is proven with a deterministic simulated
+race, not under real concurrent load.
+
+**Tests:** `test_archive.py` (8) -- the per-tenant split, hostile/missing tenant fields can't choose a key,
+erasure keeps everyone else's entries, an object holding only the subject is deleted, anonymous-id matching,
+another project with the same subject id untouched, a legacy tenant-mixed object cleaned without losing other
+tenants, an unreadable object reported. `test_rollup_repair.py` (5) -- the rollup no longer counts a deleted
+subject (events and unique users, and a bucket only they were in disappears), another project untouched, a
+simulated mid-repair ingest is detected and the repair converges (asserting the second pass happened), a
+repair that can't converge raises, a no-op. `test_deletion.py` (+1, and the API test updated) -- one deletion
+through the real worker removes a subject from events, rollup and archive together. `test_observability.py`
+(+3) -- `/metrics` is a 404 without a token, 401 for missing/wrong tokens with nothing leaked, and serves
+Prometheus text with the right one. `test_deploy_config.py` (24 -> 53) -- worker/port/scrape-template
+consistency, every `fromService` reference real, Prometheus's env group holding only the token, Terraform
+sharing one token, Grafana login and datasource uid, LF pinned for shell scripts (which caught a real CRLF
+regression), CI gates staying blocking, Dockerfile COPY sources existing, and nine rollback cases (snapshot
+before triggering, rollback order, settle-before-rollback, failed rollback, first release, no-hang timeout, and
+the HTTP client's parsing).
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1676,6 +1777,13 @@ ingestion lag, batch size, events/sec, DLQ rate, query p50/95/99; ☑ Sentry (en
 via `autoDeployTrigger: checksPass`, not proven by a live deploy); ☑ prod one gated click (manual workflow +
 required-reviewer environment, release logic tested); ☑ one trace follows an event end to end (verified live
 in Tempo). **Phase 23 is not closed out** until a real deploy has exercised the staging/prod half.
+
+**Phase 24 — Residual-risk hardening (post-roadmap; agreed after Phase 23).** ☑ subject deletion removes the
+subject from `events`, the hourly rollup and the raw archive (verified through the real worker); ☑ the
+starlette/pytest/vitest findings are fixed and dependency + image scans are blocking; ☑ deployed
+Prometheus/Grafana + a token-protected API `/metrics` (verified against the real images with simulated Render
+DNS); ☑ opt-in Terraform remote state; ☑ automatic rollback in the release script. ◐ Everything deployed-side
+is verified locally, not on Render (§6.22). Phase 23's deploy half is still open.
 
 ---
 
@@ -2204,3 +2312,23 @@ in Tempo). **Phase 23 is not closed out** until a real deploy has exercised the 
   diagnosable once pushed. 41 new backend tests (368 → 409 passed, 1 skipped): `test_observability.py` (12),
   `test_migrate.py` (4), `test_deploy_config.py` (24), +1 in `test_worker.py`; JS SDK 19 and Python SDK 8
   tests pass. ruff / ruff format / mypy (`pulse`, strict) clean.
+- 2026-09-24 — Phase 24 — Added §6.22 and a Phase 24 DoD line. Not in the original roadmap: after Phase 23 the
+  user asked for a Phase 24; with nothing defined, "close the documented residual risks" was proposed and approved
+  first. (1) **GDPR deletion now covers `events`, the hourly rollup and the raw archive** -- the rollup by
+  recomputing only the touched buckets (Phase 22 had believed only the global, ingestion-stopped `rebuild`
+  could do it), with a concurrent-ingest double count detected by an exact event-count check and retried, and a
+  repair that can't converge raising instead of claiming success; the archive by a new per-org/project layout
+  (legacy objects still cleaned); the API now returns a report. (2) **Dependencies:** the "unfixable" starlette
+  finding was the app's own `fastapi<0.116` pin -- fastapi 0.141 / starlette 1.7, pytest 9, pytest-asyncio 1,
+  vitest 4 in sdk-js (5 findings -> 0); the suite passed unchanged on the new stack. Dependency and image scans
+  are now **blocking**; doing that exposed that the Python audits had never installed the project (fixed), and
+  Trivy's first honest run found 16 fixable HIGH/CRITICAL findings in the Debian base (Dockerfile now runs
+  `apt-get upgrade`; rescan 0). (3) **Deployed observability:** workers became private services, the API gained a
+  token-protected `/metrics` (404 unless configured), Prometheus scrapes per-instance via Render's
+  `-discovery` DNS, Grafana requires login; verified by running the real images against simulated Render DNS.
+  (4) **Terraform remote state** (opt-in override; state write proven against MinIO) and **release rollback**
+  (records live deploys first, settles in-flight ones, rolls back workers then API, reports failed rollbacks and
+  first releases, and states that migrations are not undone). Also fixed a CRLF hazard for shell scripts
+  (`.gitattributes`). 46 new backend tests (409 -> 455 passed, 1 skipped); SDKs unchanged (JS 19, Python 8);
+  ruff / ruff format / mypy (`pulse`, strict) clean. **Not proven:** anything on real Render, real-API rollback,
+  DynamoDB locking.

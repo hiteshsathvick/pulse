@@ -193,15 +193,21 @@ jobs:
         run: npm run build
 
   dependency-scan:
-    # Phase 22. Advisory, not blocking: pip-audit/npm audit found real,
-    # currently-unfixable findings when this job was added (starlette has no
-    # newer version resolvable in this environment's index at all; pytest's
-    # and vitest's fixes are both major-version bumps of dev-only tooling,
-    # each needing its own full regression pass before landing, not a Phase
-    # 22 side effect). A blocking gate here would leave CI permanently red
-    # over things this run can't fix, which defeats "CI stays green" as a
-    # signal. Findings are tracked in docs/THREAT_MODEL.md; each step still
-    # runs and prints its report every time, so new findings stay visible.
+    # Phase 22 added this as advisory: starlette, pytest and the vitest chain had
+    # findings it couldn't fix. Phase 24 fixed them (fastapi 0.141 + starlette 1.7,
+    # pytest 9, vitest 4), every scan is clean, and this is now a blocking gate.
+    #
+    # The cost of blocking, stated plainly: CI installs the newest version each
+    # dependency range allows, so a newly *published* advisory can turn a push red
+    # with no change of ours. That is the gate doing its job. Fix it by bumping the
+    # dependency; if no fixed version exists, add `--ignore-vuln <ID>` to the step
+    # below and record the reasoning in docs/THREAT_MODEL.md. npm is gated at `high`
+    # because npm reports severity; pip-audit doesn't, so any finding fails it.
+    #
+    # Phase 24 also fixed the scan itself. The Python steps used to run pip-audit on
+    # a runner where the project's dependencies had never been installed, so they
+    # audited almost nothing. Each now installs into its own virtualenv first (one
+    # shared environment would let the backend's packages leak into the SDK's audit).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -211,20 +217,26 @@ jobs:
           python-version: "3.12"
       - name: pip-audit (backend)
         working-directory: backend
-        run: pip install pip-audit && pip-audit || true
+        run: |
+          python -m venv /tmp/backend-venv
+          /tmp/backend-venv/bin/pip install -e ".[dev]" pip-audit
+          /tmp/backend-venv/bin/pip-audit --skip-editable
       - name: pip-audit (sdk-python)
         working-directory: packages/sdk-python
-        run: pip-audit || true
+        run: |
+          python -m venv /tmp/sdk-venv
+          /tmp/sdk-venv/bin/pip install -e ".[dev]" pip-audit
+          /tmp/sdk-venv/bin/pip-audit --skip-editable
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
       - name: npm audit (frontend)
         working-directory: frontend
-        run: npm ci && npm audit --audit-level=high || true
+        run: npm ci && npm audit --audit-level=high
       - name: npm audit (sdk-js)
         working-directory: packages/sdk-js
-        run: npm ci && npm audit --audit-level=high || true
+        run: npm ci && npm audit --audit-level=high
 
   # Phase 23: the deploy configuration is code, so it is checked like code. None
   # of this touches a cloud account -- it proves the Terraform, the Render
@@ -247,6 +259,14 @@ jobs:
           terraform init -backend=false -input=false
           terraform validate
 
+      - name: terraform validate (with the opt-in remote-state override)
+        working-directory: infra/terraform
+        run: |
+          cp backend_override.tf.example backend_override.tf
+          terraform init -backend=false -input=false -reconfigure
+          terraform validate
+          rm backend_override.tf
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -254,6 +274,14 @@ jobs:
         run: |
           pip install check-jsonschema
           check-jsonschema --schemafile https://render.com/schema/render.yaml.json infra/render/*.render.yaml
+
+      - name: Deployed Prometheus config is valid (promtool)
+        run: |
+          sh -n infra/observability/prometheus-render-entrypoint.sh
+          sed -e 's|@@METRICS_TOKEN@@|tokenabc123|g' -e 's|@@HOST_[A-Z_]*@@|some-host-abcd|g' \
+            infra/observability/prometheus.render.yml > /tmp/prometheus.yml
+          docker run --rm --entrypoint promtool -v /tmp/prometheus.yml:/prometheus.yml \
+            prom/prometheus:v2.55.0 check config /prometheus.yml
 
       - name: Compose files render (base, and with the observability stack)
         working-directory: infra/docker
@@ -316,15 +344,16 @@ jobs:
       - name: Build backend image
         run: docker build -t pulse-backend:ci backend
 
-      # Advisory for the same reason dependency-scan is (docs/THREAT_MODEL.md):
-      # the known starlette CVEs have no resolvable fix yet, so a blocking gate
-      # would leave CI permanently red. It still prints the report every push,
-      # and continue-on-error covers the scanner's own vulnerability-DB download
-      # failing, which must not fail a build either.
-      - name: Scan backend image (Trivy, HIGH/CRITICAL)
-        continue-on-error: true
+      # Phase 24: blocking. Only findings that already have a fix (--ignore-unfixed)
+      # fail the build: the base image is patched at build time (backend/Dockerfile
+      # runs apt-get upgrade), so a fixable finding here means that step regressed,
+      # while an unfixable one is not something the build can act on. A fresh build
+      # in CI picks up newly published Debian fixes on its own.
+      - name: Scan backend image (Trivy, fixable HIGH/CRITICAL)
         run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock             aquasec/trivy:0.57.0 image --severity HIGH,CRITICAL --exit-code 0 pulse-backend:ci
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.57.0 image --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress pulse-backend:ci
 
       - uses: actions/setup-node@v4
         with:

@@ -67,6 +67,14 @@ metric that isn't exported.
 turns null once entries have been deleted from a stream — reading that as 0 would report a healthy
 queue exactly when it isn't.
 
+**Deployed, the API's metrics are a bearer-token route instead.** Where a second port isn't reachable
+(Render exposes only a web service's primary port privately) the API also serves `GET /metrics` on its
+primary port -- but only when `METRICS_TOKEN` is set. Unset (the default) the route doesn't exist and
+returns the same plain 404 as any unknown path; set, it requires `Authorization: Bearer <token>`,
+compared in constant time, and a wrong or missing token gets a 401 with no metrics in the body. It is
+not in the OpenAPI schema and is excluded from tracing. See `docs/DEPLOYMENT.md` ("Deployed
+observability") for how Prometheus and Grafana run on Render.
+
 The API's metrics are **per process**. Under `uvicorn --workers N` only one process can bind the
 port, so run one metrics-serving API process per container (as the compose file does) or add
 Prometheus multiprocess mode before scaling workers in one container.

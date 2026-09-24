@@ -48,3 +48,6 @@ infra/terraform/.terraform/
 *.secret.tfvars
 *.auto.tfvars
 crash.log
+
+# Opt-in remote-state config: copied from backend_override.tf.example per machine.
+infra/terraform/backend_override.tf

@@ -3,7 +3,9 @@ end-to-end tests against ClickHouse (pulse/services/deletion.py) plus API
 RBAC for the Owner-only endpoint."""
 
 import asyncio
+import json
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,17 +16,22 @@ from sqlalchemy import select
 
 from alembic import command
 from alembic.config import Config
+from pulse import archive
 from pulse.clickhouse_migrations.runner import migrate
 from pulse.core.config import get_settings
 from pulse.events.fixtures import generate_fake_event
 from pulse.events.repository import insert_events, query_events
 from pulse.main import app
 from pulse.models import AuditLog, User
+from pulse.repositories import object_storage
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
 from pulse.repositories.postgres import session_scope
+from pulse.repositories.redis import get_client as get_redis_client
 from pulse.services import deletion as deletion_service
 from pulse.services import orgs as orgs_service
 from pulse.services import projects as projects_service
+from pulse.worker.consumer import ensure_consumer_group, read_batch
+from pulse.worker.processing import process_batch
 from tests.clickhouse_schema import drop_event_schema
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
@@ -203,6 +210,78 @@ async def test_delete_subject_writes_an_audit_log_entry() -> None:
     assert rows[0].target == "dana"
 
 
+async def test_a_deletion_reaches_events_the_rollup_and_the_archive_together() -> None:
+    """The Phase 24 DoD in one pass, through the real ingestion worker: a subject's
+    events land in ClickHouse, feed the rollup, and are archived to object storage
+    -- and one deletion removes them from all three, leaving other users intact."""
+    org_id, project_id, actor_id = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    redis_client = get_redis_client()
+    stream_key, group = f"test:erasure:{uuid.uuid4().hex[:8]}", f"g-{uuid.uuid4().hex[:8]}"
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    now = datetime.now(UTC)
+
+    def fields(user: str) -> dict[str, str]:
+        return {
+            "org_id": str(org_id),
+            "project_id": str(project_id),
+            "event_id": str(uuid.uuid4()),
+            "event_name": "checkout completed",
+            "user_id": user,
+            "anonymous_id": "",
+            "timestamp": now.isoformat(),
+            "received_at": now.isoformat(),
+            "properties": json.dumps({"plan": "pro"}),
+        }
+
+    for user in ("erasure-alice", "erasure-alice", "erasure-bob"):
+        await redis_client.xadd(stream_key, fields(user))
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    settings = get_settings()
+    await process_batch(
+        redis_client=redis_client,
+        clickhouse_client=ch_client,
+        entries=entries,
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+    )
+
+    archived_before = [
+        e for objs in (await _archive_objects(org_id, project_id)).values() for e in objs
+    ]
+    assert sorted(e["user_id"] for e in archived_before) == [
+        "erasure-alice",
+        "erasure-alice",
+        "erasure-bob",
+    ]
+
+    report = await deletion_service.delete_subject(
+        ch_client, org_id, project_id, actor_id, user_id="erasure-alice"
+    )
+    await ch_client.command("OPTIMIZE TABLE events FINAL")
+
+    remaining = await query_events(ch_client, org_id, project_id, limit=100)
+    assert [row["user_id"] for row in remaining] == ["erasure-bob"]
+    rollup = await ch_client.query(
+        "SELECT sum(events) FROM event_hourly WHERE org_id = {o:UUID} AND project_id = {p:UUID}",
+        parameters={"o": str(org_id), "p": str(project_id)},
+    )
+    assert int(rollup.result_rows[0][0]) == 1
+    archived_after = [
+        e for objs in (await _archive_objects(org_id, project_id)).values() for e in objs
+    ]
+    assert [e["user_id"] for e in archived_after] == ["erasure-bob"]
+    assert report.rollup_verified and report.archive.entries_removed == 2
+
+
+async def _archive_objects(org_id: uuid.UUID, project_id: uuid.UUID) -> dict[str, list[Any]]:
+    keys = await object_storage.list_keys(archive.tenant_prefix(org_id, project_id))
+    return {key: json.loads(await object_storage.get_bytes(key)) for key in keys}
+
+
 # --- API RBAC ---
 
 
@@ -216,7 +295,16 @@ async def test_owner_can_delete_a_subject() -> None:
         response = await client.post(
             f"{ctx['base']}/delete", json={"user_id": "eve"}, headers=ctx["headers"]
         )
-        assert response.status_code == 204
+        assert response.status_code == 200
+        body = response.json()
+        assert body["rollup_verified"] is True
+        assert body["rollup_buckets_recomputed"] == 1
+        assert set(body["archive"]) == {
+            "entries_removed",
+            "objects_rewritten",
+            "objects_deleted",
+            "unreadable_objects",
+        }
 
 
 async def test_a_member_cannot_delete_a_subject_only_an_owner_can() -> None:

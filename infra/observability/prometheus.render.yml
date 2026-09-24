@@ -1,0 +1,40 @@
+# Prometheus config for the DEPLOYED (Render) environment. Rendered at container
+# start by prometheus-render-entrypoint.sh, which substitutes the @@...@@ markers.
+#
+# Why this differs from prometheus.yml (the local docker-compose one):
+#   * Render background workers can't receive private-network traffic at all, so
+#     the workers are declared as *private services* in the Blueprints (which can),
+#     each serving /metrics on METRICS_PORT.
+#   * Render hostnames carry a random suffix (name-2j3e), so they can't be
+#     hard-coded. The Blueprint hands each one over as an env var via
+#     `fromService ... property: host`. Prometheus then scrapes the service's
+#     `<host>-discovery` name, which Render's DNS resolves to EVERY running
+#     instance -- so a multi-instance service is scraped per instance instead of
+#     through a load balancer that would alternate between instances' counters.
+#   * The API is a *web* service, and only its primary HTTP port is reachable over
+#     the private network -- so its metrics are a token-protected /metrics route on
+#     that port (pulse/observability/metrics.py), not a separate port.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: pulse-api
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: "@@METRICS_TOKEN@@"
+    dns_sd_configs:
+      - { names: ["@@HOST_API@@-discovery"], type: A, port: 8000, refresh_interval: 30s }
+  - job_name: pulse-ingest-worker
+    dns_sd_configs:
+      - { names: ["@@HOST_INGEST_WORKER@@-discovery"], type: A, port: 9100, refresh_interval: 30s }
+  - job_name: pulse-alert-worker
+    dns_sd_configs:
+      - { names: ["@@HOST_ALERT_WORKER@@-discovery"], type: A, port: 9100, refresh_interval: 30s }
+  - job_name: pulse-billing-worker
+    dns_sd_configs:
+      - { names: ["@@HOST_BILLING_WORKER@@-discovery"], type: A, port: 9100, refresh_interval: 30s }
+  - job_name: pulse-retention-worker
+    dns_sd_configs:
+      - { names: ["@@HOST_RETENTION_WORKER@@-discovery"], type: A, port: 9100, refresh_interval: 30s }

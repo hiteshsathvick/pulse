@@ -110,7 +110,7 @@ def _not_found() -> HTTPException:
 
 def _anomaly_requires_trend() -> HTTPException:
     return HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail="An anomaly rule requires a trend insight",
     )
 
@@ -254,7 +254,7 @@ async def evaluate_now(
         outcome = await alerts_evaluate.evaluate_alert(alert, insight)
     except alerts_evaluate.InsufficientData as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(

@@ -22,7 +22,7 @@ async def _enforce_max_body_size(request: Request) -> None:
     content_length = request.headers.get("content-length")
     if content_length is not None and int(content_length) > settings.ingest_max_body_bytes:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail=f"Request body exceeds the {settings.ingest_max_body_bytes}-byte limit",
         )
 
@@ -53,7 +53,7 @@ async def ingest(
 
     if len(body.batch) > settings.ingest_max_batch_size:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Batch exceeds the {settings.ingest_max_batch_size}-event limit",
         )
 

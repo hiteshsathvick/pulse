@@ -56,6 +56,59 @@ async def put_object(key: str, data: bytes, content_type: str = "application/jso
     )
 
 
+async def list_keys(prefix: str) -> list[str]:
+    """Every object key under `prefix`, recursively. Listing is paginated by the
+    SDK; it is drained fully here because callers (subject erasure) must see
+    every object, not a first page."""
+    settings = get_settings()
+    client = get_client()
+
+    def _list() -> list[str]:
+        return [
+            obj.object_name
+            for obj in client.list_objects(settings.s3_bucket, prefix=prefix, recursive=True)
+            if obj.object_name
+        ]
+
+    return await asyncio.to_thread(_list)
+
+
+async def list_prefixes(prefix: str) -> list[str]:
+    """The immediate "directories" under `prefix` (non-recursive), each ending in
+    "/". Lets a caller walk only the branches it cares about."""
+    settings = get_settings()
+    client = get_client()
+
+    def _list() -> list[str]:
+        return [
+            obj.object_name
+            for obj in client.list_objects(settings.s3_bucket, prefix=prefix, recursive=False)
+            if obj.object_name and obj.is_dir
+        ]
+
+    return await asyncio.to_thread(_list)
+
+
+async def get_bytes(key: str) -> bytes:
+    settings = get_settings()
+    client = get_client()
+
+    def _get() -> bytes:
+        response = client.get_object(settings.s3_bucket, key)
+        try:
+            return bytes(response.read())
+        finally:
+            response.close()
+            response.release_conn()
+
+    return await asyncio.to_thread(_get)
+
+
+async def remove_object(key: str) -> None:
+    settings = get_settings()
+    await asyncio.to_thread(get_client().remove_object, settings.s3_bucket, key)
+
+
 def close() -> None:
     global _client
     _client = None

@@ -1,0 +1,13 @@
+# Grafana datasource for the DEPLOYED environment. Prometheus's address is handed
+# in by the Blueprint (`fromService ... property: hostport`); Grafana expands
+# ${VAR} in provisioning files. There is no Tempo here: traces are not hosted in
+# the Render deployment (docs/DEPLOYMENT.md), so the dashboard's trace-table panel
+# stays empty there.
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://${PROMETHEUS_HOSTPORT}
+    isDefault: true

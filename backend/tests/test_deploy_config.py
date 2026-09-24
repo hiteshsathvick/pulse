@@ -68,13 +68,19 @@ def test_staging_deploys_when_ci_passes_and_prod_never_auto_deploys() -> None:
 
 
 @pytest.mark.parametrize("env", _ENVS)
-def test_backend_services_pull_the_managed_env_group_and_the_frontend_does_not(env: str) -> None:
-    """The env group holds database, ClickHouse and signing secrets. The API
-    and workers need them; the frontend is a browser-facing renderer and must
-    not be handed credentials it has no use for."""
+def test_each_service_pulls_only_the_env_group_it_needs(env: str) -> None:
+    """The managed group holds database, ClickHouse and signing secrets. The API
+    and workers need them. The frontend and Grafana are browser-facing and must
+    not be handed credentials they have no use for; Prometheus needs just the
+    metrics token, so it gets its own one-secret group instead."""
     for name, service in _services(env).items():
         groups = [e["fromGroup"] for e in service["envVars"] if "fromGroup" in e]
-        expected = [] if name == "frontend" else [f"pulse-{env}-managed"]
+        if name in ("frontend", "grafana"):
+            expected: list[str] = []
+        elif name == "prometheus":
+            expected = [f"pulse-{env}-observability"]
+        else:
+            expected = [f"pulse-{env}-managed"]
         assert groups == expected, name
 
 
@@ -106,6 +112,125 @@ def test_every_worker_command_points_at_a_real_module(env: str) -> None:
         prefix, module = command.split()[:2], command.split()[2]
         assert prefix == ["python", "-m"], command
         assert importlib.util.find_spec(module) is not None, f"{command}: no such module"
+
+
+# --- Deployed observability (Phase 24) ------------------------------------------
+
+_OBS = _ROOT / "infra" / "observability"
+
+
+def _env_map(service: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {e["key"]: e for e in service["envVars"] if "key" in e}
+
+
+@pytest.mark.parametrize("env", _ENVS)
+def test_workers_are_private_services_serving_metrics_on_the_scraped_port(env: str) -> None:
+    """Render background workers can't receive private-network traffic, so a
+    `worker` could never be scraped. As private services they can -- provided the
+    port Render routes to (PORT) is the port the metrics server binds."""
+    template = (_OBS / "prometheus.render.yml").read_text()
+    for name in ("ingest-worker", "alert-worker", "billing-worker", "retention-worker"):
+        service = _services(env)[name]
+        assert service["type"] == "pserv", name
+        envs = _env_map(service)
+        assert envs["PORT"]["value"] == envs["METRICS_PORT"]["value"] == "9100", name
+        assert f"@@HOST_{name.upper().replace('-', '_')}@@-discovery" in template
+    assert template.count("port: 9100") == 4
+
+
+@pytest.mark.parametrize("env", _ENVS)
+def test_prometheus_is_handed_every_value_its_config_template_needs(env: str) -> None:
+    template = (_OBS / "prometheus.render.yml").read_text()
+    markers = set(re.findall(r"@@([A-Z_]+)@@", template))
+    prometheus = _services(env)["prometheus"]
+    provided = set(_env_map(prometheus)) - {"PORT"}
+    # METRICS_TOKEN arrives through the observability env group, not a key.
+    assert markers == provided | {"METRICS_TOKEN"}
+    # ...and the entrypoint refuses to start if any marker is unset.
+    entrypoint = (_OBS / "prometheus-render-entrypoint.sh").read_text()
+    for marker in markers:
+        assert f"@@{marker}@@" in entrypoint and marker in entrypoint.split("sed", 1)[0]
+
+
+@pytest.mark.parametrize("env", _ENVS)
+def test_every_fromservice_reference_names_a_real_service_of_that_type(env: str) -> None:
+    blueprint = _blueprint(env)
+    by_name = {s["name"]: s for s in blueprint["services"]}
+    checked = 0
+    for service in blueprint["services"]:
+        for var in service["envVars"]:
+            ref = var.get("fromService")
+            if ref:
+                checked += 1
+                assert ref["name"] in by_name, (service["name"], ref)
+                assert by_name[ref["name"]]["type"] == ref["type"], (service["name"], ref)
+    assert checked == 6  # five Prometheus targets + Grafana's Prometheus address
+
+
+@pytest.mark.parametrize("env", _ENVS)
+def test_the_prometheus_api_scrape_uses_the_apis_primary_port_and_a_bearer_token(env: str) -> None:
+    """Only a web service's primary port is reachable over the private network, so
+    the API's metrics are a token-protected route on that port, not port 9100."""
+    template = yaml.safe_load((_OBS / "prometheus.render.yml").read_text())["scrape_configs"]
+    api_job = next(j for j in template if j["job_name"] == "pulse-api")
+    assert api_job["dns_sd_configs"][0]["port"] == int(
+        _env_map(_services(env)["api"])["PORT"]["value"]
+    )
+    assert api_job["authorization"] == {"type": "Bearer", "credentials": "@@METRICS_TOKEN@@"}
+    # Every other job is a worker: no credentials in its config.
+    assert all("authorization" not in j for j in template if j is not api_job)
+
+
+def test_the_deployed_scrape_jobs_match_the_local_ones() -> None:
+    """Same job names locally and deployed, so a dashboard or alert written
+    against one works against the other."""
+    local = {
+        j["job_name"]
+        for j in yaml.safe_load((_OBS / "prometheus.yml").read_text())["scrape_configs"]
+    }
+    deployed = {
+        j["job_name"]
+        for j in yaml.safe_load((_OBS / "prometheus.render.yml").read_text())["scrape_configs"]
+    }
+    assert local == deployed
+
+
+@pytest.mark.parametrize("env", _ENVS)
+def test_grafana_is_login_protected_and_its_password_is_not_committed(env: str) -> None:
+    envs = _env_map(_services(env)["grafana"])
+    assert envs["GF_AUTH_ANONYMOUS_ENABLED"]["value"] == "false"  # local compose enables it
+    assert envs["GF_SECURITY_ADMIN_PASSWORD"].get("sync") is False
+    assert "value" not in envs["GF_SECURITY_ADMIN_PASSWORD"]
+
+
+def test_the_deployed_grafana_datasource_keeps_the_uid_the_dashboard_uses() -> None:
+    deployed = yaml.safe_load((_OBS / "grafana" / "render" / "datasources.yaml").read_text())
+    dashboard = (_OBS / "grafana" / "dashboards" / "pulse-health.json").read_text()
+    (source,) = deployed["datasources"]
+    assert source["uid"] == "prometheus"
+    assert '"uid": "prometheus"' in dashboard
+    assert "${PROMETHEUS_HOSTPORT}" in source["url"]  # not a hard-coded hostname
+
+
+def test_shell_scripts_are_pinned_to_lf_line_endings() -> None:
+    """A CRLF shebang fails inside a Linux container ("not found"), and this repo
+    is developed on Windows with core.autocrlf on."""
+    assert "*.sh text eol=lf" in (_ROOT / ".gitattributes").read_text()
+    assert b"\r\n" not in (_OBS / "prometheus-render-entrypoint.sh").read_bytes()
+
+
+def test_terraform_shares_one_metrics_token_between_the_api_and_prometheus() -> None:
+    text = (_TERRAFORM / "main.tf").read_text()
+    managed = text.split('resource "render_env_group" "managed"', 1)[1].split(
+        'resource "render_env_group" "observability"', 1
+    )[0]
+    observability = text.split('resource "render_env_group" "observability"', 1)[1]
+    assert "METRICS_TOKEN   = { value = random_password.metrics_token.result }" in managed
+    # The observability group holds the token and NOTHING else.
+    assert re.findall(r"^\s{4}([A-Z_]+)\s*=", observability, re.MULTILINE) == ["METRICS_TOKEN"]
+    # The entrypoint substitutes it with sed, so it must be letters and digits only.
+    token = text.split('resource "random_password" "metrics_token"', 1)[1].split("}", 1)[0]
+    assert "special = false" in token
 
 
 # --- Terraform -----------------------------------------------------------------
@@ -238,19 +363,39 @@ class _FakeRender:
     """Records the order things happen in. `outcomes` maps service id to the
     status sequence its deploy reports (the last value repeats)."""
 
-    def __init__(self, outcomes: dict[str, list[str]]) -> None:
+    def __init__(
+        self,
+        outcomes: dict[str, list[str]],
+        *,
+        previous_live: dict[str, str | None] | None = None,
+        rollback_outcomes: dict[str, list[str]] | None = None,
+    ) -> None:
         self.outcomes = outcomes
+        self.rollback_outcomes = rollback_outcomes or {}
+        self._previous_live = previous_live or {}
         self.events: list[str] = []
         self._polls: dict[str, int] = {}
+
+    def live_deploy(self, service_id: str) -> str | None:
+        self.events.append(f"live_deploy:{service_id}")
+        return self._previous_live.get(service_id, f"prev-{service_id}")
+
+    def rollback(self, service_id: str, deploy_id: str) -> str:
+        self.events.append(f"rollback:{service_id}:{deploy_id}")
+        return f"rb-{service_id}"
 
     def trigger(self, service_id: str, commit: str) -> str:
         self.events.append(f"trigger:{service_id}:{commit}")
         return f"dep-{service_id}"
 
     def status(self, service_id: str, deploy_id: str) -> str:
-        sequence = self.outcomes[service_id]
-        index = self._polls.get(service_id, 0)
-        self._polls[service_id] = index + 1
+        if deploy_id.startswith("rb-"):
+            sequence = self.rollback_outcomes.get(service_id, ["live"])
+            key = f"rb-{service_id}"
+        else:
+            sequence, key = self.outcomes[service_id], service_id
+        index = self._polls.get(key, 0)
+        self._polls[key] = index + 1
         status = sequence[min(index, len(sequence) - 1)]
         self.events.append(f"status:{service_id}:{status}")
         return status
@@ -274,7 +419,8 @@ def test_the_api_is_live_before_any_worker_is_released(release_module: Any) -> N
     api_live = fake.events.index("status:api:live")
     assert fake.events.index("trigger:w1:abc123") > api_live
     assert fake.events.index("trigger:w2:abc123") > api_live
-    assert fake.events[0] == "trigger:api:abc123"
+    triggers = [e for e in fake.events if e.startswith("trigger:")]
+    assert triggers[0] == "trigger:api:abc123"  # the API is always released first
 
 
 def test_a_failed_api_deploy_never_touches_the_workers(release_module: Any) -> None:
@@ -312,3 +458,190 @@ def test_a_deploy_that_never_goes_live_times_out_instead_of_hanging(release_modu
 def test_a_release_with_no_services_is_rejected(release_module: Any) -> None:
     with pytest.raises(ValueError):
         release_module.release(_FakeRender({}), "abc123", [], sleep=lambda _s: None)
+
+
+# --- Rollback (Phase 24) -------------------------------------------------------
+
+
+def _release(module: Any, fake: Any, services: list[str], **kwargs: Any) -> None:
+    module.release(fake, "abc123", services, sleep=lambda _s: None, **kwargs)
+
+
+def test_the_live_deploys_are_recorded_before_anything_is_triggered(release_module: Any) -> None:
+    """Once the new deploy is live, "the previous one" can no longer be told apart
+    from the list, so the snapshot has to come first."""
+    fake = _FakeRender({"api": ["live"], "w1": ["live"]})
+    _release(release_module, fake, ["api", "w1"])
+
+    first_trigger = next(i for i, e in enumerate(fake.events) if e.startswith("trigger:"))
+    snapshots = [i for i, e in enumerate(fake.events) if e.startswith("live_deploy:")]
+    assert len(snapshots) == 2 and max(snapshots) < first_trigger
+    assert not any(e.startswith("rollback:") for e in fake.events)  # success: no rollback
+
+
+def test_a_failed_worker_rolls_back_what_already_went_live_workers_first(
+    release_module: Any,
+) -> None:
+    fake = _FakeRender({"api": ["live"], "w1": ["update_failed"], "w2": ["live"]})
+
+    with pytest.raises(release_module.DeployFailed) as caught:
+        _release(release_module, fake, ["api", "w1", "w2"])
+
+    rollbacks = [e for e in fake.events if e.startswith("rollback:")]
+    # w2 and the API went live, so they are rolled back -- workers before the API.
+    # w1 never went live (Render keeps serving its old deploy), so it is not touched.
+    assert rollbacks == ["rollback:w2:prev-w2", "rollback:api:prev-api"]
+    message = str(caught.value)
+    assert "update_failed" in message and "Rolled back w2, api" in message
+    assert "forward-only" in message  # migrations are NOT undone, and it says so
+
+
+def test_a_failed_api_deploy_has_nothing_to_roll_back(release_module: Any) -> None:
+    fake = _FakeRender({"api": ["pre_deploy_failed"], "w1": ["live"]})
+
+    with pytest.raises(release_module.DeployFailed, match="nothing to roll back"):
+        _release(release_module, fake, ["api", "w1"])
+
+    assert not any(e.startswith("rollback:") for e in fake.events)
+
+
+def test_an_in_flight_deploy_is_allowed_to_settle_before_rollback(release_module: Any) -> None:
+    """w1 fails while w2 is still building. Rolling w2 back mid-build would race
+    its deploy, so the script waits for it to reach a terminal state first."""
+    fake = _FakeRender(
+        {"api": ["live"], "w1": ["update_failed"], "w2": ["build_in_progress", "live"]}
+    )
+
+    with pytest.raises(release_module.DeployFailed):
+        _release(release_module, fake, ["api", "w1", "w2"])
+
+    assert fake.events.index("status:w2:live") < fake.events.index("rollback:w2:prev-w2")
+
+
+def test_a_failed_rollback_is_reported_loudly_not_swallowed(release_module: Any) -> None:
+    fake = _FakeRender(
+        {"api": ["live"], "w1": ["update_failed"]},
+        rollback_outcomes={"api": ["update_failed"]},
+    )
+
+    with pytest.raises(release_module.DeployFailed, match="ROLLBACK FAILED"):
+        _release(release_module, fake, ["api", "w1"])
+
+
+def test_a_first_release_has_nothing_to_roll_back_to_and_says_so(release_module: Any) -> None:
+    fake = _FakeRender(
+        {"api": ["live"], "w1": ["update_failed"]}, previous_live={"api": None, "w1": None}
+    )
+
+    with pytest.raises(release_module.DeployFailed, match="first release"):
+        _release(release_module, fake, ["api", "w1"])
+
+    assert not any(e.startswith("rollback:") for e in fake.events)
+
+
+def test_a_deploy_that_never_settles_does_not_hang_the_rollback(release_module: Any) -> None:
+    fake = _FakeRender({"api": ["live"], "w1": ["update_failed"], "w2": ["build_in_progress"]})
+    ticks = iter(range(0, 100_000, 100))
+
+    with pytest.raises(release_module.DeployFailed):
+        release_module.release(
+            fake,
+            "abc123",
+            ["api", "w1", "w2"],
+            timeout_s=300,
+            poll_s=1,
+            sleep=lambda _s: None,
+            clock=lambda: float(next(ticks)),
+        )
+
+    # w2 never reached a terminal state, so it is not rolled back; the API is.
+    assert [e for e in fake.events if e.startswith("rollback:")] == ["rollback:api:prev-api"]
+
+
+def test_the_http_client_finds_the_live_deploy_and_posts_a_rollback(release_module: Any) -> None:
+    calls: list[tuple[str, str, Any]] = []
+
+    class Canned(release_module.HttpRenderClient):
+        def _call(self, method: str, path: str, body: Any = None) -> Any:
+            calls.append((method, path, body))
+            if method == "GET":
+                return [
+                    {"deploy": {"id": "dep-new", "status": "build_in_progress"}, "cursor": "a"},
+                    {"deploy": {"id": "dep-live", "status": "live"}, "cursor": "b"},
+                    {"deploy": {"id": "dep-old", "status": "deactivated"}, "cursor": "c"},
+                ]
+            return {"id": "dep-rolled-back"}
+
+    client = Canned("key")
+    assert client.live_deploy("srv-1") == "dep-live"
+    assert client.rollback("srv-1", "dep-live") == "dep-rolled-back"
+    assert calls == [
+        ("GET", "/services/srv-1/deploys?limit=20", None),
+        ("POST", "/services/srv-1/rollback", {"deployId": "dep-live"}),
+    ]
+
+
+def test_the_http_client_reports_no_live_deploy_for_a_service_that_never_had_one(
+    release_module: Any,
+) -> None:
+    class Canned(release_module.HttpRenderClient):
+        def _call(self, method: str, path: str, body: Any = None) -> Any:
+            return [{"deploy": {"id": "dep-1", "status": "build_failed"}, "cursor": "a"}]
+
+    assert Canned("key").live_deploy("srv-1") is None
+
+
+# --- CI gates and image contents (Phase 24) -------------------------------------
+
+
+def _ci() -> dict[str, Any]:
+    data: dict[str, Any] = yaml.safe_load((_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    return data
+
+
+def test_the_dependency_and_image_scans_are_blocking_gates() -> None:
+    """They were advisory in Phase 22-23 only because of findings that couldn't be
+    fixed then. Now they can, so neither may quietly go back to `|| true` or
+    `continue-on-error` -- that would make a red scan invisible again."""
+    jobs = _ci()["jobs"]
+    for step in jobs["dependency-scan"]["steps"]:
+        assert "|| true" not in step.get("run", ""), step.get("name")
+    trivy = next(s for s in jobs["build"]["steps"] if "Trivy" in s.get("name", ""))
+    assert not trivy.get("continue-on-error")
+    assert "--exit-code 1" in trivy["run"] and "--ignore-unfixed" in trivy["run"]
+
+
+def test_the_python_dependency_audits_install_the_project_first_in_their_own_venv() -> None:
+    """Auditing a runner where nothing was installed audits nothing -- the flaw the
+    advisory version of this job had. And one shared environment would let the
+    backend's packages leak into the SDK's audit."""
+    steps = {s["name"]: s["run"] for s in _ci()["jobs"]["dependency-scan"]["steps"] if "run" in s}
+    backend, sdk = steps["pip-audit (backend)"], steps["pip-audit (sdk-python)"]
+    assert 'pip install -e ".[dev]"' in backend and 'pip install -e ".[dev]"' in sdk
+    assert "/tmp/backend-venv" in backend and "/tmp/sdk-venv" in sdk
+    assert "/tmp/backend-venv" not in sdk
+
+
+def test_the_backend_image_installs_the_debian_security_updates() -> None:
+    dockerfile = (_ROOT / "backend" / "Dockerfile").read_text().replace("\r\n", "\n")
+    assert "apt-get upgrade -y" in dockerfile
+    assert dockerfile.index("apt-get upgrade") < dockerfile.index("pip install")
+
+
+@pytest.mark.parametrize("name", ["prometheus.render.Dockerfile", "grafana.render.Dockerfile"])
+def test_the_observability_dockerfiles_only_copy_files_that_exist(name: str) -> None:
+    """A Dockerfile whose COPY source has been moved fails only at deploy time."""
+    for line in (_OBS / name).read_text().splitlines():
+        if line.startswith("COPY "):
+            source = line.split()[1]
+            assert (_OBS / source).exists(), f"{name}: COPY source {source} does not exist"
+
+
+def test_the_terraform_remote_state_example_is_opt_in_and_ignored() -> None:
+    example = (_TERRAFORM / "backend_override.tf.example").read_text()
+    assert 'backend "s3"' in example and "encrypt = true" in example
+    # No bucket, key or table is committed: they are passed at `terraform init`.
+    assert not re.search(r"^\s*(bucket|key|dynamodb_table)\s*=", example, re.MULTILINE)
+    assert "infra/terraform/backend_override.tf" in (_ROOT / ".gitignore").read_text()
+    # It is only an example: without the override, Terraform still uses local state.
+    assert "backend " not in (_TERRAFORM / "versions.tf").read_text()

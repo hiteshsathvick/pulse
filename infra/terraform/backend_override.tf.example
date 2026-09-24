@@ -1,0 +1,23 @@
+# Opt-in remote state (Phase 24). By default Terraform keeps its state in a local
+# file, which is fine for one person on one machine and wrong for anything shared:
+# the state holds every generated secret in plain text, and two people applying
+# from two laptops would corrupt it.
+#
+# To use S3 with DynamoDB locking, copy this file to `backend_override.tf`
+# (git-ignored -- Terraform merges `*_override.tf` files into the configuration, so
+# nothing else needs editing) and pass the location at init time, so no bucket
+# name is ever committed:
+#
+#   terraform init \
+#     -backend-config="bucket=<state-bucket>" \
+#     -backend-config="key=pulse/<staging|prod>.tfstate" \
+#     -backend-config="region=<aws-region>" \
+#     -backend-config="dynamodb_table=<lock-table>"
+#
+# The bucket and lock table are created once by hand; docs/DEPLOYMENT.md has the
+# commands. Use a separate `key` per environment.
+terraform {
+  backend "s3" {
+    encrypt = true
+  }
+}

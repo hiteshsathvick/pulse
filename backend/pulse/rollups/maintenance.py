@@ -7,6 +7,7 @@ written (a partial deploy, a manual `DROP`), or if rows are deleted from
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from clickhouse_connect.driver.asyncclient import AsyncClient
@@ -151,3 +152,96 @@ async def rebuild(client: AsyncClient) -> int:
 
     result = await client.query("SELECT count() FROM event_hourly")
     return int(result.result_rows[0][0])
+
+
+class RollupRepairFailed(Exception):
+    """A scoped repair could not reach a state `verify` accepts."""
+
+
+@dataclass(frozen=True)
+class RepairReport:
+    buckets_recomputed: int
+    verified: bool
+    attempts: int
+
+
+_HOUR_CHUNK = 500
+_MAX_ATTEMPTS = 4
+
+
+def _bucket_filters(alias_hour: str) -> str:
+    return (
+        "org_id = {org_id:UUID} AND project_id = {project_id:UUID} "
+        "AND event_name IN {names:Array(String)} "
+        f"AND {alias_hour} IN {{hours:Array(DateTime('UTC'))}}"
+    )
+
+
+async def repair_buckets(
+    client: AsyncClient,
+    org_id: uuid.UUID,
+    project_id: uuid.UUID,
+    event_names: list[str],
+    hours: list[datetime],
+) -> RepairReport:
+    """Recomputes only the given (event name x hour) buckets of one project from
+    `events`. This is what makes deleting rows from `events` safe for the rollup
+    *without* the global, ingestion-stopped `rebuild`: a unique-users sketch can't
+    have one user subtracted, but a bucket can be rebuilt from the raw rows that
+    remain.
+
+    Ingestion keeps running, so a new event can land in a bucket between the
+    delete and the reinsert and be counted by both the materialized view and the
+    recompute. Event counts are exact, so `verify`'s comparison (scoped to the same
+    buckets) detects that, and the repair is simply run again -- the recompute is
+    idempotent, so a retry converges. If it still doesn't verify after
+    `_MAX_ATTEMPTS`, `RollupRepairFailed` is raised rather than reporting success."""
+    if not event_names or not hours:
+        return RepairReport(buckets_recomputed=0, verified=True, attempts=0)
+
+    unique_hours = sorted(set(hours))
+    chunks = [unique_hours[i : i + _HOUR_CHUNK] for i in range(0, len(unique_hours), _HOUR_CHUNK)]
+    names = sorted(set(event_names))
+    base: dict[str, object] = {
+        "org_id": str(org_id),
+        "project_id": str(project_id),
+        "names": names,
+    }
+
+    attempts = 0
+    for attempts in range(1, _MAX_ATTEMPTS + 1):
+        for chunk in chunks:
+            params = {**base, "hours": chunk}
+            await client.command(
+                f"ALTER TABLE event_hourly DELETE WHERE {_bucket_filters('hour')}",
+                parameters=params,
+                settings={"mutations_sync": 1},
+            )
+            await client.command(
+                "INSERT INTO event_hourly "
+                f"SELECT org_id, project_id, event_name, {_HOUR} AS hour, count() AS events, "
+                f"uniqCombined64State({SKETCH_PRECISION})({_IDENTITY}) AS users_state "
+                f"FROM events WHERE {_bucket_filters(_HOUR)} "
+                "GROUP BY org_id, project_id, event_name, hour",
+                parameters=params,
+            )
+
+        clean = True
+        for chunk in chunks:
+            params = {**base, "hours": chunk}
+            body = _comparison(
+                f"WHERE {_bucket_filters(_HOUR)}", f"WHERE {_bucket_filters('hour')}"
+            )
+            mismatched = await client.query(f"SELECT count() FROM ({body})", parameters=params)
+            if int(mismatched.result_rows[0][0]) != 0:
+                clean = False
+                break
+        if clean:
+            return RepairReport(
+                buckets_recomputed=len(names) * len(unique_hours), verified=True, attempts=attempts
+            )
+
+    raise RollupRepairFailed(
+        f"rollup buckets for project {project_id} still disagree with events "
+        f"after {attempts} repair attempts"
+    )

@@ -1,5 +1,11 @@
 FROM python:3.12-slim
 
+# Pick up the Debian security fixes published since this base image was built.
+# The image scan (Trivy, in CI) found HIGH/CRITICAL findings in the base -- perl,
+# openssl, sqlite, pcre2 -- every one of them already fixed upstream, so a scan
+# that fails on fixable findings stays green as long as this runs.
+RUN apt-get update     && apt-get upgrade -y --no-install-recommends     && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # Dependencies get their own layer, keyed only on pyproject.toml. Source used

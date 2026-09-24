@@ -292,12 +292,17 @@ async def test_batch_is_archived_to_object_storage() -> None:
     await object_storage.ensure_bucket()
 
     event_id = uuid.uuid4()
-    await redis_client.xadd(stream_key, _raw_fields(event_id=str(event_id)))
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    await redis_client.xadd(
+        stream_key,
+        _raw_fields(event_id=str(event_id), org_id=str(org_id), project_id=str(project_id)),
+    )
     entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
 
     result = await _process(stream_key, group, entries)
 
-    key = f"raw/{datetime.now(UTC):%Y/%m/%d}/{result.ingest_batch}.json"
+    # Phase 24: one object per (org, project) per batch, so erasure can find it.
+    key = f"raw/{org_id}/{project_id}/{datetime.now(UTC):%Y/%m/%d}/{result.ingest_batch}.json"
     client = object_storage.get_client()
     response = await asyncio.to_thread(client.get_object, settings.s3_bucket, key)
     try:

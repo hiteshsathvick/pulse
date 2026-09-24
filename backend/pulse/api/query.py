@@ -115,7 +115,7 @@ async def query_trend(
         raise _too_many_queries(exc) from exc
     except query_service.QueryTooExpensive as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
@@ -145,7 +145,7 @@ async def query_funnel(
         raise _too_many_queries(exc) from exc
     except query_service.QueryTooExpensive as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
@@ -170,7 +170,7 @@ async def query_retention(
         raise _too_many_queries(exc) from exc
     except query_service.QueryTooExpensive as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
     except query_service.ProjectNotFound as exc:
         raise HTTPException(
@@ -202,7 +202,7 @@ async def query_nl(
         ) from exc
     except ai_translator.TranslationFailed as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
         ) from exc
 
     return NLQueryResponse(

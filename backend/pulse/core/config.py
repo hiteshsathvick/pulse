@@ -169,8 +169,11 @@ class Settings(BaseSettings):
     # the Redis stream keeps working) but nothing is exported.
     otel_exporter_otlp_endpoint: str | None = None
     # Serves Prometheus /metrics from each worker process on this port.
-    # (The API serves /metrics on its own port, so it needs no setting.)
+    # (The API serves /metrics on its own port unless metrics_token is set below.)
     metrics_port: int | None = None
+    # Set: the API also serves a bearer-token-protected /metrics on its primary port
+    # (for hosts where a second port isn't reachable). Unset: that route does not exist.
+    metrics_token: str | None = None
     # Unset: sentry_sdk is never initialized -- no network, no capture.
     sentry_dsn: str | None = None
     sentry_environment: str = "development"

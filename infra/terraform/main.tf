@@ -49,6 +49,14 @@ resource "random_password" "pii_hash_secret" {
   special = false
 }
 
+# Bearer token for the API's /metrics route (Prometheus presents it). Letters and
+# digits only: the Prometheus image's entrypoint substitutes it with sed and
+# refuses anything else.
+resource "random_password" "metrics_token" {
+  length  = 48
+  special = false
+}
+
 resource "random_id" "bucket_suffix" {
   byte_length = 4
 }
@@ -203,5 +211,17 @@ resource "render_env_group" "managed" {
 
     JWT_SECRET      = { value = random_password.jwt_secret.result }
     PII_HASH_SECRET = { value = random_password.pii_hash_secret.result }
+    METRICS_TOKEN   = { value = random_password.metrics_token.result }
+  }
+}
+
+# Prometheus needs the metrics token and nothing else, so it gets its own group
+# rather than the managed one (which holds database and signing secrets). The
+# token is the same generated value in both groups -- one source, two readers.
+resource "render_env_group" "observability" {
+  name = "${local.name}-observability"
+
+  env_vars = {
+    METRICS_TOKEN = { value = random_password.metrics_token.result }
   }
 }

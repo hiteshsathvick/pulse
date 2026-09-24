@@ -409,3 +409,45 @@ def test_sentry_captures_an_exception_and_never_ships_request_bodies_or_pii() ->
         assert events[0]["exception"]["values"][0]["type"] == "ValueError"
     finally:
         sentry_sdk.init()  # disable again so no other test inherits an active client
+
+
+# --- The API's token-protected /metrics (Phase 24) ---
+
+
+async def _get_metrics(authorization: str | None) -> httpx.Response:
+    headers = {"Authorization": authorization} if authorization is not None else {}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        return await client.get("/metrics", headers=headers)
+
+
+async def test_the_api_metrics_route_does_not_exist_unless_a_token_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "metrics_token", None)
+    # Even a request carrying some bearer token gets the same plain 404 as any
+    # unknown path -- the route's existence isn't revealed.
+    assert (await _get_metrics("Bearer anything")).status_code == 404
+    assert (await _get_metrics(None)).status_code == 404
+
+
+async def test_the_api_metrics_route_rejects_a_missing_or_wrong_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "metrics_token", "correcttoken123")
+    for header in (None, "", "Bearer", "Bearer wrong", "Basic correcttoken123", "correcttoken123"):
+        response = await _get_metrics(header)
+        assert response.status_code == 401, header
+        assert response.headers["www-authenticate"] == "Bearer"
+        assert "pulse_" not in response.text  # nothing leaks on the failure path
+
+
+async def test_the_api_metrics_route_serves_prometheus_text_with_the_right_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "metrics_token", "correcttoken123")
+    response = await _get_metrics("Bearer correcttoken123")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "pulse_http_request_duration_seconds" in response.text

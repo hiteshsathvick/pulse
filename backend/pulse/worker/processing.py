@@ -13,12 +13,12 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from redis.asyncio import Redis
 
+from pulse import archive
 from pulse.core.config import get_settings
 from pulse.events.repository import insert_events
 from pulse.models import PiiAction
 from pulse.observability import metrics, tracing
 from pulse.registry import service as registry
-from pulse.repositories import object_storage
 from pulse.worker.consumer import StreamEntry, ack
 
 logger = logging.getLogger("pulse.worker")
@@ -217,14 +217,11 @@ async def register_events(observations: list[registry.RegistryObservation]) -> N
 
 async def archive_batch(ingest_batch: uuid.UUID, raw_events: list[dict[str, str]]) -> None:
     """Archives the *entire* raw batch -- good and poison entries alike --
-    as one JSON object, per SPEC.md #6.7's "raw event archive (replay/backfill
-    source of truth)". Separate from the DLQ, which exists for operator
-    visibility into bad entries specifically, not as the archive itself."""
-    if not raw_events:
-        return
-    payload = json.dumps(raw_events).encode()
-    key = f"raw/{datetime.now(UTC):%Y/%m/%d}/{ingest_batch}.json"
-    await object_storage.put_object(key, payload)
+    per SPEC.md #6.7's "raw event archive (replay/backfill source of truth)".
+    Separate from the DLQ, which exists for operator visibility into bad
+    entries specifically, not as the archive itself. Layout and the per-tenant
+    split (which is what makes GDPR erasure feasible) live in pulse/archive.py."""
+    await archive.write_batch(ingest_batch, raw_events)
 
 
 def _emit_event_spans(

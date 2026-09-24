@@ -10,3 +10,8 @@ output "clickhouse_host" {
 output "raw_events_bucket" {
   value = aws_s3_bucket.raw_events.bucket
 }
+
+output "observability_env_group_name" {
+  description = "The Render environment group holding only the metrics token (Prometheus)."
+  value       = render_env_group.observability.name
+}
