@@ -1,9 +1,20 @@
+import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
 
-from pulse.repositories import clickhouse, postgres
+from pulse.repositories import clickhouse, object_storage, postgres
 from pulse.repositories import redis as redis_repo
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _archive_bucket() -> None:
+    """Any test that runs a worker batch writes to the raw-event archive, so the
+    bucket must exist regardless of which test file runs first. It used to be
+    created only inside test_worker.py, which passed locally (the bucket persisted
+    in the MinIO volume) but failed on a fresh CI MinIO for every earlier file that
+    processes a batch. Minio's client is sync, so this is safe session-scoped."""
+    asyncio.run(object_storage.ensure_bucket())
 
 
 @pytest.fixture(autouse=True)
