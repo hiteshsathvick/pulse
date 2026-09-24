@@ -367,3 +367,28 @@ async def test_broken_registry_does_not_block_insert_archive_or_ack() -> None:
 
     pending = await redis_client.xpending(stream_key, group)
     assert pending["pending"] == 0
+
+
+async def test_acked_entries_are_deleted_so_the_ingest_stream_does_not_grow_without_bound() -> None:
+    """Found by Phase 23's stream-length gauge: XACK alone leaves every
+    processed entry in the stream forever (5,000+ entries, zero pending, zero
+    lag on a dev Redis). With the deployed `noeviction` policy that is a slow
+    outage -- so an acked entry must be gone, and an *unacked* one must not be
+    (deleting early would lose an un-landed event)."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    for _ in range(3):
+        await redis_client.xadd(
+            stream_key,
+            _raw_fields(org_id=str(org_id), project_id=str(project_id), event_id=str(uuid.uuid4())),
+        )
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=10)
+    assert await redis_client.xlen(stream_key) == 3  # delivered, not yet acked: still there
+
+    await _process(stream_key, group, entries)
+
+    assert await redis_client.xlen(stream_key) == 0
+    assert (await redis_client.xinfo_groups(stream_key))[0]["pending"] == 0

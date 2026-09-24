@@ -11,6 +11,7 @@ import logging
 
 from pulse.alerts.evaluate import evaluate_all_enabled
 from pulse.core.config import get_settings
+from pulse.observability.setup import setup_observability
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("pulse.alerts.worker")
@@ -31,6 +32,7 @@ async def run_cycle() -> None:
 
 async def main() -> None:
     settings = get_settings()
+    setup_observability("pulse-alert-worker")
     logger.info("alert-worker starting (interval=%ds)", settings.alert_evaluation_interval_seconds)
     while True:
         try:

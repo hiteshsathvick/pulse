@@ -2,17 +2,21 @@ import hashlib
 import hmac
 import json
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from clickhouse_connect.driver.asyncclient import AsyncClient
+from opentelemetry import context as otel_context
+from opentelemetry import trace
 from redis.asyncio import Redis
 
 from pulse.core.config import get_settings
 from pulse.events.repository import insert_events
 from pulse.models import PiiAction
+from pulse.observability import metrics, tracing
 from pulse.registry import service as registry
 from pulse.repositories import object_storage
 from pulse.worker.consumer import StreamEntry, ack
@@ -223,6 +227,51 @@ async def archive_batch(ingest_batch: uuid.UUID, raw_events: list[dict[str, str]
     await object_storage.put_object(key, payload)
 
 
+def _emit_event_spans(
+    traced_events: list[tuple[otel_context.Context, str]],
+    *,
+    batch_started_ns: int,
+    insert_start_ns: int,
+    insert_end_ns: int,
+    batch_size: int,
+    ingest_batch: uuid.UUID,
+) -> None:
+    """One ClickHouse insert served many events from many different traces
+    (a batch mixes requests), so each traced event gets its own pair of spans
+    recording that shared work's real timing, parented into *that event's*
+    trace -- which is what makes "one trace follows an event to ClickHouse"
+    true rather than approximate. Emitted after the batch finishes, with
+    explicit timestamps, because the parent of each span is only known once
+    the entry is parsed. Never allowed to raise: observing ingestion must not
+    be able to break it."""
+    try:
+        end_ns = time.time_ns()
+        for parent, event_id in traced_events:
+            process = tracing.start_span_in(
+                "worker.process_event",
+                parent,
+                start_time_ns=batch_started_ns,
+                attributes={"pulse.event_id": event_id, "pulse.ingest_batch": str(ingest_batch)},
+                kind=trace.SpanKind.CONSUMER,
+            )
+            insert = tracing.start_span_in(
+                "clickhouse.insert",
+                trace.set_span_in_context(process, parent),
+                start_time_ns=insert_start_ns,
+                attributes={
+                    "db.system": "clickhouse",
+                    "db.operation": "INSERT",
+                    "db.sql.table": "events",
+                    "pulse.batch_size": batch_size,
+                },
+                kind=trace.SpanKind.CLIENT,
+            )
+            insert.end(end_time=insert_end_ns)
+            process.end(end_time=end_ns)
+    except Exception:
+        logger.debug("tracing: emitting event spans failed", exc_info=True)
+
+
 async def process_batch(
     *,
     redis_client: Redis,
@@ -247,6 +296,9 @@ async def process_batch(
 
     ingest_batch = uuid.uuid4()
     result.ingest_batch = ingest_batch
+    batch_started = time.perf_counter()
+    batch_started_ns = time.time_ns()
+    traced_events: list[tuple[otel_context.Context, str]] = []
 
     good_rows: list[dict[str, object]] = []
     fresh_event_ids: list[uuid.UUID] = []
@@ -254,6 +306,7 @@ async def process_batch(
     raw_archive: list[dict[str, str]] = []
     observations: list[registry.RegistryObservation] = []
     pii_rules_cache: dict[tuple[uuid.UUID, uuid.UUID], dict[str, PiiAction]] = {}
+    received_times: list[datetime] = []
 
     async def _pii_rules_for(org_id: uuid.UUID, project_id: uuid.UUID) -> dict[str, PiiAction]:
         if pii_rules_fetcher is None:
@@ -265,7 +318,8 @@ async def process_batch(
 
     for entry_id, fields in entries:
         ack_ids.append(entry_id)
-        raw_archive.append(_decode_fields(fields))
+        decoded_fields = _decode_fields(fields)
+        raw_archive.append(decoded_fields)
 
         try:
             parsed = parse_stream_entry(fields)
@@ -283,6 +337,10 @@ async def process_batch(
 
         good_rows.append(to_clickhouse_row(parsed, ingest_batch))
         fresh_event_ids.append(parsed.event_id)
+        event_parent = tracing.extract_context(decoded_fields)
+        if event_parent is not None:
+            traced_events.append((event_parent, str(parsed.event_id)))
+        received_times.append(parsed.received_at)
         observations.append(
             registry.RegistryObservation(
                 org_id=parsed.org_id,
@@ -292,13 +350,33 @@ async def process_batch(
             )
         )
 
+    insert_start_ns = insert_end_ns = batch_started_ns
     if good_rows:
+        insert_start_ns = time.time_ns()
         await insert_events(clickhouse_client, good_rows)
+        insert_end_ns = time.time_ns()
         result.processed = len(good_rows)
+        landed_at = datetime.now(UTC)
+        for received_at in received_times:
+            metrics.LANDING_DELAY.observe((landed_at - received_at).total_seconds())
         await register_events(observations)
 
     await archive_batch(ingest_batch, raw_archive)
     await mark_seen(redis_client, fresh_event_ids, dedup_ttl_seconds)
     await ack(redis_client, stream_key, group, ack_ids)
     result.acked = len(ack_ids)
+
+    metrics.WORKER_EVENTS.labels("inserted").inc(result.processed)
+    metrics.WORKER_EVENTS.labels("duplicate").inc(result.duplicates)
+    metrics.WORKER_EVENTS.labels("poisoned").inc(result.poisoned)
+    metrics.WORKER_BATCH_SIZE.observe(len(entries))
+    metrics.WORKER_BATCH_SECONDS.observe(time.perf_counter() - batch_started)
+    _emit_event_spans(
+        traced_events,
+        batch_started_ns=batch_started_ns,
+        insert_start_ns=insert_start_ns,
+        insert_end_ns=insert_end_ns,
+        batch_size=len(good_rows),
+        ingest_batch=ingest_batch,
+    )
     return result

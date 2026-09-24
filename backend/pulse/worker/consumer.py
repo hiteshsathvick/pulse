@@ -44,5 +44,23 @@ def _flatten(result: object) -> list[StreamEntry]:
 
 
 async def ack(client: Redis, stream_key: str, group: str, entry_ids: list[bytes]) -> None:
-    if entry_ids:
-        await client.xack(stream_key, group, *entry_ids)
+    """Acknowledges AND deletes. XACK alone only clears the entry from the
+    group's pending list -- the entry itself stays in the stream forever, so
+    an un-trimmed ingest stream grows without bound (found by Phase 23's
+    stream-length gauge: 5,000+ entries with zero pending and zero lag). That
+    matters because the deployed Redis runs `noeviction` (the stream is the
+    only copy of an un-landed event, so it must never be evicted): once memory
+    filled, /ingest would fail permanently.
+
+    Deleting on ack is safe because an acked entry is, by construction,
+    already landed in ClickHouse (or routed to the DLQ) and in the raw
+    archive -- process_batch only acks after all of that. It assumes a single
+    consumer group, which is the design (one group, many consumers): a second
+    group would need its own retention story. One MULTI/EXEC round trip, so
+    an entry is never acked-but-undeleted or deleted-but-unacked."""
+    if not entry_ids:
+        return
+    pipeline = client.pipeline(transaction=True)
+    pipeline.xack(stream_key, group, *entry_ids)
+    pipeline.xdel(stream_key, *entry_ids)
+    await pipeline.execute()

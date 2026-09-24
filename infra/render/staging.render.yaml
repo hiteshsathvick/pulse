@@ -1,0 +1,129 @@
+# Render Blueprint for the staging environment (Phase 23).
+#
+# Compute only: the API, the four background workers and the frontend. Every
+# data service (Postgres, Redis/Key Value, ClickHouse Cloud, S3) and every
+# secret is owned by infra/terraform, which writes the connection strings into
+# the Render environment group `pulse-staging-managed` that each service pulls in
+# with `fromGroup` -- so nothing sensitive is committed or pasted by hand.
+#
+# Deploys automatically once CI passes on master (autoDeployTrigger: checksPass) -- this is the
+# "merge deploys to staging" half of the Phase 23 definition of done.
+#
+# Create it in Render as a Blueprint pointing at THIS file (Render lets each
+# Blueprint use its own file path, which is how staging and prod coexist in one
+# repo). Names are prefixed with the environment so the two never collide.
+#
+# Do not edit one environment's file without the other: infra/render is kept in
+# lockstep by backend/tests/test_deploy_config.py.
+
+services:
+  # -- API ----------------------------------------------------------------------
+  - type: web
+    name: pulse-staging-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    branch: master
+    plan: starter
+    numInstances: 1
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    # Both stores, Postgres then ClickHouse, before the new version takes any
+    # traffic. A failing migration fails the deploy and the previous version
+    # keeps serving. A Python module, not `a && b`: docker commands are exec'd
+    # without a shell.
+    preDeployCommand: python -m pulse.migrate
+    envVars:
+      - fromGroup: pulse-staging-managed
+      - key: PORT
+        value: "8000"
+      - key: SENTRY_ENVIRONMENT
+        value: staging
+      - key: SENTRY_DSN
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+
+  # -- Workers ------------------------------------------------------------------
+  - type: worker
+    name: pulse-staging-ingest-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.worker.main
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    envVars:
+      - fromGroup: pulse-staging-managed
+      - key: SENTRY_ENVIRONMENT
+        value: staging
+      - key: SENTRY_DSN
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+
+  - type: worker
+    name: pulse-staging-alert-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.alerts.main
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    envVars:
+      - fromGroup: pulse-staging-managed
+      - key: SENTRY_ENVIRONMENT
+        value: staging
+      - key: SENTRY_DSN
+        sync: false
+
+  - type: worker
+    name: pulse-staging-billing-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.billing.main
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    envVars:
+      - fromGroup: pulse-staging-managed
+      - key: SENTRY_ENVIRONMENT
+        value: staging
+      - key: SENTRY_DSN
+        sync: false
+
+  - type: worker
+    name: pulse-staging-retention-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.retention.main
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    envVars:
+      - fromGroup: pulse-staging-managed
+      - key: SENTRY_ENVIRONMENT
+        value: staging
+      - key: SENTRY_DSN
+        sync: false
+
+  # -- Frontend -----------------------------------------------------------------
+  - type: web
+    name: pulse-staging-frontend
+    runtime: docker
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    branch: master
+    plan: starter
+    autoDeployTrigger: checksPass
+    envVars:
+      # The public API origin, baked into the browser bundle at build time.
+      - key: NEXT_PUBLIC_API_URL
+        sync: false
+      # Server-side rendering reaches the API over Render's private network.
+      - key: API_INTERNAL_URL
+        sync: false

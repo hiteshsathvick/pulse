@@ -13,6 +13,7 @@ from sqlalchemy import select
 from pulse.billing.service import compute_and_store_usage, current_period
 from pulse.core.config import get_settings
 from pulse.models import Organization
+from pulse.observability.setup import setup_observability
 from pulse.repositories.postgres import session_scope
 
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +34,7 @@ async def run_cycle() -> None:
 
 async def main() -> None:
     settings = get_settings()
+    setup_observability("pulse-billing-worker")
     logger.info("billing-worker starting (interval=%ds)", settings.billing_usage_interval_seconds)
     while True:
         try:

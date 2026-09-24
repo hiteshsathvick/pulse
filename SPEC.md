@@ -1480,6 +1480,94 @@ forbidden, a clean 422 with no identifier, an unknown project 404). `test_pii_ru
 three-state PATCH semantics respectively. `test_nl_injection.py` unchanged in structure, +4 adversarial
 cases. ruff / ruff format / mypy (`pulse`, strict) all clean.
 
+### 6.21 Observability, CI/CD & deployment mechanism (Phase 23)
+
+Three design forks, each confirmed with the user first (all "recommended" options): deployment is **built
+and validated, not applied** (no Render/ClickHouse Cloud/AWS account, no spend); the observability stack is
+**self-hosted in docker-compose**; Sentry is an **env-gated SDK**, no account needed. Full detail in
+`docs/OBSERVABILITY.md` and `docs/DEPLOYMENT.md`.
+
+**One trace from SDK to ClickHouse** (`pulse/observability/tracing.py`). HTTP hops propagate context on
+their own; the Redis stream is a process boundary that doesn't, so `/ingest` writes the W3C `traceparent`
+into every stream entry (`ingest/service.py::buffer_batch`) and the worker reads it back as the parent of its
+spans. A worker batch mixes events from many requests, so after the batch lands each traced event gets its
+**own** `worker.process_event` span and child `clickhouse.insert` span, parented into **its own** trace and
+carrying the shared insert's real timing -- traces are never merged. Both SDKs mint a fresh `traceparent` per
+flush (zero-dependency by design, so the SDK's own span is never exported and shows as the missing parent).
+The module keeps its own `TracerProvider` rather than OpenTelemetry's set-once global, so tests can attach an
+in-memory exporter without depending on import order. Span emission can never raise into ingestion.
+**Verified live**: one event POSTed to the containerized API with a client `traceparent`, then fetched from
+Tempo by trace id -- 8 spans, one trace id, two services (`pulse-api` server span whose parent is the
+SDK-supplied span id, `ingest.buffer`, then across the stream `worker.process_event` -> `clickhouse.insert`).
+
+**Metrics + Grafana** (`pulse/observability/metrics.py`, `infra/observability/`). Prometheus instruments for
+exactly the signals SPEC names: ingest accepted, worker events by outcome (`poisoned` *is* the DLQ rate),
+batch size/duration, end-to-end landing delay, stream length / consumer lag / pending / DLQ depth, and API
+latency by route **template** (never the raw path -- cardinality). p50/p95/p99 come from Prometheus
+`histogram_quantile`, not the app. Served on a dedicated `METRICS_PORT` per process, never the public API
+port. `docker-compose.observability.yml` (a layered override, so the base stack is unchanged and the
+settings are genuinely unset without it) adds an OTel Collector, Tempo, Prometheus and Grafana with the
+datasources and the **Pulse - ingestion & query health** dashboard provisioned as code. Consumer lag is
+**derived** (`stream length - pending`) rather than read from `XINFO ... lag`, which goes null once entries
+are deleted from a stream -- reading null as 0 would report a healthy queue exactly when it isn't.
+
+**A real bug the dashboard caught on first use.** The stream-length panel read 5,000+ and only rose, with 0
+pending and 0 lag: `XACK` alone never removes an entry, so the ingest stream grew without bound (a Phase 7/8
+issue no test could see). It matters because the deployed Redis must be `noeviction` -- the stream is the only
+copy of an un-landed event, so an evicting policy silently deletes data -- and a full `noeviction` Redis fails
+`/ingest` permanently. `worker/consumer.py::ack` now acks **and** deletes in one MULTI/EXEC (safe: an acked
+entry is by construction already in ClickHouse or the DLQ, and the archive), with a regression test that
+also proves an un-acked entry is *kept*. Verified live: 180 events accepted, 180 landed, stream length 0.
+
+**Sentry** (`pulse/observability/sentry.py`). Initialized only when `SENTRY_DSN` is set. Privacy is configured,
+not defaulted: `max_request_body_size="never"`, `send_default_pii=False`, and -- found by checking the SDK's
+actual defaults rather than assuming -- `include_local_variables=False`, because the SDK captures every stack
+frame's locals by default and in this codebase a frame is where an event batch or password lives. Pinned by a
+test using a capturing transport (no account).
+
+**Migrations on deploy** (`pulse/migrate.py`). `python -m pulse.migrate` migrates Postgres (alembic) then
+ClickHouse, idempotently, failing fast, as one shell-free command (Render exec's docker commands without a
+shell). It is the API's `preDeployCommand`, so a bad migration fails the deploy and the previous version keeps
+serving.
+
+**Deploy configuration as code.** `infra/render/{staging,prod}.render.yaml` (compute only; validated against
+Render's published JSON schema, with a negative control proving the validator can fail) -- staging
+`autoDeployTrigger: checksPass`, prod `"off"` (quoted: an unquoted `off` is boolean `false` in YAML 1.1, which a
+test caught). `infra/terraform/` owns the data services and every secret (Render Postgres and Key Value,
+ClickHouse Cloud, an S3 bucket with a least-privilege IAM user) and writes the connection strings into a Render
+env group the Blueprints pull with `fromGroup` -- nothing committed or pasted; validated against the real
+Render, ClickHouse and AWS provider schemas. `.github/workflows/deploy-prod.yml` is manual-only: it refuses a
+commit CI hasn't passed, waits on a required-reviewer approval of the `production` GitHub Environment (the
+"one gated click"), then `infra/scripts/render_release.py` releases the **API first** (waiting until it is
+live, migrations applied) and only then the workers and frontend, aborting on any failure or timeout.
+
+**Full CI.** New `infra-validate` job (Terraform fmt/validate, Blueprint schema, both compose files), an
+advisory Trivy scan of the built image (advisory for the same reason as the dependency scan), and a pytest
+failure reporter that emits each failure as a `::error::` annotation -- GitHub step logs need a signed-in
+browser, annotations are readable without one.
+
+**Also found and fixed:** the backend Dockerfile copied source before `pip install`, so every code change
+re-installed every dependency (12+ minutes locally, the same cost per CI run); dependencies now have their own
+cached layer -- measured: cold build 1m25s, rebuild after a source change **9 seconds**.
+
+**Deliberately not done / not proven:** no live deploy against real accounts (config validated, not proven --
+expect first-deploy surprises); Render workers aren't scraped by Prometheus (the dashboards are proven locally,
+not in deployed environments); no remote Terraform state backend configured; image signing/SBOM; rollback
+automation; Prometheus multiprocess mode for a multi-worker API container.
+
+**Tests:** `test_observability.py` (12) -- the trace-continuity test (one trace id and the exact parent chain
+request -> `ingest.buffer` -> `worker.process_event` -> `clickhouse.insert` across the real Redis stream and
+ClickHouse), per-request trace separation within a mixed batch, untraced entries producing no spans,
+`traceparent` forwarding from a real `/ingest` request into the stream, worker outcome counters, landing
+delay/batch size, stream gauges, route-template labelling, the metrics server serving Prometheus text
+idempotently, and Sentry's no-op-without-DSN and privacy posture. `test_migrate.py` (4) -- ordering, fail-fast,
+and a real end-to-end run on the live databases plus an idempotent second run. `test_deploy_config.py` (24) --
+Blueprint parity, staging-auto/prod-gated policy, no plaintext secrets, real modules in every worker command,
+Terraform env-var names against real `Settings` fields, `noeviction`, the non-owner DB role, every dashboard
+metric actually exported, Prometheus targets matching the metrics-serving services, and the release script's
+ordering/failure/timeout behaviour with a fake Render client. Plus one stream-growth regression test in
+`test_worker.py`, one traceparent test in each SDK (JS 19, Python 8 pass), ruff / ruff format / mypy clean.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1581,10 +1669,13 @@ ClickHouse TTL -- see §6.20); ☑ PII allow/deny + hash/drop at ingest; ☑ use
 (advisory, see §6.20); ☑ threat model (`docs/THREAT_MODEL.md`). Tests: ☑ TTL expires data; ☑ deletion removes
 a subject's events; ☑ PII fields never reach ClickHouse; ☑ injection suite passes. See §6.20.
 
-**Phase 23 — Observability/CI-CD/deploy.** ☐ OTel trace SDK→API→buffer→worker→ClickHouse; ☐ Grafana:
-ingestion lag, batch size, events/sec, DLQ rate, query p50/95/99; ☐ Sentry; ☐ full CI; ☐ migrations-on-
-deploy (both stores); ☐ staging+prod on Render; ☐ IaC. DoD: merge→staging auto; prod one gated click; one
-trace follows an event end to end.
+**Phase 23 — Observability/CI-CD/deploy.** ☑ OTel trace SDK→API→buffer→worker→ClickHouse; ☑ Grafana:
+ingestion lag, batch size, events/sec, DLQ rate, query p50/95/99; ☑ Sentry (env-gated); ☑ full CI;
+☑ migrations-on-deploy (both stores); ◐ staging+prod on Render (Blueprints + workflows built and validated,
+**not applied** -- see §6.21); ◐ IaC (Terraform validated, not applied). DoD: ◐ merge→staging auto (configured
+via `autoDeployTrigger: checksPass`, not proven by a live deploy); ☑ prod one gated click (manual workflow +
+required-reviewer environment, release logic tested); ☑ one trace follows an event end to end (verified live
+in Tempo). **Phase 23 is not closed out** until a real deploy has exercised the staging/prod half.
 
 ---
 
@@ -2092,3 +2183,24 @@ trace follows an event end to end.
   `test_pii_enforcement.py` (11), `test_deletion.py` (9), `test_pii_rules_api.py` (6),
   `test_project_retention_api.py` (5). No frontend work this phase, same reasoning as Phase 21 -- the DoD is
   written purely in backend/API terms. ruff / ruff format / mypy (`pulse`, strict) all clean.
+- 2026-09-24 — Phase 23 — Added §6.21 (observability, CI/CD & deployment) and
+  updated the Phase 23 DoD **honestly as partial**: the trace, Grafana, Sentry, full-CI, migrations-on-deploy
+  and prod-gate items are ticked; staging/prod on Render, IaC and merge→staging-auto are ◐ (built and
+  validated, **not applied** -- no Render/ClickHouse Cloud/AWS account was created, by design), so Phase 23 is
+  *not closed out* until a real deploy has exercised that half. Three design forks confirmed with the user
+  first: build+validate rather than apply; self-hosted observability (OTel Collector + Tempo + Prometheus +
+  Grafana in a layered compose override); env-gated Sentry SDK. Highlights: W3C `traceparent` carried across
+  the Redis stream hop (per-event spans in per-request traces; both SDKs mint the trace id) -- verified live in
+  Tempo (8 spans, one trace id, `pulse-api` + `pulse-ingest-worker`); Prometheus metrics and a provisioned
+  Grafana dashboard covering the SPEC's named signals; Sentry with request bodies, PII and stack-frame locals
+  disabled (the SDK's `include_local_variables` default was on); `python -m pulse.migrate` as the API
+  `preDeployCommand`; Render Blueprints (staging `checksPass`, prod `"off"`), Terraform for data services and
+  secrets, a manual `deploy-prod.yml` behind a required-reviewer environment with an API-first release script;
+  new `infra-validate` CI job, advisory Trivy scan, and pytest-failure `::error::` annotations. **Real bug
+  found by the new dashboard:** `XACK` never deletes, so the ingest stream grew without bound (5,400+ entries
+  seen) -- fixed with ack+XDEL in one MULTI/EXEC plus a regression test. Also fixed: backend Dockerfile
+  reinstalled all dependencies on every source change (rebuild 12+ min → 9 s). Known open item: Phase 22's CI
+  run is red with an undiagnosed cause (backend `test` job); the new annotation reporter exists to make it
+  diagnosable once pushed. 41 new backend tests (368 → 409 passed, 1 skipped): `test_observability.py` (12),
+  `test_migrate.py` (4), `test_deploy_config.py` (24), +1 in `test_worker.py`; JS SDK 19 and Python SDK 8
+  tests pass. ruff / ruff format / mypy (`pulse`, strict) clean.

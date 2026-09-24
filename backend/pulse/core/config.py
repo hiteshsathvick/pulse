@@ -158,6 +158,24 @@ class Settings(BaseSettings):
     # Phase 22: retention (pulse/retention/). Mirrors alert_evaluation_interval_seconds.
     retention_sweep_interval_seconds: int = 3600
 
+    # Phase 23: observability (pulse/observability/). Every one of these
+    # defaults to "off" -- an unset value is a true no-op, the same
+    # convention as anthropic_api_key/stripe_secret_key, so a deployment
+    # (or CI, or a test) with none of this configured behaves exactly as it
+    # did before this phase existed.
+    #
+    # OTLP/HTTP endpoint of a collector (e.g. http://otel-collector:4318).
+    # Unset: spans are still created (so trace-context propagation through
+    # the Redis stream keeps working) but nothing is exported.
+    otel_exporter_otlp_endpoint: str | None = None
+    # Serves Prometheus /metrics from each worker process on this port.
+    # (The API serves /metrics on its own port, so it needs no setting.)
+    metrics_port: int | None = None
+    # Unset: sentry_sdk is never initialized -- no network, no capture.
+    sentry_dsn: str | None = None
+    sentry_environment: str = "development"
+    sentry_traces_sample_rate: float = 0.0
+
     # Phase 20: billing (pulse/billing/). Confirmed with the user first:
     # Stripe test mode needed a real account this session couldn't set up,
     # and a paid/external dependency wasn't wanted for this piece either --

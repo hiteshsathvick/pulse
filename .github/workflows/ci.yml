@@ -160,7 +160,14 @@ jobs:
 
       - name: Run backend tests
         working-directory: backend
-        run: pytest -v
+        run: pytest -v --junitxml=report.xml
+
+      # GitHub step logs need a signed-in browser; annotations don't. This
+      # keeps a red run's reason readable without a login.
+      - name: Annotate pytest failures
+        if: failure()
+        working-directory: backend
+        run: python ../.github/scripts/report_pytest_failures.py report.xml
 
   test-sdk-js:
     runs-on: ubuntu-latest
@@ -219,6 +226,41 @@ jobs:
         working-directory: packages/sdk-js
         run: npm ci && npm audit --audit-level=high || true
 
+  # Phase 23: the deploy configuration is code, so it is checked like code. None
+  # of this touches a cloud account -- it proves the Terraform, the Render
+  # Blueprints and the compose files are well-formed, which is what keeps a
+  # broken deploy config from being discovered at 2am during a real deploy.
+  infra-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: terraform fmt
+        working-directory: infra/terraform
+        run: terraform fmt -check -recursive
+      - name: terraform validate
+        working-directory: infra/terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Render Blueprints match Render's published schema
+        run: |
+          pip install check-jsonschema
+          check-jsonschema --schemafile https://render.com/schema/render.yaml.json infra/render/*.render.yaml
+
+      - name: Compose files render (base, and with the observability stack)
+        working-directory: infra/docker
+        run: |
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.observability.yml config -q
+
   test-sdk-python:
     runs-on: ubuntu-latest
     steps:
@@ -273,6 +315,16 @@ jobs:
 
       - name: Build backend image
         run: docker build -t pulse-backend:ci backend
+
+      # Advisory for the same reason dependency-scan is (docs/THREAT_MODEL.md):
+      # the known starlette CVEs have no resolvable fix yet, so a blocking gate
+      # would leave CI permanently red. It still prints the report every push,
+      # and continue-on-error covers the scanner's own vulnerability-DB download
+      # failing, which must not fail a build either.
+      - name: Scan backend image (Trivy, HIGH/CRITICAL)
+        continue-on-error: true
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock             aquasec/trivy:0.57.0 image --severity HIGH,CRITICAL --exit-code 0 pulse-backend:ci
 
       - uses: actions/setup-node@v4
         with:

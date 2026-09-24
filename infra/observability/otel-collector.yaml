@@ -1,0 +1,25 @@
+# Receives OTLP/HTTP from the API and workers (OTEL_EXPORTER_OTLP_ENDPOINT
+# points at :4318) and forwards traces to Tempo. A collector between the apps
+# and the backend, rather than apps -> Tempo directly, means swapping the
+# trace backend (Grafana Cloud, Jaeger, ...) is a change to this file only.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  otlp:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp]

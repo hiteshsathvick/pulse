@@ -1,0 +1,17 @@
+# Each Pulse process serves its own /metrics on a dedicated port (METRICS_PORT),
+# never on the public API port -- see pulse/observability/metrics.py.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: pulse-api
+    static_configs: [{ targets: ["api:9100"] }]
+  - job_name: pulse-ingest-worker
+    static_configs: [{ targets: ["ingest-worker:9100"] }]
+  - job_name: pulse-alert-worker
+    static_configs: [{ targets: ["alert-worker:9100"] }]
+  - job_name: pulse-billing-worker
+    static_configs: [{ targets: ["billing-worker:9100"] }]
+  - job_name: pulse-retention-worker
+    static_configs: [{ targets: ["retention-worker:9100"] }]

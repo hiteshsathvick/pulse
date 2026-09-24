@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 from pulse.core.config import get_settings
+from pulse.observability.setup import setup_observability
 from pulse.repositories import clickhouse
 from pulse.retention.service import sweep_all_projects
 
@@ -23,6 +24,7 @@ async def run_cycle() -> None:
 
 async def main() -> None:
     settings = get_settings()
+    setup_observability("pulse-retention-worker")
     logger.info(
         "retention-worker starting (interval=%ds)", settings.retention_sweep_interval_seconds
     )

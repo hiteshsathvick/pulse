@@ -1,0 +1,130 @@
+# Render Blueprint for the prod environment (Phase 23).
+#
+# Compute only: the API, the four background workers and the frontend. Every
+# data service (Postgres, Redis/Key Value, ClickHouse Cloud, S3) and every
+# secret is owned by infra/terraform, which writes the connection strings into
+# the Render environment group `pulse-prod-managed` that each service pulls in
+# with `fromGroup` -- so nothing sensitive is committed or pasted by hand.
+#
+# NEVER auto-deploys (autoDeployTrigger: off). Production is released only by the gated
+# `Deploy production` GitHub workflow (.github/workflows/deploy-prod.yml), which needs an
+# approval on the `production` environment -- the "one gated click".
+#
+# Create it in Render as a Blueprint pointing at THIS file (Render lets each
+# Blueprint use its own file path, which is how staging and prod coexist in one
+# repo). Names are prefixed with the environment so the two never collide.
+#
+# Do not edit one environment's file without the other: infra/render is kept in
+# lockstep by backend/tests/test_deploy_config.py.
+
+services:
+  # -- API ----------------------------------------------------------------------
+  - type: web
+    name: pulse-prod-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    branch: master
+    plan: standard
+    numInstances: 2
+    healthCheckPath: /health
+    autoDeployTrigger: "off"
+    # Both stores, Postgres then ClickHouse, before the new version takes any
+    # traffic. A failing migration fails the deploy and the previous version
+    # keeps serving. A Python module, not `a && b`: docker commands are exec'd
+    # without a shell.
+    preDeployCommand: python -m pulse.migrate
+    envVars:
+      - fromGroup: pulse-prod-managed
+      - key: PORT
+        value: "8000"
+      - key: SENTRY_ENVIRONMENT
+        value: prod
+      - key: SENTRY_DSN
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+
+  # -- Workers ------------------------------------------------------------------
+  - type: worker
+    name: pulse-prod-ingest-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.worker.main
+    branch: master
+    plan: standard
+    autoDeployTrigger: "off"
+    envVars:
+      - fromGroup: pulse-prod-managed
+      - key: SENTRY_ENVIRONMENT
+        value: prod
+      - key: SENTRY_DSN
+        sync: false
+      - key: OTEL_EXPORTER_OTLP_ENDPOINT
+        sync: false
+
+  - type: worker
+    name: pulse-prod-alert-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.alerts.main
+    branch: master
+    plan: standard
+    autoDeployTrigger: "off"
+    envVars:
+      - fromGroup: pulse-prod-managed
+      - key: SENTRY_ENVIRONMENT
+        value: prod
+      - key: SENTRY_DSN
+        sync: false
+
+  - type: worker
+    name: pulse-prod-billing-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.billing.main
+    branch: master
+    plan: standard
+    autoDeployTrigger: "off"
+    envVars:
+      - fromGroup: pulse-prod-managed
+      - key: SENTRY_ENVIRONMENT
+        value: prod
+      - key: SENTRY_DSN
+        sync: false
+
+  - type: worker
+    name: pulse-prod-retention-worker
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m pulse.retention.main
+    branch: master
+    plan: standard
+    autoDeployTrigger: "off"
+    envVars:
+      - fromGroup: pulse-prod-managed
+      - key: SENTRY_ENVIRONMENT
+        value: prod
+      - key: SENTRY_DSN
+        sync: false
+
+  # -- Frontend -----------------------------------------------------------------
+  - type: web
+    name: pulse-prod-frontend
+    runtime: docker
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    branch: master
+    plan: starter
+    autoDeployTrigger: "off"
+    envVars:
+      # The public API origin, baked into the browser bundle at build time.
+      - key: NEXT_PUBLIC_API_URL
+        sync: false
+      # Server-side rendering reaches the API over Render's private network.
+      - key: API_INTERNAL_URL
+        sync: false

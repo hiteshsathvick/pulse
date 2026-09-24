@@ -1,4 +1,5 @@
 import type { QueuedEvent } from "./buffer.js";
+import { generateTraceparent } from "./ids.js";
 
 export interface TransportOptions {
   apiHost: string;
@@ -22,6 +23,8 @@ export async function sendBatch(
       headers: {
         "Content-Type": "application/json",
         "X-API-Key": options.writeKey,
+        // One trace per flush: lets the server side follow this batch end to end.
+        traceparent: generateTraceparent(),
       },
       body: JSON.stringify({ batch: events }),
       keepalive,

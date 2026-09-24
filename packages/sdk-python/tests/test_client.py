@@ -83,3 +83,21 @@ def test_context_manager_flushes_on_exit() -> None:
         with PulseClient("pulse_write_x", "http://api.test") as client:
             client.capture("a", user_id="u1")
         urlopen.assert_called_once()
+
+
+def test_every_flush_sends_a_fresh_well_formed_traceparent() -> None:
+    import re
+
+    client = PulseClient("pulse_write_x", "http://api.test", flush_at_size=100)
+    seen: list[str] = []
+    for _ in range(2):
+        client.capture("a", user_id="u1")
+        with patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = MagicMock(status=202)
+            client.flush()
+        request = urlopen.call_args[0][0]
+        seen.append(request.get_header("Traceparent"))
+
+    for value in seen:
+        assert re.fullmatch(r"00-[0-9a-f]{32}-[0-9a-f]{16}-01", value)
+    assert seen[0] != seen[1]

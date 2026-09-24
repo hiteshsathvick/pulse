@@ -1,4 +1,5 @@
 import json
+import secrets
 import urllib.error
 import urllib.request
 import uuid
@@ -7,6 +8,16 @@ from types import TracebackType
 from typing import Any
 
 PropertyValue = str | float | bool | None
+
+
+def _traceparent() -> str:
+    """A W3C `traceparent` value (version 00, sampled). Zero runtime
+    dependencies is a property of this SDK, so it only originates the trace id
+    -- /ingest continues it and the ingest worker joins the same trace via the
+    Redis stream. The SDK's own span is never exported."""
+    trace_id = secrets.token_hex(16)
+    span_id = secrets.token_hex(8)
+    return f"00-{trace_id}-{span_id}-01"
 
 
 class PulseClient:
@@ -76,7 +87,11 @@ class PulseClient:
             f"{self._api_host}/ingest",
             data=payload,
             method="POST",
-            headers={"Content-Type": "application/json", "X-API-Key": self._write_key},
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": self._write_key,
+                "traceparent": _traceparent(),
+            },
         )
         try:
             urllib.request.urlopen(request, timeout=self._timeout_seconds)

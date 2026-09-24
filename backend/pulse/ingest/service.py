@@ -5,6 +5,7 @@ from redis.asyncio import Redis
 
 from pulse.ingest.schemas import IngestEvent
 from pulse.models import ApiKey
+from pulse.observability import tracing
 
 
 def _stream_fields(api_key: ApiKey, event: IngestEvent, received_at: datetime) -> dict[str, str]:
@@ -35,12 +36,25 @@ async def buffer_batch(
     once XADD returns, per SPEC.md #6's "the Ingest API returns 202 the
     instant the batch is buffered"."""
     received_at = datetime.now(UTC)
-    pipeline = client.pipeline(transaction=False)
-    for event in events:
-        # redis-py's xadd stub takes Dict[FieldT, EncodableT] (a union of
-        # several scalar types) rather than Mapping -- Dict is invariant, so
-        # our concrete dict[str, str] doesn't satisfy it even though every
-        # value we pass is a valid EncodableT.
-        pipeline.xadd(stream_key, _stream_fields(api_key, event, received_at))  # type: ignore[arg-type]
-    await pipeline.execute()
+    with tracing.tracer().start_as_current_span(
+        "ingest.buffer", attributes={"pulse.batch_size": len(events)}
+    ):
+        # Phase 23: the Redis stream is a process boundary HTTP-level trace
+        # propagation can't cross, so the current context rides along in
+        # each entry's own fields; the worker reads it back as the parent
+        # of its spans. Empty when nothing is tracing, which the worker
+        # treats as "not traced" -- never as an error.
+        trace_carrier: dict[str, str] = {}
+        tracing.inject_traceparent(trace_carrier)
+
+        pipeline = client.pipeline(transaction=False)
+        for event in events:
+            fields = _stream_fields(api_key, event, received_at)
+            fields.update(trace_carrier)
+            # redis-py's xadd stub takes Dict[FieldT, EncodableT] (a union of
+            # several scalar types) rather than Mapping -- Dict is invariant, so
+            # our concrete dict[str, str] doesn't satisfy it even though every
+            # value we pass is a valid EncodableT.
+            pipeline.xadd(stream_key, fields)  # type: ignore[arg-type]
+        await pipeline.execute()
     return len(events)

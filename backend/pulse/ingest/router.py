@@ -7,6 +7,7 @@ from pulse.core.config import get_settings
 from pulse.ingest.schemas import IngestBatchRequest, IngestBatchResponse
 from pulse.ingest.service import buffer_batch
 from pulse.models import ApiKey
+from pulse.observability.metrics import INGEST_ACCEPTED
 from pulse.repositories.redis import get_client
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -64,6 +65,7 @@ async def ingest(
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=quota.message)
 
     accepted = await buffer_batch(get_client(), settings.ingest_stream_key, api_key, body.batch)
+    INGEST_ACCEPTED.inc(accepted)
     return IngestBatchResponse(
         accepted=accepted,
         quota_warning=quota.message if quota.level == billing_service.QuotaLevel.SOFT else None,

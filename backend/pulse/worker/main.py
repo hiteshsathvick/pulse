@@ -2,6 +2,8 @@ import asyncio
 import logging
 
 from pulse.core.config import get_settings
+from pulse.observability.metrics import update_stream_gauges
+from pulse.observability.setup import setup_observability
 from pulse.repositories import clickhouse, object_storage
 from pulse.repositories import redis as redis_repo
 from pulse.services.pii_rules import get_rules_for_project
@@ -17,6 +19,12 @@ async def run_cycle() -> None:
     redis_client = redis_repo.get_client()
     clickhouse_client = await clickhouse.get_client()
 
+    await update_stream_gauges(
+        redis_client,
+        settings.ingest_stream_key,
+        settings.worker_consumer_group,
+        settings.worker_dlq_stream_key,
+    )
     entries = await read_batch(
         redis_client,
         settings.ingest_stream_key,
@@ -58,6 +66,7 @@ async def run_cycle() -> None:
 
 async def main() -> None:
     settings = get_settings()
+    setup_observability("pulse-ingest-worker")
     redis_client = redis_repo.get_client()
 
     await ensure_consumer_group(

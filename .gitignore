@@ -37,3 +37,14 @@ Thumbs.db
 # Phase 17 load tests: .bench.json holds API keys, the CSVs are raw locust output
 backend/loadtests/.bench.json
 backend/loadtests/results/*.csv
+
+# Terraform: provider plugins and, critically, STATE -- state files contain the
+# generated database/ClickHouse/IAM secrets in plain text and must never be
+# committed. (The lock file .terraform.lock.hcl IS committed, on purpose.)
+infra/terraform/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.secret.tfvars
+*.auto.tfvars
+crash.log

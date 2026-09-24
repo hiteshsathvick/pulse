@@ -31,6 +31,21 @@ describe("sendBatch", () => {
     );
   });
 
+  it("sends a fresh, well-formed W3C traceparent on every flush", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await sendBatch([event], { apiHost: "http://api.test", writeKey: "k" });
+    await sendBatch([event], { apiHost: "http://api.test", writeKey: "k" });
+
+    const values = fetchMock.mock.calls.map((call) => call[1].headers.traceparent as string);
+    for (const value of values) {
+      expect(value).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      expect(value).not.toMatch(/^00-0{32}-/);
+    }
+    expect(values[0]).not.toBe(values[1]);
+  });
+
   it("passes keepalive through for the unload path", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true });
     vi.stubGlobal("fetch", fetchMock);

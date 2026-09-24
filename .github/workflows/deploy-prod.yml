@@ -1,0 +1,97 @@
+name: Deploy production
+
+# Phase 23's "prod deploy is one gated click". Manual only -- nothing merges
+# into production by itself (the prod Blueprint has autoDeployTrigger: off).
+#
+# The gate is the `production` GitHub Environment: configure it under
+# Settings -> Environments -> production with "Required reviewers". The
+# `deploy` job below cannot start until a reviewer approves, so the one click
+# is that approval.
+#
+# One-time setup this workflow assumes (see docs/DEPLOYMENT.md):
+#   secrets.RENDER_API_KEY            a Render API key
+#   vars.RENDER_PROD_SERVICE_IDS      space-separated srv-... ids, the API FIRST
+#   vars.PROD_API_URL                 e.g. https://api.example.com (for the smoke check)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit SHA to release. Blank = the tip of master. Release a commit that already ran on staging."
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || 'master' }}
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Refuses to ship a commit CI hasn't passed -- checked before the approval
+  # prompt, so a reviewer is never asked to approve something already known bad.
+  verify-ci:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI must be green for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          conclusion=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$SHA" \
+            --status completed --json conclusion --jq '.[0].conclusion')
+          echo "CI conclusion for $SHA: ${conclusion:-none}"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error title=Refusing to deploy::CI has not passed for $SHA"
+            exit 1
+          fi
+
+  deploy:
+    needs: [resolve, verify-ci]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.PROD_API_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Release to Render (API first, then workers and frontend)
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          SERVICE_IDS: ${{ vars.RENDER_PROD_SERVICE_IDS }}
+        # SERVICE_IDS is intentionally unquoted so it word-splits into arguments.
+        run: python infra/scripts/render_release.py "$SHA" $SERVICE_IDS
+
+      - name: Smoke check
+        env:
+          PROD_API_URL: ${{ vars.PROD_API_URL }}
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$PROD_API_URL/health" || true)
+            echo "attempt $i: /health -> $code"
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error title=Smoke check failed::$PROD_API_URL/health never returned 200"
+          exit 1

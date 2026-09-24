@@ -1,0 +1,78 @@
+# Phase 23: opt-in observability stack. Layered on top of docker-compose.yml:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d --build
+#
+# Adds an OpenTelemetry Collector, Tempo (traces), Prometheus (metrics) and
+# Grafana (provisioned dashboard), and turns on OTLP export + a metrics port
+# for the API and every worker. A separate override file rather than a compose
+# "profile" because it also needs to set environment on services the base file
+# already defines -- and with this file absent, every one of those settings is
+# genuinely unset, not set-to-empty, so the base stack is unchanged.
+#
+# Grafana: http://localhost:3001 (anonymous Admin, bound to 127.0.0.1 -- this
+# is a local development stack, not something to expose).
+
+x-observability-env: &observability-env
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  METRICS_PORT: "9100"
+
+services:
+  api:
+    environment:
+      <<: *observability-env
+  ingest-worker:
+    environment:
+      <<: *observability-env
+  alert-worker:
+    environment:
+      <<: *observability-env
+  billing-worker:
+    environment:
+      <<: *observability-env
+  retention-worker:
+    environment:
+      <<: *observability-env
+
+  otel-collector:
+    image: otel/opentelemetry-collector:0.110.0
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ../observability/otel-collector.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - tempo
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ../observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "127.0.0.1:3200:3200"
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ../observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ../observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:3001:3000"
+    depends_on:
+      - prometheus
+      - tempo
+
+volumes:
+  tempo_data:

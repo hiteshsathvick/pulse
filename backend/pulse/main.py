@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from pulse.api.alerts import router as alerts_router
@@ -32,10 +33,14 @@ from pulse.core.error_handlers import (
 from pulse.core.logging import configure_logging
 from pulse.core.middleware import RequestIdMiddleware, SecurityHeadersMiddleware
 from pulse.ingest.router import router as ingest_router
+from pulse.observability.metrics import MetricsMiddleware
+from pulse.observability.setup import setup_observability
+from pulse.observability.tracing import get_provider
 from pulse.repositories import clickhouse, postgres
 from pulse.repositories import redis as redis_repo
 
 configure_logging()
+setup_observability("pulse-api")
 
 
 @asynccontextmanager
@@ -50,6 +55,7 @@ app = FastAPI(title="Pulse API", lifespan=lifespan)
 
 app.add_middleware(RequestIdMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(MetricsMiddleware)
 # Applied app-wide for simplicity rather than scoped to just /ingest --
 # Starlette's CORSMiddleware has no per-route scoping, and hand-rolling one
 # to avoid opening CORS on the JWT-bearer console endpoints would reinvent
@@ -88,3 +94,8 @@ app.include_router(webhooks_router)
 app.include_router(export_router)
 app.include_router(pii_rules_router)
 app.include_router(deletion_router)
+
+# Phase 23: after every router is registered. Reads an incoming `traceparent`
+# (an SDK's, or an upstream proxy's) and starts a server span from it; /health
+# is excluded so a load balancer's polling doesn't flood the trace backend.
+FastAPIInstrumentor.instrument_app(app, tracer_provider=get_provider(), excluded_urls="health")
