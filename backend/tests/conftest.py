@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import pytest
+import urllib3
 
 from pulse.repositories import clickhouse, object_storage, postgres
 from pulse.repositories import redis as redis_repo
@@ -13,8 +14,15 @@ def _archive_bucket() -> None:
     bucket must exist regardless of which test file runs first. It used to be
     created only inside test_worker.py, which passed locally (the bucket persisted
     in the MinIO volume) but failed on a fresh CI MinIO for every earlier file that
-    processes a batch. Minio's client is sync, so this is safe session-scoped."""
-    asyncio.run(object_storage.ensure_bucket())
+    processes a batch. Minio's client is sync, so this is safe session-scoped.
+
+    Tolerant of MinIO being unreachable: this runs for the whole session, so failing
+    here would fail even the static tests that never touch storage. A test that
+    genuinely needs the bucket still fails, with the real connection error."""
+    try:
+        asyncio.run(object_storage.ensure_bucket())
+    except (OSError, urllib3.exceptions.HTTPError):
+        pass
 
 
 @pytest.fixture(autouse=True)

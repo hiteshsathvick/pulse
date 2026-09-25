@@ -620,6 +620,12 @@ def test_the_python_dependency_audits_install_the_project_first_in_their_own_ven
     assert 'pip install -e ".[dev]"' in backend and 'pip install -e ".[dev]"' in sdk
     assert "/tmp/backend-venv" in backend and "/tmp/sdk-venv" in sdk
     assert "/tmp/backend-venv" not in sdk
+    # pip-audit audits pip itself, and the pip bundled with `python -m venv` had
+    # published advisories -- this failed the first real CI run. It must be
+    # upgraded before the audit, and the findings surfaced without a log sign-in.
+    for run in (backend, sdk):
+        assert run.index("pip install --upgrade pip") < run.index("pip-audit --skip-editable")
+        assert "::error title=pip-audit" in run
 
 
 def test_the_backend_image_installs_the_debian_security_updates() -> None:

@@ -136,9 +136,18 @@ jobs:
       # future upstream change can't silently break CI again.
       - name: Start MinIO
         run: |
+          # This step failed once with docker exit 125, before any test ran; the log
+          # wasn't readable, but a registry hiccup on the pull (quay.io) is the likely
+          # cause. Pull with retries, then start from the local image.
+          image=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          for attempt in 1 2 3 4; do
+            docker pull "$image" && break
+            [ "$attempt" = 4 ] && { echo "::error title=MinIO image pull failed::could not pull $image after 4 attempts"; exit 1; }
+            sleep $((attempt * 5))
+          done
           docker run -d --name minio -p 9002:9000 \
             -e MINIO_ROOT_USER=pulse -e MINIO_ROOT_PASSWORD=pulse12345 \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data
+            "$image" server /data
 
       - name: Wait for ClickHouse
         run: |
@@ -219,24 +228,62 @@ jobs:
         working-directory: backend
         run: |
           python -m venv /tmp/backend-venv
+          # `python -m venv` bundles whatever pip shipped with the interpreter, and
+          # pip-audit audits the whole environment, pip included. The bundled pip
+          # (25.0.1) had five published advisories fixed in 26.x, which failed this
+          # job -- so upgrade it before auditing.
+          /tmp/backend-venv/bin/pip install --upgrade pip
           /tmp/backend-venv/bin/pip install -e ".[dev]" pip-audit
-          /tmp/backend-venv/bin/pip-audit --skip-editable
+          # Findings are also emitted as an annotation: step logs need a GitHub
+          # sign-in to read, annotations do not.
+          if ! /tmp/backend-venv/bin/pip-audit --skip-editable > /tmp/audit.txt 2>&1; then
+            cat /tmp/audit.txt
+            echo "::error title=pip-audit (backend) found vulnerabilities::$(tr '\n' ' ' < /tmp/audit.txt | cut -c1-1500)"
+            exit 1
+          fi
+          cat /tmp/audit.txt
       - name: pip-audit (sdk-python)
         working-directory: packages/sdk-python
         run: |
           python -m venv /tmp/sdk-venv
+          # `python -m venv` bundles whatever pip shipped with the interpreter, and
+          # pip-audit audits the whole environment, pip included. The bundled pip
+          # (25.0.1) had five published advisories fixed in 26.x, which failed this
+          # job -- so upgrade it before auditing.
+          /tmp/sdk-venv/bin/pip install --upgrade pip
           /tmp/sdk-venv/bin/pip install -e ".[dev]" pip-audit
-          /tmp/sdk-venv/bin/pip-audit --skip-editable
+          # Findings are also emitted as an annotation: step logs need a GitHub
+          # sign-in to read, annotations do not.
+          if ! /tmp/sdk-venv/bin/pip-audit --skip-editable > /tmp/audit.txt 2>&1; then
+            cat /tmp/audit.txt
+            echo "::error title=pip-audit (sdk-python) found vulnerabilities::$(tr '\n' ' ' < /tmp/audit.txt | cut -c1-1500)"
+            exit 1
+          fi
+          cat /tmp/audit.txt
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
       - name: npm audit (frontend)
         working-directory: frontend
-        run: npm ci && npm audit --audit-level=high
+        run: |
+          npm ci
+          if ! npm audit --audit-level=high > /tmp/audit.txt 2>&1; then
+            cat /tmp/audit.txt
+            echo "::error title=npm audit (frontend) found vulnerabilities::$(tr '\n' ' ' < /tmp/audit.txt | cut -c1-1500)"
+            exit 1
+          fi
+          cat /tmp/audit.txt
       - name: npm audit (sdk-js)
         working-directory: packages/sdk-js
-        run: npm ci && npm audit --audit-level=high
+        run: |
+          npm ci
+          if ! npm audit --audit-level=high > /tmp/audit.txt 2>&1; then
+            cat /tmp/audit.txt
+            echo "::error title=npm audit (sdk-js) found vulnerabilities::$(tr '\n' ' ' < /tmp/audit.txt | cut -c1-1500)"
+            exit 1
+          fi
+          cat /tmp/audit.txt
 
   # Phase 23: the deploy configuration is code, so it is checked like code. None
   # of this touches a cloud account -- it proves the Terraform, the Render
