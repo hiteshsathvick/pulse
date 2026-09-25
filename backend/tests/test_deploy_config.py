@@ -651,3 +651,49 @@ def test_the_terraform_remote_state_example_is_opt_in_and_ignored() -> None:
     assert "infra/terraform/backend_override.tf" in (_ROOT / ".gitignore").read_text()
     # It is only an example: without the override, Terraform still uses local state.
     assert "backend " not in (_TERRAFORM / "versions.tf").read_text()
+
+
+# --- The object store (SeaweedFS replaced MinIO) ----------------------------------
+
+
+def _compose() -> dict[str, Any]:
+    data: dict[str, Any] = yaml.safe_load(
+        (_ROOT / "infra" / "docker" / "docker-compose.yml").read_text()
+    )
+    return data
+
+
+def test_the_object_store_image_is_pinned_and_the_same_in_compose_and_ci() -> None:
+    """MinIO's images stopped being pullable (quay.io answers 401), which turned CI
+    red. A floating tag would let the next upstream change do the same, and the
+    two places must not drift apart."""
+    image = _compose()["services"]["objectstore"]["image"]
+    assert ":" in image and not image.endswith(":latest"), image
+    ci_text = (_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    assert image in ci_text, "CI must run the same pinned object-store image as compose"
+    for path in (
+        _ROOT / ".github" / "workflows" / "ci.yml",
+        _ROOT / "infra" / "docker" / "docker-compose.yml",
+    ):
+        # Comments explain the history and may name the old image; code must not use it.
+        code = [line for line in path.read_text().splitlines() if not line.lstrip().startswith("#")]
+        assert not any("minio/minio" in line for line in code), f"{path.name} pulls dead MinIO"
+
+
+def test_the_unauthenticated_object_store_is_bound_to_loopback() -> None:
+    """It has no identities configured (unlike MinIO, which had credentials), so it
+    must never be reachable from the network."""
+    service = _compose()["services"]["objectstore"]
+    assert service["ports"], "expected a published port"
+    assert all(p.startswith("127.0.0.1:") for p in service["ports"]), service["ports"]
+    # Inside the container `localhost` resolves to IPv6, where the S3 port is not
+    # listening -- a healthcheck written with it reports a healthy store as unhealthy.
+    assert "127.0.0.1" in " ".join(service["healthcheck"]["test"])
+
+
+def test_services_that_use_the_object_store_wait_for_it_to_be_healthy() -> None:
+    services = _compose()["services"]
+    for name, service in services.items():
+        env = service.get("environment") or {}
+        if isinstance(env, dict) and "objectstore" in str(env.get("S3_ENDPOINT_URL", "")):
+            assert service["depends_on"]["objectstore"]["condition"] == "service_healthy", name

@@ -2332,3 +2332,19 @@ is verified locally, not on Render (§6.22). Phase 23's deploy half is still ope
   (`.gitattributes`). 46 new backend tests (409 -> 455 passed, 1 skipped); SDKs unchanged (JS 19, Python 8);
   ruff / ruff format / mypy (`pulse`, strict) clean. **Not proven:** anything on real Render, real-API rollback,
   DynamoDB locking.
+- 2026-09-25 — Phase 24 follow-up (CI, after the push) — The first CI run on Phase 24 failed and, with the new
+  annotation reporting, was diagnosable from the API alone. Two causes. (a) **The blocking `pip-audit` gate
+  caught a real finding on its first run:** `python -m venv` bundles pip 25.0.1, pip-audit audits the whole
+  environment including pip, and pip had five advisories fixed in 26.x -- reproduced locally, cleared by
+  upgrading pip first (both Python audit steps). Audit findings (pip and npm) are now emitted as `::error::`
+  annotations too. (b) **The object store could no longer be pulled:** quay.io began answering 401 to anonymous
+  pulls of `quay.io/minio/minio` (the Docker Hub repository was already gone in Phase 8's era), so the "Start
+  MinIO" step failed four pull attempts in a row -- not a flake, and invisible locally because machines with a
+  cached copy kept working. Replaced with a pinned `chrislusf/seaweedfs:4.47` (a maintained real S3
+  implementation) in both compose (service `objectstore`, bound to loopback because it is unauthenticated) and
+  CI, after running the archive/erasure/deletion/worker tests against it (27 passed) and then the full suite
+  (458 passed, 1 skipped). Two things found on the way: `localhost` inside the container resolves to IPv6 so the healthcheck must
+  use 127.0.0.1, and my Phase 22 session-wide bucket fixture failed even static tests when the store was down
+  (now tolerant). New guard tests keep the image pinned and identical in compose and CI, keep the store
+  loopback-bound, and keep `minio/minio` out of code. The `phase-24-complete` tag was created on the red commit
+  and has not been moved.

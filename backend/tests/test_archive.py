@@ -1,6 +1,7 @@
 """Phase 24: the raw event archive's tenant-partitioned layout and GDPR subject
-erasure (pulse/archive.py). Real MinIO, no other store -- every test uses its own
-random org/project UUIDs so it only ever looks at its own prefix."""
+erasure (pulse/archive.py). Real S3-compatible object store (SeaweedFS), no other
+store -- every test uses its own random org/project UUIDs so it only ever looks at
+its own prefix."""
 
 import json
 import uuid

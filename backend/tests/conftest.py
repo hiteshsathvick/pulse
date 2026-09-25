@@ -13,10 +13,10 @@ def _archive_bucket() -> None:
     """Any test that runs a worker batch writes to the raw-event archive, so the
     bucket must exist regardless of which test file runs first. It used to be
     created only inside test_worker.py, which passed locally (the bucket persisted
-    in the MinIO volume) but failed on a fresh CI MinIO for every earlier file that
+    in the object store's volume) but failed on a fresh CI object store for every earlier file that
     processes a batch. Minio's client is sync, so this is safe session-scoped.
 
-    Tolerant of MinIO being unreachable: this runs for the whole session, so failing
+    Tolerant of the object store being unreachable: this runs for the whole session, so failing
     here would fail even the static tests that never touch storage. A test that
     genuinely needs the bucket still fails, with the real connection error."""
     try:

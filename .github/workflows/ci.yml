@@ -122,32 +122,25 @@ jobs:
         working-directory: backend
         run: pip install -e .[dev]
 
-      # Not a `services:` container -- those can't override a container's
-      # command, and the official minio/minio image needs `server /data`
-      # passed explicitly or it never starts serving. Missing since this job
-      # was first written; Phase 8/9's worker tests (object-storage
-      # archiving) need it and were silently unexercised in CI until now.
+      # Not a `services:` container -- those can't override a container's command,
+      # and this image needs `server -s3 -dir=/data` passed explicitly.
       #
-      # Two things that made this step fail (exit 125) on every run: the
-      # `minio/minio` Docker Hub repository no longer exists (MinIO publishes
-      # to quay.io now), and host port 9000 is already taken by the ClickHouse
-      # service's native port -- the same clash the local compose file avoids
-      # by publishing MinIO on 9002. The tag is pinned, not `latest`, so a
-      # future upstream change can't silently break CI again.
-      - name: Start MinIO
+      # The object store is SeaweedFS, pinned. It replaced MinIO when quay.io began
+      # answering 401 to anonymous pulls of quay.io/minio/minio (the `minio/minio`
+      # Docker Hub repository was already gone), which failed this step on the first
+      # run after the change: four pull attempts in a row, so not a flake. The S3 API
+      # listens on 8333 and is published on 9002 to match the app's default
+      # S3_ENDPOINT_URL (host 9000 is ClickHouse's native port). No identities are
+      # configured, so it is unauthenticated -- fine for an ephemeral runner.
+      - name: Start object store
         run: |
-          # This step failed once with docker exit 125, before any test ran; the log
-          # wasn't readable, but a registry hiccup on the pull (quay.io) is the likely
-          # cause. Pull with retries, then start from the local image.
-          image=quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+          image=chrislusf/seaweedfs:4.47
           for attempt in 1 2 3 4; do
             docker pull "$image" && break
-            [ "$attempt" = 4 ] && { echo "::error title=MinIO image pull failed::could not pull $image after 4 attempts"; exit 1; }
+            [ "$attempt" = 4 ] && { echo "::error title=Object store image pull failed::could not pull $image after 4 attempts"; exit 1; }
             sleep $((attempt * 5))
           done
-          docker run -d --name minio -p 9002:9000 \
-            -e MINIO_ROOT_USER=pulse -e MINIO_ROOT_PASSWORD=pulse12345 \
-            "$image" server /data
+          docker run -d --name objectstore -p 9002:8333 "$image" server -s3 -dir=/data
 
       - name: Wait for ClickHouse
         run: |
@@ -158,13 +151,14 @@ jobs:
           echo "ClickHouse never became ready" >&2
           exit 1
 
-      - name: Wait for MinIO
+      - name: Wait for object store
         run: |
           for i in $(seq 1 30); do
-            curl -sf http://localhost:9002/minio/health/live && exit 0
+            curl -sf http://localhost:9002/ >/dev/null && exit 0
             sleep 2
           done
-          echo "MinIO never became ready" >&2
+          echo "The object store never became ready" >&2
+          docker logs objectstore >&2 || true
           exit 1
 
       - name: Run backend tests

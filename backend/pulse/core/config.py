@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     worker_dedup_ttl_seconds: int = 86_400
     worker_dlq_stream_key: str = "pulse:ingest:dlq"
 
-    # Object storage (MinIO locally / S3-compatible in prod) -- the raw
+    # Object storage (SeaweedFS locally / S3-compatible in prod) -- the raw
     # per-batch archive, per SPEC.md #6.7. Access/secret reuse the same
     # dev-only credentials as every other store in this file.
     s3_endpoint_url: str = "http://localhost:9002"

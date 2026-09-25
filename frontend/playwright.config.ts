@@ -7,7 +7,7 @@ export default defineConfig({
   reporter: "list",
   use: {
     // No `webServer` here: this app needs the whole docker-compose stack
-    // (postgres/redis/clickhouse/minio/api) up and healthy, not just
+    // (postgres/redis/clickhouse/objectstore/api) up and healthy, not just
     // `next dev` on its own -- start both separately before running these
     // (`docker compose up -d` for the stack, `npm run dev` for the
     // frontend), matching this phase's "local-only for now" scope for
