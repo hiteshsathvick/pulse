@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, model_validator
 from pulse.api.dependencies import require_role
 from pulse.models import Membership, MembershipRole
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
+from pulse.repositories.redis import get_client as get_redis_client
 from pulse.services import deletion as deletion_service
 from pulse.services import projects as projects_service
 
@@ -53,6 +54,7 @@ async def delete_subject(
     clickhouse_client = await get_clickhouse_client()
     report = await deletion_service.delete_subject(
         clickhouse_client,
+        get_redis_client(),
         membership.org_id,
         project_id,
         membership.user_id,

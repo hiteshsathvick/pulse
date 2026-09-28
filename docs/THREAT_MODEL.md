@@ -107,25 +107,34 @@ this codebase ever interpolates such a value into SQL, a shell command, or a tru
 
 ## Residual risks — open, not hidden
 
-- **GDPR subject deletion now reaches every store, with three scope limits left** (Phase 24 closed the
-  ClickHouse-`events`-only gap that Phase 22 documented). One call removes the subject from `events`,
-  recomputes the touched `event_hourly` buckets from what remains (a unique-users sketch can't have one user
-  subtracted, but a bucket can be rebuilt -- scoped, so it needs neither the global `rebuild` nor stopped
-  ingestion; a concurrent-ingest double count is detected by an exact event-count comparison and the repair
-  re-run, and a repair that can't converge fails loudly rather than reporting success), and rewrites the raw
-  archive without the subject's entries (the archive is now partitioned per org/project, so this reads one
-  project's prefix; objects from the old tenant-mixed layout are still scanned). What is still **not**
-  covered: (1) an event the API has *accepted* but the worker has not yet landed sits in the Redis stream and
-  will land after the deletion -- a deletion is a point-in-time act, not a block on future events with that
-  id; (2) archive entries whose org/project could not be parsed (poison entries with garbage tenant fields)
-  live under `raw/_unattributed/` and cannot be tied to a tenant, so erasure leaves them; (3) backups and
-  point-in-time copies of ClickHouse/Postgres/S3 are outside the application's reach. An archive object that
-  cannot be read is reported in the response (`unreadable_objects`), never silently skipped.
-- **PII rules still don't protect the raw batch archive** -- a dropped or hashed property is kept out of
-  ClickHouse and the schema registry, but the original raw JSON (before any Phase 22 transform) still lands
-  in object storage as Phase 8 always intended it to (the "replay/backfill source of truth"). Subject
-  *deletion* now reaches the archive; property-level PII *rules* do not. A customer relying on PII rules for
-  full compliance needs to know this boundary exists.
+- **GDPR subject deletion now reaches every store, including events already in flight** (Phase 24 closed the
+  ClickHouse-`events`-only gap Phase 22 documented; Phase 25 closed the in-flight-event gap Phase 24 itself
+  left open). One call removes the subject from `events`, recomputes the touched `event_hourly` buckets from
+  what remains (a unique-users sketch can't have one user subtracted, but a bucket can be rebuilt -- scoped,
+  so it needs neither the global `rebuild` nor stopped ingestion; a concurrent-ingest double count is
+  detected by an exact event-count comparison and the repair re-run, and a repair that can't converge fails
+  loudly rather than reporting success), rewrites the raw archive without the subject's entries (partitioned
+  per org/project, so this reads one project's prefix; objects from the old tenant-mixed layout are still
+  scanned), and -- as of Phase 25 -- suppresses the identity in Redis (`pulse/suppression.py`) *before*
+  touching any store, so an event for that subject already accepted by `/ingest` but not yet landed by the
+  worker is dropped rather than reintroducing what was just erased. What is still **not** covered: (1)
+  suppression is bounded, not permanent (`Settings.subject_suppression_ttl_seconds`, default 24h) -- a worker
+  outage longer than that window could let a very late event through after all, a documented trade-off
+  against the alternative of an ever-growing suppression list (the exact unbounded-growth shape Phase 23's
+  stream bug already showed the cost of); (2) archive entries whose org/project could not be parsed (poison
+  entries with garbage tenant fields) live under `raw/_unattributed/` and cannot be tied to a tenant, so
+  neither erasure nor suppression reaches them; (3) backups and point-in-time copies of
+  ClickHouse/Postgres/S3 are outside the application's reach. An archive object that cannot be read is
+  reported in the response (`unreadable_objects`), never silently skipped.
+- **PII rules now protect the raw archive too, retroactively** (Phase 25 closed the gap Phase 24 left open).
+  Creating a rule (`pulse/services/pii_rules.py::create_pii_rule`) scrubs the property from the project's
+  already-archived events, not just events ingested from then on -- the same drop/hash logic
+  (`pulse/pii.py`) the worker already applied live at ingest since Phase 22. The rewrite is **best-effort**:
+  it runs after the rule row is committed, so a total object-storage outage during the rewrite still leaves
+  the rule created and enforced going forward, just not retroactively (the API reports `archive_rewrite:
+  null` rather than pretending it happened; per-object *read* failures inside an otherwise-successful
+  rewrite are counted in `unreadable_objects`, not swallowed). Deleting a rule does not un-scrub anything --
+  a hash is one-way and a drop is destructive, so there is nothing to restore.
 - **`pii_hash_secret` has an insecure default** (`dev-insecure-pii-hash-secret-change-me`, matching
   `jwt_secret`'s own convention) — fine for dev/CI, a real deployment must set a real one via `.env`, same
   operational requirement as every other secret this app has.

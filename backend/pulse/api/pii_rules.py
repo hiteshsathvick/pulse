@@ -24,6 +24,19 @@ class PiiRuleResponse(BaseModel):
     created_at: datetime
 
 
+class ArchiveRewriteSummary(BaseModel):
+    entries_scrubbed: int
+    objects_rewritten: int
+    unreadable_objects: int
+
+
+class CreatePiiRuleResponse(PiiRuleResponse):
+    # None only if the retroactive archive rewrite failed outright (e.g. the
+    # object store was unreachable) -- the rule itself was still created and
+    # is enforced for new events either way; see docs/THREAT_MODEL.md.
+    archive_rewrite: ArchiveRewriteSummary | None
+
+
 def _rule_response(rule: PiiRule) -> PiiRuleResponse:
     return PiiRuleResponse(
         id=rule.id, property_key=rule.property_key, action=rule.action, created_at=rule.created_at
@@ -35,15 +48,15 @@ async def _require_project_in_org(org_id: uuid.UUID, project_id: uuid.UUID) -> N
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
 
-@router.post("", response_model=PiiRuleResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=CreatePiiRuleResponse, status_code=status.HTTP_201_CREATED)
 async def create_pii_rule(
     project_id: uuid.UUID,
     body: CreatePiiRuleRequest,
     membership: Membership = Depends(require_role(MembershipRole.ADMIN)),
-) -> PiiRuleResponse:
+) -> CreatePiiRuleResponse:
     await _require_project_in_org(membership.org_id, project_id)
     try:
-        rule = await pii_rules_service.create_pii_rule(
+        rule, rewrite_report = await pii_rules_service.create_pii_rule(
             membership.org_id, project_id, body.property_key, body.action, membership.user_id
         )
     except pii_rules_service.DuplicatePiiRule as exc:
@@ -51,7 +64,22 @@ async def create_pii_rule(
             status_code=status.HTTP_409_CONFLICT,
             detail="A rule for this property already exists on this project",
         ) from exc
-    return _rule_response(rule)
+    summary = (
+        ArchiveRewriteSummary(
+            entries_scrubbed=rewrite_report.entries_changed,
+            objects_rewritten=rewrite_report.objects_rewritten,
+            unreadable_objects=rewrite_report.unreadable,
+        )
+        if rewrite_report is not None
+        else None
+    )
+    return CreatePiiRuleResponse(
+        id=rule.id,
+        property_key=rule.property_key,
+        action=rule.action,
+        created_at=rule.created_at,
+        archive_rewrite=summary,
+    )
 
 
 @router.get("", response_model=list[PiiRuleResponse])

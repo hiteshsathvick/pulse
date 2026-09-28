@@ -23,6 +23,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from pulse import pii
+from pulse.models import PiiAction
 from pulse.repositories import object_storage
 
 logger = logging.getLogger("pulse.archive")
@@ -143,4 +145,69 @@ async def erase_subject(
         objects_rewritten=rewritten,
         objects_deleted=deleted,
         unreadable=unreadable,
+    )
+
+
+@dataclass(frozen=True)
+class RewriteReport:
+    entries_changed: int
+    objects_rewritten: int
+    # Same meaning as ErasureReport.unreadable: an object that could not be
+    # read or parsed, so it was left as-is rather than guessed at. Reported,
+    # never silently skipped -- it might still hold the property un-scrubbed.
+    unreadable: int
+
+
+async def apply_pii_rules(
+    org_id: uuid.UUID, project_id: uuid.UUID, rules: dict[str, PiiAction], secret: str
+) -> RewriteReport:
+    """Retroactively applies newly created PII rules to this project's
+    already-archived events -- called once, right after a rule is created
+    (pulse/services/pii_rules.py), so "protect this property" means the same
+    thing for the archive as it already meant for ClickHouse and the schema
+    registry (pulse/worker/processing.py::apply_pii_rules enforces the same
+    rules going forward, at ingest). `pulse/pii.py` holds the one drop/hash
+    implementation both paths use.
+
+    Scans this project's own prefix plus legacy tenant-mixed objects, exactly
+    like `erase_subject`, and re-checks the tenant per entry so a legacy
+    object's other tenants are never touched. An object where nothing changed
+    is left alone (not rewritten), so an archive with no matching property in
+    it costs a read, not a write, when a rule is created."""
+    keys = await object_storage.list_keys(tenant_prefix(org_id, project_id))
+    keys += await _legacy_keys()
+
+    entries_changed = objects_rewritten = unreadable = 0
+    for key in keys:
+        try:
+            entries = json.loads(await object_storage.get_bytes(key))
+            if not isinstance(entries, list):
+                raise ValueError("archive object is not a list")
+        except Exception:
+            logger.exception("archive object %s could not be read for PII rewrite", key)
+            unreadable += 1
+            continue
+
+        object_changed = False
+        for entry in entries:
+            if not isinstance(entry, dict) or _tenant_of(entry) != (org_id, project_id):
+                continue
+            try:
+                properties = json.loads(entry.get("properties") or "{}")
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(properties, dict):
+                continue
+            scrubbed, changed = pii.apply_to_archived_properties(properties, rules, secret)
+            if changed:
+                entry["properties"] = json.dumps(scrubbed)
+                entries_changed += 1
+                object_changed = True
+
+        if object_changed:
+            await object_storage.put_object(key, json.dumps(entries).encode())
+            objects_rewritten += 1
+
+    return RewriteReport(
+        entries_changed=entries_changed, objects_rewritten=objects_rewritten, unreadable=unreadable
     )

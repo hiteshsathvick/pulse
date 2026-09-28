@@ -20,6 +20,7 @@ from pulse.events.fixtures import generate_fake_event
 from pulse.events.repository import insert_events
 from pulse.query.rollup import SKETCH_PRECISION
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
+from pulse.repositories.redis import get_client as get_redis_client
 from pulse.rollups import maintenance
 from pulse.services import deletion as deletion_service
 from tests.clickhouse_schema import drop_event_schema
@@ -110,7 +111,9 @@ async def test_the_rollup_no_longer_counts_a_deleted_subject() -> None:
     assert before[("page view", h0)] == (3, 2)
     assert before[("signup", h0)] == (1, 1)
 
-    report = await deletion_service.delete_subject(client, org, project, actor, user_id="alice")
+    report = await deletion_service.delete_subject(
+        client, get_redis_client(), org, project, actor, user_id="alice"
+    )
 
     after = await _rollup(client, org, project)
     assert after[("page view", h0)] == (1, 1)  # alice's two events and her user are gone
@@ -136,7 +139,9 @@ async def test_another_projects_rollup_is_left_alone() -> None:
         ],
     )
 
-    await deletion_service.delete_subject(client, org_a, project_a, actor, user_id="shared")
+    await deletion_service.delete_subject(
+        client, get_redis_client(), org_a, project_a, actor, user_id="shared"
+    )
 
     assert await _rollup(client, org_b, project_b) == {("page view", hour): (2, 1)}
 
@@ -183,7 +188,14 @@ async def test_an_event_landing_mid_repair_is_detected_and_the_repair_converges(
         await insert_events(real, [_event(org, project, "carol", "page view", hour)])
 
     racing = _RacingClient(real, late_event_lands)
-    report = await deletion_service.delete_subject(racing, org, project, actor, user_id="alice")  # type: ignore[arg-type]
+    report = await deletion_service.delete_subject(
+        racing,  # type: ignore[arg-type]
+        get_redis_client(),
+        org,
+        project,
+        actor,
+        user_id="alice",
+    )
 
     assert report.rollup_verified is True
     # Two recompute passes: the first double-counted the late event, was caught,

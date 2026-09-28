@@ -143,7 +143,9 @@ async def test_delete_subject_removes_only_the_matching_user_id() -> None:
         ],
     )
 
-    await deletion_service.delete_subject(ch_client, org_id, project_id, actor_id, user_id="alice")
+    await deletion_service.delete_subject(
+        ch_client, get_redis_client(), org_id, project_id, actor_id, user_id="alice"
+    )
     await ch_client.command("OPTIMIZE TABLE events FINAL")
 
     remaining = await query_events(ch_client, org_id, project_id, limit=100)
@@ -165,7 +167,7 @@ async def test_delete_subject_by_anonymous_id() -> None:
     )
 
     await deletion_service.delete_subject(
-        ch_client, org_id, project_id, actor_id, anonymous_id=anon
+        ch_client, get_redis_client(), org_id, project_id, actor_id, anonymous_id=anon
     )
     await ch_client.command("OPTIMIZE TABLE events FINAL")
 
@@ -180,7 +182,9 @@ async def test_delete_subject_never_leaks_across_tenants() -> None:
     await insert_events(ch_client, [generate_fake_event(org_a, project_a, user_id="shared_id")])
     await insert_events(ch_client, [generate_fake_event(org_b, project_b, user_id="shared_id")])
 
-    await deletion_service.delete_subject(ch_client, org_a, project_a, actor_a, user_id="shared_id")
+    await deletion_service.delete_subject(
+        ch_client, get_redis_client(), org_a, project_a, actor_a, user_id="shared_id"
+    )
     await ch_client.command("OPTIMIZE TABLE events FINAL")
 
     assert await query_events(ch_client, org_a, project_a, limit=100) == []
@@ -191,7 +195,9 @@ async def test_no_identifier_raises_without_touching_clickhouse() -> None:
     org_id, project_id, actor_id = await _create_org_and_project()
     ch_client = await get_clickhouse_client()
     with pytest.raises(deletion_service.NoIdentifierGiven):
-        await deletion_service.delete_subject(ch_client, org_id, project_id, actor_id)
+        await deletion_service.delete_subject(
+            ch_client, get_redis_client(), org_id, project_id, actor_id
+        )
 
 
 async def test_delete_subject_writes_an_audit_log_entry() -> None:
@@ -199,7 +205,9 @@ async def test_delete_subject_writes_an_audit_log_entry() -> None:
     ch_client = await get_clickhouse_client()
     await insert_events(ch_client, [generate_fake_event(org_id, project_id, user_id="dana")])
 
-    await deletion_service.delete_subject(ch_client, org_id, project_id, actor_id, user_id="dana")
+    await deletion_service.delete_subject(
+        ch_client, get_redis_client(), org_id, project_id, actor_id, user_id="dana"
+    )
 
     async with session_scope(org_id=org_id) as session:
         rows = list(
@@ -259,7 +267,7 @@ async def test_a_deletion_reaches_events_the_rollup_and_the_archive_together() -
     ]
 
     report = await deletion_service.delete_subject(
-        ch_client, org_id, project_id, actor_id, user_id="erasure-alice"
+        ch_client, redis_client, org_id, project_id, actor_id, user_id="erasure-alice"
     )
     await ch_client.command("OPTIMIZE TABLE events FINAL")
 
@@ -280,6 +288,119 @@ async def test_a_deletion_reaches_events_the_rollup_and_the_archive_together() -
 async def _archive_objects(org_id: uuid.UUID, project_id: uuid.UUID) -> dict[str, list[Any]]:
     keys = await object_storage.list_keys(archive.tenant_prefix(org_id, project_id))
     return {key: json.loads(await object_storage.get_bytes(key)) for key in keys}
+
+
+async def test_an_event_already_in_the_stream_when_deletion_runs_does_not_reappear() -> None:
+    """Phase 25 DoD: the gap Phase 24 documented as still open -- an event the
+    API had already accepted into the stream, but the worker had not yet
+    landed, used to reappear after delete_subject returned, reintroducing
+    exactly the data that was just erased. Simulated here as an event that
+    lands in the SAME stream, processed by the SAME real worker, AFTER
+    delete_subject has already run for that identity -- the closest a test
+    without real concurrency can get to "already buffered when deletion ran"."""
+    org_id, project_id, actor_id = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    redis_client = get_redis_client()
+    stream_key = f"test:suppression:{uuid.uuid4().hex[:8]}"
+    group = f"g-{uuid.uuid4().hex[:8]}"
+    await ensure_consumer_group(redis_client, stream_key, group)
+    settings = get_settings()
+
+    def fields(user: str) -> dict[str, str]:
+        now = datetime.now(UTC).isoformat()
+        return {
+            "org_id": str(org_id),
+            "project_id": str(project_id),
+            "event_id": str(uuid.uuid4()),
+            "event_name": "checkout completed",
+            "user_id": user,
+            "anonymous_id": "",
+            "timestamp": now,
+            "received_at": now,
+            "properties": json.dumps({"plan": "pro"}),
+        }
+
+    # An event lands and is fully processed first -- there is real data to erase.
+    await redis_client.xadd(stream_key, fields("racer"))
+    first_batch = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    await process_batch(
+        redis_client=redis_client,
+        clickhouse_client=ch_client,
+        entries=first_batch,
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+    )
+
+    await deletion_service.delete_subject(
+        ch_client, redis_client, org_id, project_id, actor_id, user_id="racer"
+    )
+
+    # The racing event: as far as this identity is concerned, indistinguishable
+    # from one that was already sitting in the stream when the deletion ran.
+    await redis_client.xadd(stream_key, fields("racer"))
+    second_batch = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    result = await process_batch(
+        redis_client=redis_client,
+        clickhouse_client=ch_client,
+        entries=second_batch,
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+    )
+
+    assert result.suppressed == 1
+    assert result.processed == 0
+    await ch_client.command("OPTIMIZE TABLE events FINAL")
+    assert await query_events(ch_client, org_id, project_id, limit=100) == []
+    assert await _archive_objects(org_id, project_id) == {}
+    # The batch was still ack'd -- a suppressed entry must never jam the stream.
+    assert result.acked == 1
+
+
+async def test_suppression_never_touches_a_different_identity_in_the_same_project() -> None:
+    org_id, project_id, actor_id = await _create_org_and_project()
+    ch_client = await get_clickhouse_client()
+    redis_client = get_redis_client()
+    stream_key = f"test:suppression:{uuid.uuid4().hex[:8]}"
+    group = f"g-{uuid.uuid4().hex[:8]}"
+    await ensure_consumer_group(redis_client, stream_key, group)
+    settings = get_settings()
+
+    await deletion_service.delete_subject(
+        ch_client, redis_client, org_id, project_id, actor_id, user_id="suppressed-only"
+    )
+
+    now = datetime.now(UTC).isoformat()
+    await redis_client.xadd(
+        stream_key,
+        {
+            "org_id": str(org_id),
+            "project_id": str(project_id),
+            "event_id": str(uuid.uuid4()),
+            "event_name": "checkout completed",
+            "user_id": "untouched",
+            "anonymous_id": "",
+            "timestamp": now,
+            "received_at": now,
+            "properties": json.dumps({}),
+        },
+    )
+    entries = await read_batch(redis_client, stream_key, group, "c1", count=10, block_ms=100)
+    result = await process_batch(
+        redis_client=redis_client,
+        clickhouse_client=ch_client,
+        entries=entries,
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+    )
+
+    assert result.suppressed == 0
+    assert result.processed == 1
 
 
 # --- API RBAC ---

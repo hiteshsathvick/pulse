@@ -1669,6 +1669,105 @@ regression), CI gates staying blocking, Dockerfile COPY sources existing, and ni
 before triggering, rollback order, settle-before-rollback, failed rollback, first release, no-hang timeout, and
 the HTTP client's parsing).
 
+### 6.23 Closing the remaining GDPR/PII gaps mechanism (Phase 25)
+
+Not a numbered phase in the original roadmap: after Phase 24 the user asked for a Phase 25. The interrupting
+design-fork question got cut off mid-session before an answer came back, so -- running in auto-mode, which
+says to make the reasonable call and keep going rather than stall -- both forks were resolved to their
+recommended option (confirmed retroactively, not pre-approved): scrub the archive on write AND rewrite it
+retroactively when a rule is created; build the subject-deletion UI only, not a PII-rules UI, this phase.
+Two of §6.22's own "still not covered" items, closed.
+
+**1. In-flight events no longer reappear after a deletion** (`pulse/suppression.py`, wired into
+`pulse/services/deletion.py::delete_subject` and `pulse/worker/processing.py::process_batch`). The gap: an
+event already accepted by `/ingest` but not yet landed by the worker used to land anyway, after the deletion
+had already run, reintroducing exactly the data that was just erased. `delete_subject` now suppresses the
+identity in Redis (one key per identifier, `SET ... EX`) as its very first act, before the ClickHouse
+mutation, the rollup repair or the archive erasure -- so anything racing in during the rest of the call is
+caught too. The worker checks it right after a successful parse, before archiving or inserting; a suppressed
+entry is ack'd like everything else (so it can never jam the batch) but neither archived nor inserted, and
+counted under a new `suppressed` outcome (`BatchResult.suppressed`, `pulse_worker_events_total{outcome="suppressed"}`).
+**Design fork, resolved without a round-trip:** the alternative to a bounded TTL (`Settings.subject_suppression_ttl_seconds`,
+default 24h, matching the existing ingest-dedup TTL) was to suppress forever -- rejected on the same grounds
+as Phase 23's own stream-growth bug: an ever-growing suppression key set is the identical shape of problem.
+Documented honestly as a residual limit, not a solved one: a worker outage longer than the window could still
+let a very late event through.
+
+**2. PII rules now protect the archive, both retroactively and going forward** (new `pulse/pii.py`,
+`pulse/archive.py::apply_pii_rules`, `pulse/services/pii_rules.py::create_pii_rule`). Phase 22 enforced rules
+against ClickHouse and the registry only; Phase 24 gave subject *deletion* reach into the archive but left
+PII *rules* not reaching it at all. `pulse/pii.py` is a new leaf module holding the drop/hash primitives
+(`stringify_properties`, `hash_value`) both the worker's live enforcement and the archive path now use --
+but `apply_to_archived_properties` is a deliberately **separate** function from the worker's existing
+`apply_pii_rules`, not a shared one both call: the worker's `ParsedEvent` carries two properties
+representations (`properties`, already stringified for ClickHouse's Map(String,String) column, and
+`raw_properties`, for the schema registry) that a synthetic edge case in `tests/test_pii_enforcement.py`
+pins as capable of diverging, with `properties` as the source of truth for "does this key exist"; an
+archived event has only one representation, so a function shaped for the two-dict case would be the wrong
+shape and risk silently changing that already-tested contract. `worker/processing.py`'s per-entry loop was
+restructured so the archive write happens *after* PII rules are applied (previously before), closing the
+live-ingest half of the gap; an identity check (`apply_pii_rules` returns the same object when nothing
+changed, itself a pinned contract) means an event's archived JSON stays byte-identical to what the customer
+sent whenever no rule actually touches it -- reserialization only happens for genuinely scrubbed events.
+`create_pii_rule` closes the retroactive half: after the rule row commits (in its own short transaction, so
+a slow archive scan never holds a Postgres transaction open), it walks the project's archive
+(`archive.apply_pii_rules`, mirroring `erase_subject`'s per-project-prefix-plus-legacy-objects, per-entry
+tenant-checked scan) and scrubs the property from every already-archived event. **Best-effort by design:**
+if the archive scan fails outright (e.g. the object store is unreachable), the rule is still created and
+enforced for new events -- the API reports `archive_rewrite: null` rather than claiming success, and a
+per-object *read* failure inside an otherwise-successful rewrite is counted in `unreadable_objects`, never
+swallowed. Deleting a rule does not un-scrub anything: a hash is one-way and a drop is destructive, so there
+is nothing to restore. The create-rule API response (`POST .../pii-rules`) gained an `archive_rewrite` field
+reporting entries scrubbed, objects rewritten, and unreadable objects.
+
+**3. A new Owner-only Privacy page** (`frontend/src/app/orgs/[orgId]/projects/[projectId]/privacy`,
+`SubjectDeletion.tsx`) -- the subject-deletion endpoint has existed since Phase 22 with no console screen at
+all. Type-`DELETE`-to-confirm before the button enables (this repo's first such confirmation pattern -- the
+existing alert-delete flow has none, and this is "the single most destructive action in the app" per
+`pulse/api/deletion.py`'s own comment); the success state shows the full report (rollup buckets, archive
+entries/objects, and an unreadable-objects warning when non-zero) rather than a bare confirmation. Gated
+client-side on the caller's org role (non-Owners see why, not a blank page or a raw 403) -- the same
+server-side `require_role(OWNER)` check from Phase 22 is still the real enforcement.
+
+**Verified live, beyond the tests**, against the real API (uvicorn), real Postgres/ClickHouse/Redis
+containers and the real SeaweedFS object store, not just fixtures: registered a user, created an org and
+project, ingested two events (`live-alice`, `live-bob`) through the real `/ingest` -> Redis stream -> worker
+path (which also drained a 768-entry stale backlog from earlier sessions along the way, including 500 events
+for a since-deleted org -- confirming the schema registry's best-effort failure handling from Phase 9 still
+holds: `500 inserted` despite every one of those failing to register, because a Postgres FK violation there
+must never cost a ClickHouse insert). Created a `hash` rule on `email` through the real API -- both events'
+archived properties came back with `email` hashed and `plan` untouched, matching what the API's
+`archive_rewrite` field reported (`entries_scrubbed: 2`). Deleted `live-alice` through the real API --
+`rollup_verified: true`, one archive entry removed -- then pushed two more `live-alice` events through
+`/ingest` (one before the delete call even completed, racing it; one immediately after) and ran the worker:
+neither reappeared in ClickHouse or the archive, while `live-bob` was untouched throughout (still plaintext
+in ClickHouse, since retroactive ClickHouse rewrite was never in scope for any phase -- only the archive
+was) and the suppression key was confirmed present in Redis with a ~24h TTL. A real, unrelated bug surfaced
+and worked around during this check, unrelated to Phase 25 itself: git-bash's `/tmp` and the Windows-native
+`python3` on `PATH` resolve to different filesystems, so writing a response to a file with `curl` and reading
+it back with a bare `open()` in that `python3` silently failed -- worked around by piping directly instead
+of round-tripping through a file (now recorded in `windows_file_edit_pitfalls`-style project memory for next
+time).
+
+**Tests:** `test_pii.py` (10) -- `pulse/pii.py`'s primitives in isolation, no DB. `test_suppression.py` (7)
+-- `pulse/suppression.py` against real Redis, including that the given TTL is actually set. `test_pii_archive_rewrite.py`
+(8) -- `create_pii_rule`'s retroactive scan through service-layer cases (drop, hash, another project
+untouched, nothing-to-scrub is a true no-op, no archived events yet, a legacy tenant-mixed object rewritten
+without losing the other tenant) plus one through the real HTTP API for the response shape. `test_pii_enforcement.py`
+(+2) -- a project's rule now keeps the marked property out of the archive too, and an event with no matching
+property is archived byte-identical (not merely equivalent after a JSON round trip). `test_deletion.py` (+2)
+-- an event already in the stream when deletion runs does not reappear (through the real worker, twice: once
+already-landed-then-deleted-then-a-second-event-races, and the acked-not-jammed invariant), and suppression
+never touches a different identity in the same project. 28 new backend tests (458 -> 486 passed, 1 skipped);
+frontend `SubjectDeletion.test.tsx` (8, non-owner explanation, confirm-gating, submission payload and
+success report, form reset after success, an unreadable-objects warning surfaced not dropped, error display)
+-- full frontend suite 150 -> 158 passed; `npm run build` clean. ruff / ruff format / mypy (`pulse`, strict)
+clean.
+
+**Deliberately not done this phase:** no PII-rules management UI (list/create/delete), only subject deletion
+-- the other recommended-default fork answer. Suppression's bounded-TTL trade-off (above) is unresolved by
+design, not an oversight.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1784,6 +1883,19 @@ starlette/pytest/vitest findings are fixed and dependency + image scans are bloc
 Prometheus/Grafana + a token-protected API `/metrics` (verified against the real images with simulated Render
 DNS); ☑ opt-in Terraform remote state; ☑ automatic rollback in the release script. ◐ Everything deployed-side
 is verified locally, not on Render (§6.22). Phase 23's deploy half is still open.
+
+**Phase 25 — Closing the remaining GDPR/PII gaps (post-roadmap; agreed after Phase 24).** ☑ an event already
+in the Redis stream when a deletion runs is suppressed by the worker, not reinserted (bounded 24h TTL, not
+permanent -- documented residual limit); ☑ PII rules now scrub the archive too, both retroactively (a new
+rule rewrites already-archived events) and going forward (the worker archives after applying rules, not
+before); ☑ a new Owner-only Privacy page for subject deletion, with a type-DELETE-to-confirm step and the
+full deletion report. Verified live against the real API, worker and object store, not just tests: a hash
+rule scrubbed two already-archived events' emails; a subsequent deletion removed the subject from events,
+rollup and archive; two events racing the deletion (one before it completed, one right after) were both
+dropped by the worker rather than reappearing, confirmed absent from both ClickHouse and the archive while
+an untouched user's data stayed intact throughout. 28 new backend tests (458 -> 486 passed, 1 skipped); 8
+new frontend tests (150 -> 158 passed). Phase 23's deploy half remains the only item still open across all
+phases.
 
 ---
 
@@ -2348,3 +2460,29 @@ is verified locally, not on Render (§6.22). Phase 23's deploy half is still ope
   (now tolerant). New guard tests keep the image pinned and identical in compose and CI, keep the store
   loopback-bound, and keep `minio/minio` out of code. The `phase-24-complete` tag was created on the red commit
   and has not been moved.
+- 2026-09-28 — Phase 25 — Added §6.23 and a Phase 25 DoD line. Not in the original roadmap: after Phase 24
+  the user asked for a Phase 25; the design-fork question got interrupted mid-session before an answer came
+  back, so, running in auto-mode (make the reasonable call rather than stall), both forks were resolved to
+  their recommended option: scrub the archive on write and retroactively; build subject-deletion UI only,
+  not a PII-rules UI, this phase. (1) **In-flight events no longer reappear after a deletion**: new
+  `pulse/suppression.py`, called first by `delete_subject` before anything else, checked by the worker before
+  archiving or inserting; bounded to a 24h TTL by design (the alternative, permanent suppression, is the same
+  unbounded-growth shape Phase 23's stream bug already showed the cost of). (2) **PII rules now protect the
+  archive too**: new `pulse/pii.py` (a leaf module, deliberately NOT shared with the worker's existing
+  `apply_pii_rules` -- a synthetic test in test_pii_enforcement.py pins a two-dict-divergence contract an
+  archived event, with only one properties representation, doesn't have); `create_pii_rule` now retroactively
+  rewrites the project's archive (best-effort: a total object-storage outage still leaves the rule created and
+  enforced, just not backfilled, and the API says `archive_rewrite: null` rather than pretending); the worker
+  now archives after PII rules are applied instead of before, closing the live-ingest half. (3) New Owner-only
+  Privacy page (`/orgs/[orgId]/projects/[projectId]/privacy`) for subject deletion -- this repo's first
+  type-to-confirm destructive-action pattern. **Docker Desktop hit its known stuck dockerInference-socket
+  failure mid-session** (see project memory); all backend work was written and statically checked (ruff /
+  mypy) but genuinely blocked on running any backend test until it cleared on its own (no reboot needed this
+  time) partway through the session -- flagged to the user honestly rather than claiming untested code was
+  verified. **Verified live** against the real API/worker/object store once Docker recovered: a hash rule
+  scrubbed two already-archived events' emails; a deletion removed a subject from events, rollup and archive;
+  two events racing the deletion (one before it completed, one right after) were both dropped, confirmed
+  absent from ClickHouse and the archive, while an untouched user's data and a real 768-entry stale backlog
+  from earlier sessions were both handled correctly along the way. 28 new backend tests (458 -> 486 passed, 1
+  skipped); 8 new frontend tests (150 -> 158 passed); `npm run build` clean. ruff / ruff format / mypy
+  (`pulse`, strict) clean. Nothing committed yet.

@@ -3,8 +3,8 @@ identifier the customer's own app assigns via the ingestion SDK
 (events.user_id / events.anonymous_id) -- not a Pulse console User, which is an
 entirely separate identity (pulse/models/user.py).
 
-Phase 22 covered ClickHouse `events` only. Phase 24 closes the two gaps it
-documented, so a deletion now reaches every store that holds the subject:
+Phase 22 covered ClickHouse `events` only. Phase 24 closed two of the three
+gaps it documented, so a deletion reaches every store that holds the subject:
 
   1. `events`            -- the rows themselves (ALTER TABLE ... DELETE).
   2. `event_hourly`      -- the rollup keeps a per-hour unique-users sketch that
@@ -16,17 +16,26 @@ documented, so a deletion now reaches every store that holds the subject:
   3. raw object archive  -- rewritten without the subject's entries
                             (archive.erase_subject).
 
-Remaining, deliberate scope limits (docs/THREAT_MODEL.md): an event the API has
-accepted but the worker has not yet landed is still in the Redis stream and will
-land after this call; archive entries whose org/project couldn't be parsed can't
-be attributed to a tenant; backups are out of scope. See SPEC.md #6.20 / #6.22."""
+Phase 25 closes the third: an event the API had already accepted into the Redis
+stream, but the worker had not yet landed, used to reappear after this call
+returned -- reintroducing exactly the data that was just erased. `suppress()`
+below is called FIRST, before anything else, so any such event racing in during
+the rest of this function is caught too; the worker checks it
+(pulse/worker/processing.py, pulse/suppression.py) before landing an event.
+
+Remaining, deliberate scope limits (docs/THREAT_MODEL.md): suppression is
+bounded, not permanent (pulse/suppression.py); archive entries whose org/project
+couldn't be parsed can't be attributed to a tenant; backups are out of scope.
+See SPEC.md #6.20 / #6.22 / #6.25."""
 
 import uuid
 from dataclasses import dataclass
 
 from clickhouse_connect.driver.asyncclient import AsyncClient
+from redis.asyncio import Redis
 
-from pulse import archive
+from pulse import archive, suppression
+from pulse.core.config import get_settings
 from pulse.repositories.postgres import session_scope
 from pulse.rollups import maintenance as rollup_maintenance
 from pulse.services import audit
@@ -46,6 +55,7 @@ class DeletionReport:
 
 async def delete_subject(
     clickhouse_client: AsyncClient,
+    redis_client: Redis,
     org_id: uuid.UUID,
     project_id: uuid.UUID,
     actor_id: uuid.UUID,
@@ -55,6 +65,18 @@ async def delete_subject(
 ) -> DeletionReport:
     if not user_id and not anonymous_id:
         raise NoIdentifierGiven()
+
+    # First, before anything else: any event for this identity that lands in
+    # the stream from here on is dropped by the worker, not just the events
+    # already sitting there when this call started.
+    await suppression.suppress(
+        redis_client,
+        org_id,
+        project_id,
+        user_id=user_id,
+        anonymous_id=anonymous_id,
+        ttl_seconds=get_settings().subject_suppression_ttl_seconds,
+    )
 
     where = ["org_id = {org_id:UUID}", "project_id = {project_id:UUID}"]
     parameters: dict[str, object] = {"org_id": str(org_id), "project_id": str(project_id)}

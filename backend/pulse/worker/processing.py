@@ -1,5 +1,3 @@
-import hashlib
-import hmac
 import json
 import logging
 import time
@@ -13,7 +11,7 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from redis.asyncio import Redis
 
-from pulse import archive
+from pulse import archive, pii, suppression
 from pulse.core.config import get_settings
 from pulse.events.repository import insert_events
 from pulse.models import PiiAction
@@ -69,6 +67,11 @@ class BatchResult:
     processed: int = 0
     duplicates: int = 0
     poisoned: int = 0
+    # A subject-deletion suppression matched (pulse/suppression.py): the
+    # event was already in the stream when a deletion ran for this identity.
+    # Not inserted, not archived, not registered -- ack'd like everything
+    # else, so it never blocks the batch.
+    suppressed: int = 0
     acked: int = 0
     ingest_batch: uuid.UUID | None = None
 
@@ -82,20 +85,11 @@ def _decode_fields(fields: dict[bytes, bytes]) -> dict[str, str]:
 
 
 def _stringify_properties(properties: dict[str, PropertyValue]) -> dict[str, str]:
-    """Matches Phase 6's fixture convention exactly (events/fixtures.py):
-    plain str() for numbers, lowercase true/false for bool (Python's own
-    str(True) == "True" would silently break a later `= 'true'`-style
-    query), and a property with a null value is dropped -- Map(String,String)
-    has no null representation, so an absent key is the natural encoding."""
-    result: dict[str, str] = {}
-    for key, value in properties.items():
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            result[key] = "true" if value else "false"
-        else:
-            result[key] = str(value)
-    return result
+    """A thin alias: the implementation now lives in pulse/pii.py, shared
+    with the archive rewrite a new PII rule triggers (pulse/archive.py).
+    Kept as a module-level name here since it's part of this module's own
+    settled vocabulary (parse_stream_entry below reads naturally with it)."""
+    return pii.stringify_properties(properties)
 
 
 def parse_stream_entry(fields: dict[bytes, bytes]) -> ParsedEvent:
@@ -119,10 +113,9 @@ def parse_stream_entry(fields: dict[bytes, bytes]) -> ParsedEvent:
 
 
 def _hash_pii_value(value: str, secret: str) -> str:
-    """Keyed HMAC, not a plain hash: deterministic (the same input always
-    hashes the same, so a hashed property still supports unique-user-style
-    grouping) but not reversible or rainbow-table-able without the secret."""
-    return hmac.new(secret.encode(), value.encode(), hashlib.sha256).hexdigest()
+    """A thin alias -- see `_stringify_properties` above; implementation in
+    pulse/pii.py."""
+    return pii.hash_value(value, secret)
 
 
 def apply_pii_rules(parsed: ParsedEvent, rules: dict[str, PiiAction]) -> ParsedEvent:
@@ -316,21 +309,51 @@ async def process_batch(
     for entry_id, fields in entries:
         ack_ids.append(entry_id)
         decoded_fields = _decode_fields(fields)
-        raw_archive.append(decoded_fields)
 
         try:
             parsed = parse_stream_entry(fields)
         except PoisonEvent as exc:
+            # A poison entry can't be reliably read for a subject identity,
+            # so it's archived as-is like it always has been -- the archive's
+            # per-entry tenant check (pulse/archive.py) already keeps an
+            # unattributable entry from being reached by anyone's deletion.
+            raw_archive.append(decoded_fields)
             await push_to_dlq(redis_client, dlq_stream_key, fields, exc.reason)
             result.poisoned += 1
             continue
 
+        if await suppression.is_suppressed(
+            redis_client, parsed.org_id, parsed.project_id, parsed.user_id, parsed.anonymous_id
+        ):
+            # Not archived either: writing a just-deleted subject's raw data
+            # into the archive would undo exactly what the deletion erased
+            # there (pulse/services/deletion.py, pulse/archive.py).
+            result.suppressed += 1
+            continue
+
+        original_parsed = parsed
+        pii_rules = await _pii_rules_for(parsed.org_id, parsed.project_id)
+        parsed = apply_pii_rules(parsed, pii_rules)
+
+        # Archived AFTER PII rules are applied (closing the gap SPEC.md has
+        # documented since Phase 22: a rule now keeps a property out of the
+        # archive, not just ClickHouse and the registry) and BEFORE the
+        # duplicate check, so a redelivered duplicate is still archived --
+        # matching the pre-existing "every worker batch, good and poison
+        # entries alike" behavior. `apply_pii_rules` returns the identical
+        # object when nothing actually changed (tests/test_pii_enforcement.py
+        # pins that), so this entry's raw JSON is byte-identical to what the
+        # customer sent whenever no rule touched it -- reserializing only
+        # happens for events a rule genuinely scrubbed.
+        archived_entry = decoded_fields
+        if parsed is not original_parsed:
+            archived_entry = dict(decoded_fields)
+            archived_entry["properties"] = json.dumps(parsed.raw_properties)
+        raw_archive.append(archived_entry)
+
         if await is_duplicate(redis_client, parsed.event_id):
             result.duplicates += 1
             continue
-
-        pii_rules = await _pii_rules_for(parsed.org_id, parsed.project_id)
-        parsed = apply_pii_rules(parsed, pii_rules)
 
         good_rows.append(to_clickhouse_row(parsed, ingest_batch))
         fresh_event_ids.append(parsed.event_id)
@@ -366,6 +389,7 @@ async def process_batch(
     metrics.WORKER_EVENTS.labels("inserted").inc(result.processed)
     metrics.WORKER_EVENTS.labels("duplicate").inc(result.duplicates)
     metrics.WORKER_EVENTS.labels("poisoned").inc(result.poisoned)
+    metrics.WORKER_EVENTS.labels("suppressed").inc(result.suppressed)
     metrics.WORKER_BATCH_SIZE.observe(len(entries))
     metrics.WORKER_BATCH_SECONDS.observe(time.perf_counter() - batch_started)
     _emit_event_spans(

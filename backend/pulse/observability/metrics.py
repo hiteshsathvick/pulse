@@ -40,7 +40,7 @@ INGEST_ACCEPTED = Counter(
 WORKER_EVENTS = Counter(
     "pulse_worker_events_total",
     "Stream entries the ingest worker handled, by outcome. `poisoned` is the DLQ rate.",
-    ["outcome"],  # inserted | duplicate | poisoned
+    ["outcome"],  # inserted | duplicate | poisoned | suppressed
 )
 WORKER_BATCH_SIZE = Histogram(
     "pulse_worker_batch_size",

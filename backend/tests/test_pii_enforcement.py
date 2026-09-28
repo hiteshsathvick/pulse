@@ -16,10 +16,12 @@ import pytest
 
 from alembic import command
 from alembic.config import Config
+from pulse import archive
 from pulse.clickhouse_migrations.runner import migrate
 from pulse.core.config import get_settings
 from pulse.events.repository import query_events
 from pulse.models import PiiAction
+from pulse.repositories import object_storage
 from pulse.repositories.clickhouse import get_client as get_clickhouse_client
 from pulse.repositories.redis import get_client as get_redis_client
 from pulse.worker.consumer import ensure_consumer_group
@@ -205,6 +207,77 @@ async def test_a_project_s_rules_keep_the_marked_property_out_of_clickhouse() ->
     assert len(rows) == 1
     assert "email" not in rows[0]["properties"]
     assert rows[0]["properties"]["plan"] == "pro"
+
+
+async def test_a_project_s_rules_also_keep_the_marked_property_out_of_the_archive() -> None:
+    """Phase 25 DoD: a PII rule now protects the raw archive too, not just
+    ClickHouse and the registry (the gap Phase 22 documented and left open).
+    A second, unmarked property on the same event survives -- in the archive,
+    not just in ClickHouse."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    fields = _raw_fields(org_id, project_id)
+    entry = (b"1-1", {k.encode(): v.encode() for k, v in fields.items()})
+
+    async def fetch_rules(_org_id: uuid.UUID, _project_id: uuid.UUID) -> dict[str, PiiAction]:
+        return {"email": PiiAction.DROP}
+
+    settings = get_settings()
+    await process_batch(
+        redis_client=redis_client,
+        clickhouse_client=await get_clickhouse_client(),
+        entries=[entry],
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+        pii_rules_fetcher=fetch_rules,
+    )
+
+    keys = await object_storage.list_keys(archive.tenant_prefix(org_id, project_id))
+    assert len(keys) == 1
+    archived = json.loads(await object_storage.get_bytes(keys[0]))
+    assert len(archived) == 1
+    archived_properties = json.loads(archived[0]["properties"])
+    assert "email" not in archived_properties
+    assert archived_properties["plan"] == "pro"
+
+
+async def test_an_event_with_no_matching_property_is_archived_byte_identical() -> None:
+    """When a rule exists for the project but this particular event's
+    properties don't contain the ruled key, the archived JSON must be exactly
+    what the customer sent -- not merely equivalent after a round trip through
+    json.loads/json.dumps, which could reorder keys or reformat numbers."""
+    stream_key, group = _stream_key(), _group()
+    redis_client = get_redis_client()
+    await ensure_consumer_group(redis_client, stream_key, group)
+
+    org_id, project_id = uuid.uuid4(), uuid.uuid4()
+    original_properties = '{"zebra": 1, "apple": 2.50, "plan": "pro"}'
+    fields = _raw_fields(org_id, project_id, properties=original_properties)
+    entry = (b"1-1", {k.encode(): v.encode() for k, v in fields.items()})
+
+    async def fetch_rules(_org_id: uuid.UUID, _project_id: uuid.UUID) -> dict[str, PiiAction]:
+        return {"email": PiiAction.DROP}  # a real rule, just not for a key on THIS event
+
+    settings = get_settings()
+    await process_batch(
+        redis_client=redis_client,
+        clickhouse_client=await get_clickhouse_client(),
+        entries=[entry],
+        stream_key=stream_key,
+        group=group,
+        dlq_stream_key=f"{stream_key}:dlq",
+        dedup_ttl_seconds=settings.worker_dedup_ttl_seconds,
+        pii_rules_fetcher=fetch_rules,
+    )
+
+    keys = await object_storage.list_keys(archive.tenant_prefix(org_id, project_id))
+    archived = json.loads(await object_storage.get_bytes(keys[0]))
+    assert archived[0]["properties"] == original_properties
 
 
 async def test_a_different_project_with_no_rules_is_unaffected() -> None:

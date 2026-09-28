@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     # ReplacingMergeTree is the backstop for whatever slips past it.
     worker_dedup_ttl_seconds: int = 86_400
     worker_dlq_stream_key: str = "pulse:ingest:dlq"
+    # How long a just-deleted subject's identity is suppressed from ingestion
+    # (pulse/suppression.py) -- long enough that an event already accepted
+    # into the stream when the deletion ran, and not yet landed, is caught
+    # before it can reintroduce the data. Bounded, not permanent: see
+    # pulse/suppression.py's own docstring.
+    subject_suppression_ttl_seconds: int = 86_400
 
     # Object storage (SeaweedFS locally / S3-compatible in prod) -- the raw
     # per-batch archive, per SPEC.md #6.7. Access/secret reuse the same

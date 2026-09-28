@@ -58,6 +58,13 @@ function ProjectHome() {
           Get notified by email, webhook, or in-app when a metric breaches a threshold or moves
           anomalously.
         </p>
+        <Link
+          href={`/orgs/${orgId}/projects/${projectId}/privacy`}
+          className="mt-2 text-lg font-medium underline"
+        >
+          Privacy
+        </Link>
+        <p className="text-gray-500">Delete a subject&apos;s data on request (Owners only).</p>
       </div>
     </div>
   );
