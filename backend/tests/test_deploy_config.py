@@ -647,9 +647,14 @@ def test_the_dependency_and_image_scans_are_blocking_gates() -> None:
     jobs = _ci()["jobs"]
     for step in jobs["dependency-scan"]["steps"]:
         assert "|| true" not in step.get("run", ""), step.get("name")
-    trivy = next(s for s in jobs["build"]["steps"] if "Trivy" in s.get("name", ""))
-    assert not trivy.get("continue-on-error")
-    assert "--exit-code 1" in trivy["run"] and "--ignore-unfixed" in trivy["run"]
+    # Phase 31 added a second Trivy step (frontend) -- iterate all of them
+    # rather than next()ing the first, or a second one silently going
+    # unchecked (and un-blocking) would look identical to this test passing.
+    trivy_steps = [s for s in jobs["build"]["steps"] if "Trivy" in s.get("name", "")]
+    assert len(trivy_steps) == 2, "expected one Trivy scan step each for backend and frontend"
+    for trivy in trivy_steps:
+        assert not trivy.get("continue-on-error"), trivy["name"]
+        assert "--exit-code 1" in trivy["run"] and "--ignore-unfixed" in trivy["run"], trivy["name"]
 
 
 def test_the_python_dependency_audits_install_the_project_first_in_their_own_venv() -> None:
@@ -675,6 +680,37 @@ def test_the_backend_image_installs_the_debian_security_updates() -> None:
     assert dockerfile.index("apt-get upgrade") < dockerfile.index("pip install")
 
 
+def test_the_frontend_image_is_multistage_standalone_with_no_npm_cli() -> None:
+    """A naive single-stage frontend image shipped the entire npm CLI into
+    production, including npm's own bundled internal deps (pacote/tar/
+    sigstore/etc) -- none of it reachable by this app at runtime, and exactly
+    what a Trivy scan of that image found (Phase 31). Fixed at the root:
+    Next's own `output: "standalone"` mode traces only the deps the built
+    server actually imports, and the runtime stage additionally removes
+    npm/npx entirely, since it only ever runs `node server.js`."""
+    config = (_ROOT / "frontend" / "next.config.mjs").read_text()
+    assert re.search(r'output:\s*"standalone"', config)
+
+    dockerfile = (_ROOT / "frontend" / "Dockerfile").read_text().replace("\r\n", "\n")
+    assert re.search(r"FROM node:[\w.-]+ AS builder", dockerfile)
+    assert re.search(r"FROM node:[\w.-]+ AS runner", dockerfile)
+    assert "apt-get upgrade -y" in dockerfile
+    assert "rm -rf /usr/local/lib/node_modules/npm" in dockerfile
+    assert "/usr/local/bin/npm" in dockerfile
+    # The npm removal and Debian upgrade must happen in the runner stage,
+    # after the FROM ... AS runner line -- doing it in the builder would be a
+    # no-op (that stage is discarded) and leave the shipped image untouched.
+    runner_start = dockerfile.index("AS runner")
+    assert dockerfile.index("apt-get upgrade", runner_start) > runner_start
+    assert dockerfile.index("rm -rf /usr/local/lib/node_modules/npm", runner_start) > runner_start
+    # Only .next/standalone and .next/static are copied out of the builder --
+    # not the builder's own full node_modules (that would reintroduce every
+    # devDependency, and npm's bundled internals, right back into the image).
+    assert "COPY --from=builder /app/.next/standalone" in dockerfile
+    assert "COPY --from=builder /app/.next/static" in dockerfile
+    assert "COPY --from=builder /app/node_modules" not in dockerfile
+
+
 # --- SBOM + signed provenance attestation (Phase 30) -----------------------------
 
 
@@ -682,9 +718,10 @@ def test_both_images_get_an_sbom_generated_and_a_signed_attestation() -> None:
     """Render builds every service from source itself (runtime: docker in the
     Blueprints) rather than pulling a pre-built image, so there is nothing to
     cosign-sign here yet -- the SBOM is the real, independently verifiable
-    artifact this phase adds, and it must exist and be signed for BOTH images,
-    not just the one the vulnerability scan already covers (the frontend image
-    is unscanned -- see docs/THREAT_MODEL.md -- but still gets an SBOM)."""
+    artifact this phase adds, and it must exist and be signed for BOTH images
+    (as of Phase 31 both are also vulnerability-scanned, but this SBOM/
+    attestation check is unconditional either way -- it never depended on
+    the scan)."""
     steps = _ci()["jobs"]["build"]["steps"]
     names = [s.get("name", "") for s in steps]
 

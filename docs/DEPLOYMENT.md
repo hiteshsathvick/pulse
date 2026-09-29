@@ -190,9 +190,11 @@ provisioned its datasource from the environment and the dashboard, and queried P
   rewrite (the exact app code, unmodified) against the real `pulse-staging-raw-events` bucket and its
   Application Key left over from Phase 26 -- both worked, confirmed by reading the object back and seeing
   the ruled property genuinely hashed. But the app processes that ran were local (host venv, talking to
-  local Postgres/ClickHouse/Redis) with only `S3_*` pointed at real B2 -- `/health` still only checks
-  Postgres, ClickHouse and Redis, not S3/B2, and no deployed Render service has made this call. The B2
-  credentials/bucket are proven good; the deployed API/worker actually reaching them from Render is not.
+  local Postgres/ClickHouse/Redis) with only `S3_*` pointed at real B2. `/health` gained an object-storage
+  check in Phase 29, but only ever against local SeaweedFS -- no deployed Render service has called
+  `/health` with `S3_*` pointed at real B2. The B2 credentials/bucket are proven good; the deployed
+  API/worker actually reaching them from Render, and `/health` reporting on that specific connection, is
+  not.
 - **Frontend env vars** (`NEXT_PUBLIC_API_URL`, `API_INTERNAL_URL`) can't be composed by a Blueprint, so
   they're filled by hand once per environment -- confirmed for real this round: Render didn't even
   auto-redeploy the frontend after the env var was corrected, a manual deploy trigger was needed.

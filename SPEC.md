@@ -2032,6 +2032,54 @@ right filename, a signed attestation of exactly that file, not `continue-on-erro
 are exactly the three scopes needed, nothing broader. 490 -> 492 passed, 1 skipped. ruff / ruff format /
 mypy (`pulse`, strict) clean. No frontend changes, no application code changed -- CI config and docs only.
 
+### 6.29 Scanning the frontend image too (Phase 31)
+
+Not a numbered phase in the original roadmap: after Phase 30 the user asked for a Phase 31, and the
+recommended pick from a short menu was `docs/THREAT_MODEL.md`'s own plainly-stated gap: "Not scanned: the
+frontend image" -- only the backend got a blocking Trivy vulnerability scan.
+
+**A naive implementation would have immediately turned CI red with nothing straightforward to fix.**
+Scanning the original single-stage `frontend/Dockerfile` found unpatched Debian base packages (the same
+class the backend's Phase 24 fix addressed) plus a full set of HIGH/CRITICAL CVEs in npm's own bundled
+internal dependencies -- `pacote`, `tar`, `sigstore`, `minimatch`, `glob`, `cross-spawn`, `ip-address`,
+`brace-expansion`. None of these are this app's own dependencies (`frontend/package.json` cannot touch
+them, they belong to the `npm` CLI itself, bundled by the `node:20-slim` base image regardless of what the
+Dockerfile installs) and none are reachable at runtime (this app never invokes `npm` after it's built, only
+`next start`/`node server.js`). **Confirmed with the user first**: rewrite the Dockerfile properly (chosen)
+versus paper over the findings with `--ignore-vuln` exceptions (rejected -- would leave real, if unused,
+attack surface and its ongoing CVE churn in the production image indefinitely).
+
+**`frontend/Dockerfile` is now multi-stage**, using Next's own `output: "standalone"` mode
+(`next.config.mjs`) -- a builder stage runs `npm ci && npm run build` same as before, but the runtime
+stage copies out only `.next/standalone` (which `next build` already traces and prunes to exactly the
+production dependencies the built server imports) and `.next/static`, never the builder's own full
+`node_modules`. The runtime stage additionally runs `apt-get upgrade` (mirroring `backend/Dockerfile`'s
+Phase 24 fix) and explicitly removes npm's CLI (`rm -rf /usr/local/lib/node_modules/npm` and the `npm`/
+`npx`/`corepack` binaries) -- standalone tracing alone does not touch this, since npm is bundled into the
+base image itself, not part of this app's traced dependency graph, confirmed by finding it at
+`/usr/local/lib/node_modules/npm/` inside the built image and not under `/app` at all.
+
+**Verified at every step, not assumed**: the original single-stage image was scanned first to establish
+what a naive "just add the scan" would actually find (20 npm-internal findings + 9 Debian findings); the
+standalone-only rewrite was built, run, and re-scanned -- confirming `output: "standalone"` alone did
+*not* remove the npm-internal findings (they're base-image-level, invisible to Next's dependency tracer);
+only after adding the explicit npm removal and `apt-get upgrade` did a final rescan come back with **zero**
+HIGH/CRITICAL findings -- no `--ignore-vuln` exceptions needed anywhere. The rebuilt image was run
+end-to-end at each stage (a real HTTP request against the root page and a static CSS chunk, both 200) to
+confirm `output: "standalone"` and removing npm didn't silently break serving; the real local dev
+`docker-compose` stack (which builds from this same Dockerfile) was also rebuilt and confirmed working, not
+just an isolated test image, since this Dockerfile is what local dev, CI, and Render's own build all use.
+Image size dropped from ~1.5 GB to ~400 MB as a side effect of removing what was never runtime-necessary,
+not a goal in itself.
+
+**Tests:** `test_deploy_config.py` (+1 new, and the existing blocking-gate test extended in place) -- the
+frontend Dockerfile is multi-stage with `output: "standalone"` configured, runs `apt-get upgrade` and
+removes npm specifically in the runner stage (not a no-op in the discarded builder stage), and copies out
+only the standalone/static output, never the builder's full `node_modules`; the existing Trivy-blocking-
+gate test now iterates *both* scan steps rather than checking only the first found, so a silently
+non-blocking second scan can't hide again the way it could have before this phase. 492 -> 493 passed,
+1 skipped. ruff / ruff format / mypy (`pulse`, strict) clean.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2210,6 +2258,16 @@ no registry artifact to cosign-sign the traditional way -- chose SBOM + attestat
 GHCR-publish-then-sign capability, documented honestly as attesting to what CI built, not literally what
 Render deploys. 2 new backend tests (490 -> 492 passed, 1 skipped); ruff / ruff format / mypy clean. No
 application code changed -- CI config and docs only (see §6.28).
+
+**Phase 31 — Scan the frontend image too (post-roadmap; agreed after Phase 30).** ☑ `frontend/Dockerfile`
+rewritten as a multi-stage build using Next's `output: "standalone"`, runtime stage stripped of npm's CLI
+entirely and running `apt-get upgrade`; ☑ a blocking Trivy scan added for the frontend image, mirroring
+the backend's, verified clean (zero HIGH/CRITICAL findings, no exceptions) only after the fix, not assumed.
+◐ **Confirmed with the user first**: a naive scan of the original image found real CVEs, all in npm's own
+bundled internal deps (unfixable via `frontend/package.json`) plus unpatched Debian packages -- fixed the
+Dockerfile properly rather than suppressing the findings. Image size dropped ~1.5GB -> ~400MB as a side
+effect. 1 new backend test (492 -> 493 passed, 1 skipped); ruff / ruff format / mypy clean; frontend suite
+unaffected (170 passed). No application code changed -- Dockerfile, config, CI and docs only (see §6.29).
 
 ---
 
@@ -2929,4 +2987,33 @@ application code changed -- CI config and docs only (see §6.28).
   2 new backend tests (`test_deploy_config.py`, 490 -> 492 passed, 1 skipped) confirming both images get a
   correctly-ordered, non-`continue-on-error` SBOM-then-attestation-then-upload and the job's permissions are
   exactly the three scopes needed. ruff / ruff format / mypy clean. No application code changed -- CI
-  config and docs only.
+  config and docs only. Committed as `4af6dc1`, pushed; CI green (the workflow's own new steps ran for
+  real, not just parsed locally -- the first time a phase's own CI change was itself what CI verified).
+- 2026-09-29 — Phase 31 — Added §6.29 and a Phase 31 DoD line. Not in the original roadmap: after Phase 30
+  the user asked for a Phase 31, and the recommended pick from a short menu was `docs/THREAT_MODEL.md`'s
+  own plainly-stated gap: "Not scanned: the frontend image." **A naive implementation would have turned CI
+  red with nothing straightforward to fix**: scanning the original single-stage `frontend/Dockerfile` found
+  unpatched Debian base packages (same class as the backend's Phase 24 fix) plus a full set of HIGH/CRITICAL
+  CVEs in npm's own bundled internal dependencies (`pacote`, `tar`, `sigstore`, `minimatch`, `glob`,
+  `cross-spawn`, `ip-address`, `brace-expansion`) -- none of them this app's own dependencies (they belong
+  to the `npm` CLI bundled into the `node:20-slim` base image itself, not `frontend/package.json`) and none
+  reachable at runtime (this app never invokes `npm` once built). **Confirmed with the user first**:
+  properly rewrite the Dockerfile (chosen) versus paper over the findings with `--ignore-vuln` exceptions
+  (rejected -- would leave real, unused attack surface and its ongoing CVE churn in the image indefinitely).
+  `frontend/Dockerfile` is now multi-stage using Next's own `output: "standalone"` mode
+  (`next.config.mjs`) -- the runtime stage copies out only `.next/standalone`/`.next/static`, never the
+  builder's full `node_modules`, and additionally runs `apt-get upgrade` and explicitly removes npm's CLI
+  (standalone tracing alone does not touch npm, confirmed by finding it at `/usr/local/lib/node_modules/npm/`
+  in the built image, outside the app's own traced dependency graph entirely). **Verified at every step**:
+  scanned the original image first to establish a concrete baseline (20 npm-internal + 9 Debian findings);
+  confirmed `output: "standalone"` alone did *not* remove the npm-internal findings (base-image-level, not
+  app-level); only after the explicit npm removal + `apt-get upgrade` did a rescan come back with **zero**
+  HIGH/CRITICAL findings, no exceptions needed anywhere; ran the built image directly (root page and a
+  static CSS chunk, both 200) at each stage to confirm nothing broke serving; rebuilt and confirmed the real
+  local dev `docker-compose` stack too, not just an isolated test image, since this Dockerfile is what local
+  dev, CI and Render's own build all share. Image size dropped ~1.5GB -> ~400MB as a side effect, not the
+  goal. 1 new backend test (`test_the_frontend_image_is_multistage_standalone_with_no_npm_cli`) plus the
+  existing Trivy-blocking-gate test extended to iterate both scan steps instead of checking only the first
+  found (a silently non-blocking second scan could otherwise have hidden behind a passing test). 492 -> 493
+  passed, 1 skipped; ruff / ruff format / mypy clean; frontend suite unaffected (170 passed), `npm run
+  build` clean. No application code changed -- Dockerfile, config, CI and docs only.

@@ -447,6 +447,22 @@ jobs:
       - name: Build frontend image
         run: docker build -t pulse-frontend:ci frontend
 
+      # Phase 31: mirrors the backend scan above. The frontend image was
+      # never scanned before -- a naive scan of the old single-stage image
+      # found real findings, but all in npm's own bundled internal deps
+      # (unreachable at runtime, unfixable via frontend/package.json) and
+      # unpatched Debian base packages. Fixed at the root: frontend/Dockerfile
+      # is now a multi-stage build using Next's own `output: "standalone"`
+      # (next.config.mjs) -- the runtime stage ships no npm CLI at all and
+      # runs `apt-get upgrade`, same as backend/Dockerfile. A clean rescan
+      # after that fix found zero HIGH/CRITICAL findings; no --ignore-vuln
+      # exceptions needed.
+      - name: Scan frontend image (Trivy, fixable HIGH/CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.57.0 image --severity HIGH,CRITICAL --ignore-unfixed \
+            --exit-code 1 --no-progress pulse-frontend:ci
+
       - name: Generate frontend SBOM (CycloneDX)
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" \

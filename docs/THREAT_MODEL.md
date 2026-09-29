@@ -150,9 +150,17 @@ this codebase ever interpolates such a value into SQL, a shell command, or a tru
   audited almost nothing; they now install the project into their own virtualenv first.
 - **The image scan found real, fixable issues on its first honest run** -- 16 HIGH/CRITICAL findings in
   the Debian base (perl, openssl, sqlite, pcre2), all with published fixes. The Dockerfile now runs
-  `apt-get upgrade`. Not scanned: the frontend image. Observed, not changed: the backend image also
-  installs the `dev` extras and copies `tests/` (CI runs the suite inside it), which is more than a
-  production image needs.
+  `apt-get upgrade`. Observed, not changed: the backend image also installs the `dev` extras and copies
+  `tests/` (CI runs the suite inside it), which is more than a production image needs.
+- **The frontend image is scanned too now (Phase 31), and needed a bigger fix than the backend's did.**
+  A naive scan of the original single-stage image found real findings -- unpatched Debian base packages
+  (same class as the backend's), plus a full set of CVEs in npm's own bundled internal dependencies
+  (`pacote`, `tar`, `sigstore`, etc.), none of them reachable by this app at runtime and none fixable via
+  `frontend/package.json` since they aren't this app's dependencies at all. `output: "standalone"`
+  (Next's own mode for exactly this) plus explicitly removing npm's CLI from the runtime stage (it only
+  ever runs `node server.js`) eliminated the entire class of finding at the root -- a rescan came back
+  with zero HIGH/CRITICAL findings, no `--ignore-vuln` exceptions needed. Image size also dropped from
+  ~1.5 GB to ~400 MB as a side effect, not the goal.
 - **A signed SBOM exists per build (Phase 30), but attests to CI's image, not Render's.** CI generates a
   CycloneDX SBOM for the backend and frontend images it builds and signs it keylessly via GitHub's
   Sigstore-backed attestation (`actions/attest-build-provenance`, OIDC -- no key to manage or leak). This
