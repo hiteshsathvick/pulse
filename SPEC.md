@@ -1775,6 +1775,8 @@ clean.
 -- the other recommended-default fork answer. Suppression's bounded-TTL trade-off (above) is unresolved by
 design, not an oversight.
 
+> **Superseded by Phase 27 (§6.25):** the PII-rules management UI deferred above now exists.
+
 ### 6.24 A real staging deploy mechanism (Phase 26)
 
 Not a numbered phase in the original roadmap: after Phase 25 the user asked for a Phase 26, and the one
@@ -1825,6 +1827,72 @@ not a decision to run it indefinitely: `terraform destroy` removed all 10 Terraf
 (verified empty afterward against the real Render and ClickHouse Cloud APIs, not just a "destroy complete"
 message) and the 8 Render Blueprint services were deleted directly. The B2 bucket and the Render/ClickHouse
 API keys were left in place (not Terraform-managed, cost nothing idle) for a future re-run.
+
+### 6.25 PII-rules management UI (Phase 27)
+
+Not a numbered phase in the original roadmap: after Phase 26 the user asked for a Phase 27, and with
+nothing defined, the pending item Phase 25 itself had named as its explicitly deferred fork answer --
+"no PII-rules management UI (list/create/delete), only subject deletion" -- was proposed and confirmed
+first. The rule-management API has existed since Phase 25; this phase gave it a console screen, the
+same way Phase 25 gave the older subject-deletion API its first screen.
+
+**New route** (`frontend/src/app/orgs/[orgId]/projects/[projectId]/pii-rules`,
+`frontend/src/components/pii-rules/PiiRules.tsx`, `frontend/src/lib/pii-rules-api.ts`) -- list, create and
+delete against `pulse/api/pii_rules.py` (unchanged this phase). **Gated on Admin-or-Owner, not Owner-only**:
+`pii_rules.py`'s three routes all depend on `require_role(MembershipRole.ADMIN)`, one rank below the
+Subject Deletion page's Owner-only gate -- copying `SubjectDeletion.tsx`'s `role !== "owner"` check verbatim
+would have hidden the page from Admins the backend actually permits, so the client-side check here is
+`role !== "owner" && role !== "admin"` instead. A create form (property key + hash/drop action select) shows
+the `archive_rewrite` summary the API already returned (entries scrubbed, objects rewritten, an
+unreadable-objects warning when non-zero, or a distinct message when the field is `null` -- the archive
+was unreachable, not merely empty) -- mirroring `SubjectDeletion`'s `SuccessReport`, not a bare
+confirmation. **Deletion uses a plain `window.confirm`, not Subject Deletion's type-`DELETE`-to-confirm
+pattern** -- a deliberate difference, not an oversight: deleting a rule only stops *future* enforcement
+(already-scrubbed data stays scrubbed, per Phase 25's own "deleting a rule does not un-scrub anything"),
+so it doesn't carry the same irreversible-data-loss weight as erasing a subject, and the codebase's existing
+lighter-weight delete confirmations (`DashboardEditor.tsx`, `InsightBuilder.tsx`) already establish
+`window.confirm` as this repo's normal-destructiveness pattern.
+
+**A real, pre-existing bug found and fixed by live verification, not by any test**: `infra/docker/docker-compose.yml`'s
+`api` service has never set `S3_ENDPOINT_URL`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` -- only `ingest-worker` has,
+since only the worker ever touched object storage before Phase 24/25 added archive-reaching endpoints
+(`delete_subject`, `create_pii_rule`) that run synchronously *inside an API request*, not the worker. The
+gap is invisible to `pytest` (the backend test suite talks to the app in-process, never through this
+container) and had been invisible in every prior live check too, because Phase 24/25's own live verification
+ran the backend via the host venv (which correctly resolves the published `localhost:9002` port), never via
+`docker compose up api`. Running the full compose stack for this phase's check surfaced it directly: creating
+a rule against a project with an already-archived event returned `archive_rewrite: null` with a
+`ConnectionRefusedError` to `localhost:9002` in the API's own log -- the *container's* localhost, reachable
+only from itself, not the `objectstore` service. Fixed by adding the same three `S3_*` vars (and an
+`objectstore` health dependency) to the `api` service block, matching `ingest-worker`'s. **Staging/production
+were never affected**: Terraform's `render_env_group.managed` already hands the same S3 credentials to
+every Blueprint service via `fromGroup`, api included -- confirmed by rereading `infra/render/staging.render.yaml`
+before assuming this needed a second fix anywhere else.
+
+**Verified live, beyond the tests**, against the real, freshly-rebuilt API/worker/frontend images (the
+running containers were still on Phase-26-era code and silently 404'd/used the pre-Phase-25 response shape
+until rebuilt -- rebuilding before trusting a live check is now the standing practice, not just documented
+once) and Postgres/ClickHouse/Redis/SeaweedFS: registered a user, created an org and project, created a
+write key, ingested a real event through `/ingest`, confirmed the worker landed and archived it. Created a
+`hash` rule on the archived event's property through the real API -- `archive_rewrite:
+{"entries_scrubbed": 1, "objects_rewritten": 1, "unreadable_objects": 0}`, the exact shape
+`PiiRules.tsx`'s success report renders. Confirmed the 409-duplicate-property_key path, the full
+list ordering, a real `DELETE` (204) and a re-`DELETE` of the same id (404) -- all matching
+`pii-rules-api.ts`'s types exactly. Confirmed the new route's `ProtectedRoute` gate live in the browser:
+visiting `/orgs/.../pii-rules` signed out redirects to `/login`, the same as every other feature page.
+Frontend-only phase, like Phase 25's own Owner-only page and Phases 21/22 before it -- no backend code
+changed except the docker-compose fix above.
+
+**Tests:** `PiiRules.test.tsx` (12) -- role-gating (member sees the explanation, not the form, and the list
+is never fetched; an admin, not just an owner, can use the page), empty state, listing rules with their
+action, the create button disabled until a property key is given, a successful create's payload and success
+report (including the unreadable-objects and null-archive_rewrite cases), the form clearing after success,
+the 409 duplicate-key error surfacing verbatim, and delete's confirm-then-call-then-refetch sequence
+(including declining the confirm). Full frontend suite 158 -> 170 passed. `npm run build` and `npm run lint`
+clean; `tsc --noEmit` clean. No backend tests added -- `pii_rules.py` and its `test_pii_rules_api.py` /
+`test_pii_archive_rewrite.py` coverage are unchanged from Phase 25; only the local dev compose config
+changed, which has no automated test surface of its own (a real regression there would only ever show up
+the way this one did, by an actual container failing to reach the object store).
 
 ---
 
@@ -1965,6 +2033,20 @@ deployed all 8 services live; ☑ `/health` confirmed every store connection act
 server-rendered against the live API; ☑ a real commit to `master` auto-deployed to staging with nobody
 clicking anything, proving the literal DoD sentence. ◐ Production was never applied. ◐ Prometheus/Grafana's
 live scrape path and the archive's B2 connectivity were not directly exercised this round (see §6.24).
+
+**Phase 27 — PII-rules management UI (post-roadmap; agreed after Phase 26).** ☑ list/create/delete for a
+project's PII rules, gated Admin-or-Owner (matching the backend's actual `require_role(ADMIN)`, not copied
+from the Owner-only Subject Deletion page); ☑ a create form (property key + hash/drop) that surfaces the
+API's `archive_rewrite` summary, including the null (store-unreachable) and unreadable-objects cases; ☑
+delete with a plain confirm, deliberately lighter than Subject Deletion's type-to-confirm since it only
+stops future enforcement. Verified live against a freshly rebuilt API/worker/frontend and a real ingested,
+archived, then retroactively-scrubbed event (`archive_rewrite: {"entries_scrubbed": 1, "objects_rewritten":
+1, "unreadable_objects": 0}`) -- which surfaced and fixed a real, previously-invisible gap: the local
+`docker-compose.yml` `api` service never had object-storage credentials, so every archive-touching request
+made directly from the API process (this phase's rule creation, and Phase 24/25's subject deletion before
+it) had been silently falling into the best-effort "unreachable" path in the full compose stack the whole
+time, un-caught because CI/pytest never route through this container and Phase 24/25's own live checks ran
+the backend via the host venv instead. 12 new frontend tests (158 -> 170 passed); no backend code changed.
 
 ---
 
@@ -2584,3 +2666,36 @@ live scrape path and the archive's B2 connectivity were not directly exercised t
   (`test_object_storage_is_backblaze_b2_not_aws_and_needs_no_aws_provider`); ruff / ruff format / mypy
   clean. Committed as `f44cfa6` (no tag -- staging proof, not a phase boundary with new application code);
   pushed; CI green.
+- 2026-09-29 — Phase 27 — Added §6.25 and a Phase 27 DoD line. Not in the original roadmap: after Phase 26
+  the user asked for a Phase 27, and with nothing defined, Phase 25's own explicitly deferred fork answer
+  ("no PII-rules management UI, only subject deletion") was proposed and confirmed first. (1) **New console
+  screen** (`frontend/src/app/orgs/[orgId]/projects/[projectId]/pii-rules`, `PiiRules.tsx`,
+  `pii-rules-api.ts`) for the list/create/delete PII-rules API that has existed since Phase 25 with no UI at
+  all -- mirroring how Phase 25 itself gave the older subject-deletion API its first screen. **Gated
+  Admin-or-Owner, not Owner-only**: `pii_rules.py`'s routes depend on `require_role(ADMIN)`, one rank below
+  Subject Deletion's Owner-only gate, so the client check is `role !== "owner" && role !== "admin"` rather
+  than copying `SubjectDeletion.tsx`'s check verbatim (which would wrongly hide the page from Admins the
+  backend permits). The create form surfaces the API's `archive_rewrite` summary (entries scrubbed, objects
+  rewritten, an unreadable-objects warning, or a distinct message when the field is `null`), mirroring
+  `SubjectDeletion`'s success report. Deletion uses a plain `window.confirm`, not a type-to-confirm phrase --
+  deliberately lighter than Subject Deletion, since deleting a rule only stops future enforcement and
+  doesn't undo any scrubbing already done, matching this repo's existing lighter delete-confirm pattern
+  (`DashboardEditor.tsx`, `InsightBuilder.tsx`). (2) **A real, previously-invisible bug found by live
+  verification, not any test:** `infra/docker/docker-compose.yml`'s `api` service has never had
+  `S3_ENDPOINT_URL`/`S3_ACCESS_KEY`/`S3_SECRET_KEY` -- only `ingest-worker` did, since only the worker ever
+  touched object storage before Phase 24/25 added archive-reaching endpoints that run synchronously inside
+  an API request. Invisible to `pytest` (in-process, never through this container) and to every prior live
+  check (Phase 24/25 ran the backend via the host venv, not `docker compose up api`); surfaced the moment
+  this phase ran the full compose stack, as a `ConnectionRefusedError` to the container's own `localhost:9002`
+  and an always-null `archive_rewrite`. Fixed by adding the same three vars (and an `objectstore` health
+  dependency) to the `api` service, matching `ingest-worker`'s -- confirmed staging/production were never
+  affected, since Terraform's `render_env_group.managed` already hands every Blueprint service the same S3
+  credentials via `fromGroup`. **Verified live** against freshly rebuilt API/worker/frontend images (the
+  running containers were still serving Phase-26-era code -- rebuilding before trusting a live check is now
+  standing practice, not a one-off): registered a user, created an org/project/write-key, ingested and
+  archived a real event, then created a rule on it through the real API and got back exactly the shape the
+  UI renders (`archive_rewrite: {"entries_scrubbed": 1, "objects_rewritten": 1, "unreadable_objects": 0}`);
+  confirmed the 409-duplicate path, list ordering, a real delete (204) and re-delete (404); confirmed the
+  new route's `ProtectedRoute` gate live in the browser (signed-out visit redirects to `/login`). 12 new
+  frontend tests (158 -> 170 passed); `npm run build`/`lint` and `tsc --noEmit` clean; no backend code
+  changed. Committed as (pending -- awaiting the user's go-ahead to commit/push); CI not yet run.

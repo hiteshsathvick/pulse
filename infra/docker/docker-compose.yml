@@ -79,6 +79,18 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-pulse}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DB:-pulse}
       REDIS_URL: redis://redis:6379/0
+      # ingest-worker archives events as it lands them, but subject deletion
+      # (Phase 24) and a PII rule's retroactive archive rewrite (Phase 25) run
+      # synchronously inside an API request handler, not the worker -- this
+      # service needs its own object-storage credentials for the same reason
+      # ingest-worker does. Missing until Phase 27's live check: every such
+      # request was silently falling into the best-effort "store unreachable"
+      # path (an unhandled exception caught the try/except, not a crash), so
+      # it never surfaced as a failed request -- only as an always-null
+      # archive_rewrite/report.
+      S3_ENDPOINT_URL: http://objectstore:8333
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-pulse}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-pulse12345}
     ports:
       - "8000:8000"
     depends_on:
@@ -87,6 +99,8 @@ services:
       clickhouse:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      objectstore:
         condition: service_healthy
     healthcheck:
       test:

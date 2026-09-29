@@ -65,6 +65,15 @@ function ProjectHome() {
           Privacy
         </Link>
         <p className="text-gray-500">Delete a subject&apos;s data on request (Owners only).</p>
+        <Link
+          href={`/orgs/${orgId}/projects/${projectId}/pii-rules`}
+          className="mt-2 text-lg font-medium underline"
+        >
+          PII rules
+        </Link>
+        <p className="text-gray-500">
+          Scrub a property from every event automatically (Admins and Owners).
+        </p>
       </div>
     </div>
   );
