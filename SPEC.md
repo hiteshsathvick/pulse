@@ -1940,6 +1940,50 @@ only its S3 credentials pointed at B2 -- a deployed Render service (staging or p
 reaching B2 from Render's network has still never been exercised, and `/health` still doesn't check
 object storage connectivity at all.
 
+### 6.27 Object storage in /health (Phase 29)
+
+Not a numbered phase in the original roadmap: after Phase 28 the user asked for a Phase 29, and the
+recommended pick from a short menu was the concrete, zero-cost gap Phase 28 itself had just named in its
+own "still not proven" line above -- `/health` never checked object storage at all.
+
+**`pulse/repositories/object_storage.py` gained `check_connection()`**, added to `pulse/api/health.py`'s
+`_CHECKS` tuple alongside Postgres/ClickHouse/Redis, same shape as the other three. **Deliberately not
+`bucket_exists`** (a HeadBucket-style request): confirmed live in Phase 28 that a bucket-scoped B2
+Application Key -- the credential this app is actually meant to run with, not a master key -- returns
+`AccessDenied` for `bucket_exists` even when fully functional for every operation the app actually
+performs (list/put/get/remove). Using it here would have made `/health` report a false `error` against a
+perfectly healthy bucket, a worse outcome than not checking at all. Instead the check pulls exactly one
+page from the SDK's `list_objects` generator (`next(..., None)`) -- a single bounded request regardless of
+bucket size, and the same call `list_keys`/subject erasure/PII archive rewrite already rely on working.
+
+**A real, previously-untested failure path, not just a new success check**: `/health` has had no test at
+all for what happens when a store is actually down, since Phase 0 -- every one of its checks has been
+trusted to report an outage correctly, untested, for the whole project's history. Added
+`test_health_is_503_when_object_storage_is_unreachable`, which patches `health._CHECKS` itself (not
+`object_storage.check_connection` directly -- the tuple already holds a direct reference to the function
+object, bound at import time, so patching the module attribute afterward wouldn't reach the already-bound
+tuple entry) to fail one check and confirms the endpoint goes `503` with that one check's real error
+message while the other three still correctly report `ok` alongside it.
+
+**Verified live**: rebuilt and restarted the local `docker-api-1` container; `GET /health` now reports
+`"object_storage": "ok"` as a fourth check. The failure path was verified by test (against the real FastAPI
+app object, one dependency swapped) rather than by breaking the live container a second time, since the
+success path was already proven live and the failure path's own correctness doesn't depend on which
+container it runs in.
+
+**A real, unrelated flakiness finding along the way**: a full-suite run after this session's earlier B2
+work (Phase 28) came back with a shifting, non-overlapping set of 24-35 failures across files this phase
+never touched (`test_insights.py`, `test_observability.py`, `test_alert_evaluation.py`, ...) -- every one
+of them passed cleanly re-run in isolation, and a third full run after restarting Postgres/ClickHouse/Redis
+for a clean connection slate passed clean (490 -> 490, no failures). Consistent with this project's
+already-known local-session flakiness (`docker_desktop_containers_dying_midrun`-style project memory), not
+a regression from this phase's two-file change -- the shifting, unrelated failure set across two different
+runs is itself evidence against a deterministic regression.
+
+**Tests:** `test_health.py` (1 new, 2 total) -- the existing happy-path test extended to assert
+`object_storage: ok`; the new failure-path test above. 489 -> 490 passed, 1 skipped (a clean, isolated
+run after a container restart). ruff / ruff format / mypy (`pulse`, strict) clean. No frontend changes.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2101,6 +2145,13 @@ retroactive archive rewrite run against the same real bucket -- the ruled proper
 hashed, an untouched property came back unchanged. ◐ Only the app's own S3 credentials pointed at B2, run
 locally -- a deployed Render service reaching B2 from Render's own network is still unexercised, and
 `/health` still doesn't check object storage. No code changed; pure verification (see §6.26).
+
+**Phase 29 — Object storage in /health (post-roadmap; agreed after Phase 28).** ☑ `/health` now checks
+object storage connectivity alongside Postgres/ClickHouse/Redis, via a single bounded LIST call rather
+than `bucket_exists` (confirmed live in Phase 28 to false-negative against a working bucket-scoped B2
+key); ☑ a real failure-path test for `/health` -- the first one ever, for any of its four checks. Verified
+live against a rebuilt local API container (`object_storage: "ok"`). 1 new backend test (489 -> 490
+passed, 1 skipped); ruff / ruff format / mypy clean. No frontend changes.
 
 ---
 
@@ -2777,5 +2828,24 @@ locally -- a deployed Render service reaching B2 from Render's own network is st
   the B2 rewrite had already committed by then.) Cleaned up afterward: the one test object deleted from the
   real bucket, the local worker container restarted. **Still not proven**: a deployed Render service
   actually reaching B2 from Render's own network, and `/health` still doesn't check object storage --
-  updated `docs/DEPLOYMENT.md` to say so precisely. Not committed -- no files changed except SPEC.md and
-  DEPLOYMENT.md.
+  updated `docs/DEPLOYMENT.md` to say so precisely. Committed as `74766ac` (docs only), pushed; CI green.
+- 2026-09-29 — Phase 29 — Added §6.27 and a Phase 29 DoD line. Not in the original roadmap: after Phase 28
+  the user asked for a Phase 29, and the recommended pick from a short menu was the concrete gap Phase 28
+  had just named in its own "still not proven" line: `/health` never checked object storage at all. (1)
+  **`object_storage.check_connection()`**, added to `/health`'s checks alongside Postgres/ClickHouse/Redis.
+  Deliberately not `bucket_exists` (a HeadBucket-style call) -- confirmed live in Phase 28 that a
+  bucket-scoped B2 Application Key returns `AccessDenied` for it even when fully healthy, which would have
+  made `/health` false-negative against a working bucket. Uses a single bounded `list_objects` page instead
+  (`next(..., None)`), the same underlying call the archive/erasure code paths already rely on. (2) **A
+  real, previously-untested failure path**: `/health` has never had a test for what happens when a store is
+  actually down, for any of its four checks, since Phase 0. Added a test that patches `health._CHECKS`
+  itself rather than the `object_storage` module attribute directly (the tuple already holds a bound
+  function reference from import time, so patching the module afterward wouldn't reach it) -- confirms a
+  503 with the real error message on the failing check while the other three still report `ok` alongside
+  it. **A real, unrelated flakiness finding along the way**: a full-suite run came back with a shifting,
+  non-overlapping set of 24-35 failures across files this phase never touched; every one passed cleanly
+  re-run in isolation, and a clean run after restarting Postgres/ClickHouse/Redis passed outright (490 ->
+  490, no failures) -- consistent with this project's already-known local-session flakiness, not a
+  regression from this phase's two-file change. **Verified live** against a rebuilt local API container:
+  `GET /health` now reports `"object_storage": "ok"` as a fourth check. 1 new backend test (489 -> 490
+  passed, 1 skipped); ruff / ruff format / mypy clean; no frontend changes.

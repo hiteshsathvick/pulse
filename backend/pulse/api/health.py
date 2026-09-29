@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from pulse.repositories import clickhouse, postgres
+from pulse.repositories import clickhouse, object_storage, postgres
 from pulse.repositories import redis as redis_repo
 
 router = APIRouter()
@@ -10,6 +10,7 @@ _CHECKS = (
     ("postgres", postgres.check_connection),
     ("clickhouse", clickhouse.check_connection),
     ("redis", redis_repo.check_connection),
+    ("object_storage", object_storage.check_connection),
 )
 
 

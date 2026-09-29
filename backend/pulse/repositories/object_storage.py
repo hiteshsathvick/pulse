@@ -27,6 +27,25 @@ def get_client() -> Minio:
     return _client
 
 
+async def check_connection() -> bool:
+    """Proves the object store is reachable with a single bounded LIST call.
+    Deliberately not `bucket_exists` (a HeadBucket request): confirmed live
+    (Phase 28) that a bucket-scoped B2 Application Key -- the credential this
+    app is actually meant to run with, not a master key -- returns
+    AccessDenied for it even when fully functional for every operation this
+    app actually performs (list/put/get/remove). `next(..., None)` pulls
+    exactly one page of the generator MinIO's SDK returns, so this costs one
+    request regardless of how many objects the bucket holds."""
+    settings = get_settings()
+    client = get_client()
+
+    def _check() -> bool:
+        next(client.list_objects(settings.s3_bucket, recursive=True), None)
+        return True
+
+    return await asyncio.to_thread(_check)
+
+
 async def ensure_bucket() -> None:
     """Idempotent, like alembic/env.py's _ensure_app_role_exists -- called on
     worker startup so a fresh MinIO instance doesn't need manual setup."""
