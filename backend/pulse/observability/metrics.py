@@ -42,6 +42,12 @@ WORKER_EVENTS = Counter(
     "Stream entries the ingest worker handled, by outcome. `poisoned` is the DLQ rate.",
     ["outcome"],  # inserted | duplicate | poisoned | suppressed
 )
+WORKER_CYCLE_FAILURES = Counter(
+    "pulse_worker_cycle_failures_total",
+    "Worker cycles that raised uncaught (Redis down, say) and were retried "
+    "after a backoff instead of crashing the process. Sustained nonzero "
+    "means a real outage, not a blip.",
+)
 WORKER_BATCH_SIZE = Histogram(
     "pulse_worker_batch_size",
     "Stream entries per worker batch.",

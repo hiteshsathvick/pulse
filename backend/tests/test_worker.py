@@ -6,6 +6,7 @@ from pathlib import Path
 
 import clickhouse_connect
 import pytest
+from prometheus_client import REGISTRY
 
 from alembic import command
 from alembic.config import Config
@@ -26,6 +27,10 @@ from tests.clickhouse_schema import drop_event_schema
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 _MIGRATIONS_DIR = _BACKEND_ROOT / "pulse" / "clickhouse_migrations" / "migrations"
+
+
+def _sample(name: str, labels: dict[str, str] | None = None) -> float:
+    return REGISTRY.get_sample_value(name, labels or {}) or 0.0
 
 
 def _alembic_config() -> Config:
@@ -397,3 +402,53 @@ async def test_acked_entries_are_deleted_so_the_ingest_stream_does_not_grow_with
 
     assert await redis_client.xlen(stream_key) == 0
     assert (await redis_client.xinfo_groups(stream_key))[0]["pending"] == 0
+
+
+async def test_a_cycle_failure_backs_off_and_retries_instead_of_crashing_the_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 32, found live: a Redis restart mid-session raised a
+    ConnectionError out of read_batch/update_stream_gauges -- neither is
+    inside run_cycle's own try/except (that one only guards process_batch,
+    for the batch-stays-pending backpressure behavior) -- and nothing in
+    main()'s `while True: await run_cycle()` ever caught it, so the whole
+    worker process died and needed a manual restart to notice and recover.
+    run_cycle_with_retry() is the fix; this drives exactly one iteration of
+    it without needing main()'s infinite loop."""
+    import pulse.worker.main as worker_main
+
+    async def _boom() -> None:
+        raise ConnectionError("simulated Redis outage")
+
+    monkeypatch.setattr(worker_main, "run_cycle", _boom)
+
+    slept: list[float] = []
+
+    async def _fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(worker_main.asyncio, "sleep", _fake_sleep)
+
+    before = _sample("pulse_worker_cycle_failures_total")
+    await worker_main.run_cycle_with_retry()  # must not raise
+    after = _sample("pulse_worker_cycle_failures_total")
+
+    assert after == before + 1
+    assert slept == [get_settings().worker_cycle_retry_backoff_seconds]
+
+
+async def test_a_successful_cycle_neither_sleeps_nor_counts_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pulse.worker.main as worker_main
+
+    async def _noop() -> None:
+        return None
+
+    monkeypatch.setattr(worker_main, "run_cycle", _noop)
+
+    before = _sample("pulse_worker_cycle_failures_total")
+    await worker_main.run_cycle_with_retry()
+    after = _sample("pulse_worker_cycle_failures_total")
+
+    assert after == before

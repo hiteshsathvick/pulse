@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 from pulse.core.config import get_settings
-from pulse.observability.metrics import update_stream_gauges
+from pulse.observability.metrics import WORKER_CYCLE_FAILURES, update_stream_gauges
 from pulse.observability.setup import setup_observability
 from pulse.repositories import clickhouse, object_storage
 from pulse.repositories import redis as redis_repo
@@ -64,6 +64,25 @@ async def run_cycle() -> None:
     )
 
 
+async def run_cycle_with_retry() -> None:
+    """One trip through run_cycle(), never raising. A ClickHouse/object-storage
+    failure *during* processing is already handled inside run_cycle -- the
+    batch stays pending, not lost. This is the broader net around the whole
+    cycle: a Redis error from read_batch/update_stream_gauges (confirmed live
+    -- a Redis restart mid-session took the whole worker process down, needing
+    a manual restart to notice and recover) used to propagate straight out of
+    the main loop uncaught. redis-py's own connection pool recovers on its own
+    on the next call; nothing here ever gave it one. Split out from main()'s
+    `while True` so a test can drive exactly one iteration without looping
+    forever."""
+    try:
+        await run_cycle()
+    except Exception:
+        WORKER_CYCLE_FAILURES.inc()
+        logger.exception("worker cycle failed, retrying after backoff")
+        await asyncio.sleep(get_settings().worker_cycle_retry_backoff_seconds)
+
+
 async def main() -> None:
     settings = get_settings()
     setup_observability("pulse-ingest-worker")
@@ -76,7 +95,7 @@ async def main() -> None:
 
     logger.info("ingest-worker starting (consumer=%s)", settings.worker_consumer_name)
     while True:
-        await run_cycle()
+        await run_cycle_with_retry()
 
 
 if __name__ == "__main__":

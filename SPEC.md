@@ -2080,6 +2080,49 @@ gate test now iterates *both* scan steps rather than checking only the first fou
 non-blocking second scan can't hide again the way it could have before this phase. 492 -> 493 passed,
 1 skipped. ruff / ruff format / mypy (`pulse`, strict) clean.
 
+### 6.30 Worker resilience to a Redis disconnect (Phase 32)
+
+Not a numbered phase in the original roadmap: after Phase 31 the user asked for a Phase 32, and the
+recommended pick was something found firsthand this same session, not from any doc: Phase 29's own
+`docker compose restart postgres clickhouse redis` (done to get a clean connection slate before a full
+test run) crashed the local `docker-ingest-worker-1` container outright -- it sat exited for roughly an
+hour, unnoticed, until this phase's own investigation found it.
+
+**Root cause**: `pulse/worker/main.py`'s `run_cycle()` only wraps `process_batch` in a try/except -- by
+design, for the batch-stays-pending backpressure behavior a ClickHouse or object-storage outage needs. But
+`update_stream_gauges` and `read_batch`, both real Redis calls that run *before* that try/except, were
+never guarded at all, and `main()`'s `while True: await run_cycle()` had no guard of its own either. A
+`redis.exceptions.ConnectionError` from either call propagated straight out of `main()`, uncaught, and
+`asyncio.run(main())` took the whole process down -- confirmed exactly by the real traceback in the crashed
+container's own logs.
+
+**The fix is a retry wrapper, not manual reconnection logic**: redis-py's own connection pool already
+creates a fresh connection on the next call once one breaks -- the actual problem was that nothing ever
+gave it a next call. `run_cycle()` is now split out from a new `run_cycle_with_retry()`, which `main()`'s
+loop calls instead: it runs one cycle, and on *any* uncaught exception, increments a new
+`pulse_worker_cycle_failures_total` counter, logs it, and sleeps `worker_cycle_retry_backoff_seconds`
+(new setting, default 2.0s) before returning -- never raising, so the loop keeps going. Splitting it out
+this way (rather than putting the try/except directly in `main()`'s `while True`) is what let a test drive
+exactly one iteration without needing to run or interrupt an infinite loop.
+
+**Verified live, reproducing the exact original failure, not just a unit test**: rebuilt the worker and
+API images with the fix, restarted them, then ran `docker compose restart redis` again -- the same action
+that killed the container an hour earlier. This time `docker inspect` showed the container's own restart
+count stay at 0 (Docker never had to restart it -- the process itself survived), the new "worker cycle
+failed, retrying after backoff" log line appeared exactly once, and a freshly ingested event immediately
+after was picked up and processed normally (`1 inserted ... 1 acked`) in the very next log line -- proving
+real recovery, not just "didn't crash but also stopped working." A real, unrelated environment gotcha
+surfaced along the way: running the backend pytest suite against the same local dev Postgres the
+docker-compose stack points at downgrades its schema at module teardown (already documented in project
+memory), which briefly broke the live API with an unrelated `relation "api_keys" does not exist` error --
+resolved by re-running `alembic upgrade head` before trusting the live check, not a bug in this phase's
+own change.
+
+**Tests:** `test_worker.py` (+2) -- a simulated cycle failure increments the new counter, sleeps for
+exactly the configured backoff, and does not raise; a successful cycle does neither. Both drive
+`run_cycle_with_retry()` directly via `monkeypatch`, not the real infinite loop. 493 -> 495 passed,
+1 skipped. ruff / ruff format / mypy (`pulse`, strict) clean. No frontend changes.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2268,6 +2311,16 @@ bundled internal deps (unfixable via `frontend/package.json`) plus unpatched Deb
 Dockerfile properly rather than suppressing the findings. Image size dropped ~1.5GB -> ~400MB as a side
 effect. 1 new backend test (492 -> 493 passed, 1 skipped); ruff / ruff format / mypy clean; frontend suite
 unaffected (170 passed). No application code changed -- Dockerfile, config, CI and docs only (see §6.29).
+
+**Phase 32 — Worker resilience to a Redis disconnect (post-roadmap; agreed after Phase 31).** ☑ a Redis
+`ConnectionError` from `read_batch`/`update_stream_gauges` no longer crashes the worker process -- found
+live this session (Phase 29's own Redis restart killed it, unnoticed for about an hour); ☑ a new
+`run_cycle_with_retry()` catches any uncaught cycle exception, counts it (`pulse_worker_cycle_failures_total`),
+logs it, and backs off before retrying, relying on redis-py's own connection pool to recover rather than
+implementing manual reconnection. Verified by reproducing the exact original failure: restarted Redis again
+against the fixed worker, confirmed the container's own restart count stayed 0 (the process itself
+survived) and a freshly ingested event was processed normally in the very next log line. 2 new backend
+tests (493 -> 495 passed, 1 skipped); ruff / ruff format / mypy clean. No frontend changes.
 
 ---
 
@@ -3016,4 +3069,33 @@ unaffected (170 passed). No application code changed -- Dockerfile, config, CI a
   existing Trivy-blocking-gate test extended to iterate both scan steps instead of checking only the first
   found (a silently non-blocking second scan could otherwise have hidden behind a passing test). 492 -> 493
   passed, 1 skipped; ruff / ruff format / mypy clean; frontend suite unaffected (170 passed), `npm run
-  build` clean. No application code changed -- Dockerfile, config, CI and docs only.
+  build` clean. No application code changed -- Dockerfile, config, CI and docs only. Committed as
+  `f6ac369`, pushed; CI green (the workflow's own new blocking scan step ran for real).
+- 2026-09-29 — Phase 32 — Added §6.30 and a Phase 32 DoD line. Not in the original roadmap: after Phase 31
+  the user asked for a Phase 32, and the recommended pick was something found firsthand in this very
+  session, not from any doc: Phase 29's own `docker compose restart postgres clickhouse redis` (to get a
+  clean connection slate before a full test run) crashed the local `docker-ingest-worker-1` container
+  outright, and it sat exited for roughly an hour before Phase 31's own investigation noticed. **Root
+  cause**: `pulse/worker/main.py`'s `run_cycle()` only wraps `process_batch` in a try/except, by design, for
+  the batch-stays-pending backpressure behavior a ClickHouse/object-storage outage needs -- but
+  `update_stream_gauges` and `read_batch`, real Redis calls that run *before* that try/except, were never
+  guarded, and `main()`'s `while True: await run_cycle()` had no guard of its own either, so a
+  `redis.exceptions.ConnectionError` from either propagated straight out and took the whole process down,
+  confirmed exactly by the crashed container's own traceback. **The fix is a retry wrapper, not manual
+  reconnection**: redis-py's own connection pool already recovers on the next call once one breaks; nothing
+  here ever gave it one. `run_cycle()` is now split out from a new `run_cycle_with_retry()`, which `main()`'s
+  loop calls instead -- one cycle, and on any uncaught exception, increments a new
+  `pulse_worker_cycle_failures_total` counter, logs it, sleeps `worker_cycle_retry_backoff_seconds` (new
+  setting, default 2.0s), and never raises, so the loop keeps going. **Verified live, reproducing the exact
+  original failure**: rebuilt the worker/API images, restarted them, then ran `docker compose restart redis`
+  again -- the same action that killed the container an hour earlier. This time the container's own restart
+  count stayed 0 (the process itself survived), the new "worker cycle failed, retrying after backoff" log
+  line appeared exactly once, and a freshly ingested event was picked up and processed normally in the very
+  next log line, proving real recovery, not just survival. A real, unrelated environment gotcha surfaced
+  along the way: running the backend pytest suite against the same local dev Postgres the docker-compose
+  stack points at downgrades its schema at module teardown (already documented in project memory), briefly
+  breaking the live API with an unrelated `relation "api_keys" does not exist` error until `alembic upgrade
+  head` was re-run -- not a bug in this phase's own change. 2 new backend tests (`test_worker.py`, driving
+  `run_cycle_with_retry()` directly via `monkeypatch` rather than the real infinite loop): a simulated
+  failure counts and backs off without raising; a success does neither. 493 -> 495 passed, 1 skipped. ruff /
+  ruff format / mypy clean. No frontend changes.

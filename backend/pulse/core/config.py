@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     # ReplacingMergeTree is the backstop for whatever slips past it.
     worker_dedup_ttl_seconds: int = 86_400
     worker_dlq_stream_key: str = "pulse:ingest:dlq"
+    # Phase 32: a transient Redis outage (a restart, a network blip) used to
+    # crash the whole worker process outright -- redis-py's own connection
+    # pool recovers on the next call, but nothing ever gave it one, since an
+    # uncaught error propagated straight out of the main loop. This is the
+    # backoff between retries once the loop catches that instead, so a
+    # sustained outage doesn't turn into a tight reconnect-attempt loop.
+    worker_cycle_retry_backoff_seconds: float = 2.0
     # How long a just-deleted subject's identity is suppressed from ingestion
     # (pulse/suppression.py) -- long enough that an event already accepted
     # into the stream when the deletion ran, and not yet landed, is caught
