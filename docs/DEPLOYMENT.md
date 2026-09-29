@@ -185,9 +185,14 @@ provisioned its datasource from the environment and the dashboard, and queried P
   Render-style DNS names (Phase 24/25, locally) and the Blueprint's `fromService`/`-discovery` wiring is
   believed correct by construction, but nobody has confirmed live Render data actually reaches the
   dashboard. Tempo isn't deployed at all.
-- **Object storage connectivity wasn't directly exercised.** `/health` checks Postgres, ClickHouse and
-  Redis, not S3/B2 -- the worker's archive-write path (which is what actually proves the B2 credentials
-  and bucket work end-to-end) hasn't been run against the live deployment.
+- **Object storage connectivity has been proven against the real B2 bucket, but not through a live
+  deployment.** Phase 28 ran the actual worker archive-write path and a PII rule's retroactive archive
+  rewrite (the exact app code, unmodified) against the real `pulse-staging-raw-events` bucket and its
+  Application Key left over from Phase 26 -- both worked, confirmed by reading the object back and seeing
+  the ruled property genuinely hashed. But the app processes that ran were local (host venv, talking to
+  local Postgres/ClickHouse/Redis) with only `S3_*` pointed at real B2 -- `/health` still only checks
+  Postgres, ClickHouse and Redis, not S3/B2, and no deployed Render service has made this call. The B2
+  credentials/bucket are proven good; the deployed API/worker actually reaching them from Render is not.
 - **Frontend env vars** (`NEXT_PUBLIC_API_URL`, `API_INTERNAL_URL`) can't be composed by a Blueprint, so
   they're filled by hand once per environment -- confirmed for real this round: Render didn't even
   auto-redeploy the frontend after the env var was corrected, a manual deploy trigger was needed.

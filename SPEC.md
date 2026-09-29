@@ -1894,6 +1894,52 @@ clean; `tsc --noEmit` clean. No backend tests added -- `pii_rules.py` and its `t
 changed, which has no automated test surface of its own (a real regression there would only ever show up
 the way this one did, by an actual container failing to reach the object store).
 
+### 6.26 Real B2 archive verification (Phase 28)
+
+Not a numbered phase in the original roadmap: after Phase 27 the user asked for a Phase 28, and with
+nothing defined, the recommended candidate from a short menu was to exercise the worker's archive-write
+path and a PII rule's retroactive rewrite against the *real* Backblaze B2 bucket left over from Phase
+26 -- `docs/DEPLOYMENT.md` had flagged this as unproven since Phase 26 ("the worker's archive-write path
+... hasn't been run against the live deployment"), and Phase 27's own local `docker-compose.yml` fix made
+it possible to test the same code path without a paid Render redeploy.
+
+**No code changed this phase** -- this is pure verification, using the exact application code as-is
+(`pulse.worker.main`, `pulse.services.pii_rules.create_pii_rule`) with only its `S3_*` environment pointed
+at the real bucket instead of local SeaweedFS/Docker's `objectstore` service.
+
+**Credential handoff, same discipline as Phase 26**: nothing from Phase 26's B2 Application Key was ever
+persisted (by design), so the user supplied it again this phase. The first two attempts to use it failed --
+`AccessDenied` then `InvalidAccessKeyId` -- both traced to a mistranscribed `keyID` from a screenshot (an
+OCR-style digit duplication in a long numeric run, 28 characters where B2's non-master key IDs are always
+25); resolved by asking for the value as pasted text instead of read from an image, which is now the
+practice going forward for any credential arriving as a screenshot. The bucket name and endpoint were
+confirmed against a screenshot of the bucket's own detail page before running anything, specifically to
+avoid the app's `ensure_bucket()` silently creating a wrongly-named bucket on the real account if a guessed
+name had been wrong.
+
+**Verified live against the real bucket**, not a mock or local SeaweedFS: the local `docker-ingest-worker-1`
+container was stopped so it wouldn't race a second consumer for the same stream; a real event was ingested
+through the real local API (`/ingest`); `python -m pulse.worker.main` was run on the host, pointed at local
+Postgres/ClickHouse/Redis but real B2, and picked up and archived the event -- confirmed by listing and
+reading the object directly from B2's own API, byte-matching the expected content. A PII rule
+(`secret_field` -> `hash`) was then created through the real `create_pii_rules` service call, same
+credentials -- the rule committed, and reading the B2 object back afterward showed `secret_field` genuinely
+replaced with its HMAC hash while the untouched `keep_field` property was unchanged, proving the retroactive
+archive-rewrite path (not just the forward-archive path) works against real B2 too. (One test-script-only
+hiccup along the way, not a real bug: the first `create_pii_rule` call used a random UUID for the test
+script's convenience instead of a real user id, and the audit-log insert's `actor_id` foreign key correctly
+rejected it -- the rule row and the B2 rewrite had already committed by that point, confirming the FK
+constraint is exactly the guard it's meant to be, not a bug in the archive-rewrite path itself.)
+
+**Cleaned up afterward**: the one test object was deleted from the real B2 bucket (leaving it empty, as
+found) and the local `docker-ingest-worker-1` container was restarted to restore the normal local dev
+state (back on local SeaweedFS).
+
+**Still not proven** (see `docs/DEPLOYMENT.md`'s updated "Not yet proven"): this ran the app locally with
+only its S3 credentials pointed at B2 -- a deployed Render service (staging or production) actually
+reaching B2 from Render's network has still never been exercised, and `/health` still doesn't check
+object storage connectivity at all.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2047,6 +2093,14 @@ made directly from the API process (this phase's rule creation, and Phase 24/25'
 it) had been silently falling into the best-effort "unreachable" path in the full compose stack the whole
 time, un-caught because CI/pytest never route through this container and Phase 24/25's own live checks ran
 the backend via the host venv instead. 12 new frontend tests (158 -> 170 passed); no backend code changed.
+
+**Phase 28 — Real B2 archive verification (post-roadmap; agreed after Phase 27).** ☑ the worker's
+archive-write path run for real against the live Backblaze B2 bucket/key left over from Phase 26 -- a real
+event ingested, archived, and confirmed byte-correct by reading it back directly from B2; ☑ a PII rule's
+retroactive archive rewrite run against the same real bucket -- the ruled property came back genuinely
+hashed, an untouched property came back unchanged. ◐ Only the app's own S3 credentials pointed at B2, run
+locally -- a deployed Render service reaching B2 from Render's own network is still unexercised, and
+`/health` still doesn't check object storage. No code changed; pure verification (see §6.26).
 
 ---
 
@@ -2698,4 +2752,30 @@ the backend via the host venv instead. 12 new frontend tests (158 -> 170 passed)
   confirmed the 409-duplicate path, list ordering, a real delete (204) and re-delete (404); confirmed the
   new route's `ProtectedRoute` gate live in the browser (signed-out visit redirects to `/login`). 12 new
   frontend tests (158 -> 170 passed); `npm run build`/`lint` and `tsc --noEmit` clean; no backend code
-  changed. Committed as (pending -- awaiting the user's go-ahead to commit/push); CI not yet run.
+  changed. Committed as `fb208df`, pushed; CI green.
+- 2026-09-29 — Phase 28 — Added §6.26 and a Phase 28 DoD line. Not in the original roadmap: after Phase 27
+  the user asked for a Phase 28, and the recommended pick from a short menu was to close the "worker's
+  archive-write path ... hasn't been run against the live deployment" gap `docs/DEPLOYMENT.md` had flagged
+  since Phase 26 -- made newly testable without a paid Render redeploy by Phase 27's own local
+  `docker-compose.yml` fix. **No code changed**: pure verification, running the unmodified app
+  (`pulse.worker.main`, `pii_rules_service.create_pii_rule`) with only its `S3_*` environment pointed at
+  the real `pulse-staging-raw-events` B2 bucket instead of local SeaweedFS. The B2 Application Key from
+  Phase 26 was never persisted (by design), so the user supplied it again; two credential attempts failed
+  (`AccessDenied`, then `InvalidAccessKeyId`) before tracing the cause to a mistranscribed `keyID` read from
+  a screenshot (28 characters where B2's are always 25) -- resolved by asking for it as pasted text instead,
+  now the practice for any credential arriving as an image. The bucket name/endpoint were confirmed against
+  a screenshot of the bucket's own detail page first, specifically so a wrong guess couldn't make the app's
+  `ensure_bucket()` silently create a stray bucket on the real account. **Verified live**: stopped the local
+  `docker-ingest-worker-1` container so it wouldn't race a second consumer; ingested a real event through
+  the real local API; ran the real worker on the host (local Postgres/ClickHouse/Redis, real B2) and
+  confirmed the archived object byte-for-byte by reading it back directly from B2's own API; created a
+  `hash` rule on one of its properties through the real service call and confirmed, again by reading the
+  live B2 object back, that the ruled property came back genuinely hashed while an untouched property was
+  unchanged -- proving both the forward archive-write path and the retroactive rewrite path against real
+  B2, not local SeaweedFS. (One test-script-only hiccup, not a real bug: a first attempt used a throwaway
+  random UUID as the audit log's `actor_id`, correctly rejected by the FK constraint -- the rule row and
+  the B2 rewrite had already committed by then.) Cleaned up afterward: the one test object deleted from the
+  real bucket, the local worker container restarted. **Still not proven**: a deployed Render service
+  actually reaching B2 from Render's own network, and `/health` still doesn't check object storage --
+  updated `docs/DEPLOYMENT.md` to say so precisely. Not committed -- no files changed except SPEC.md and
+  DEPLOYMENT.md.
