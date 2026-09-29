@@ -3,12 +3,15 @@
 Phase 23. Staging and production on Render, with the data services on ClickHouse Cloud, Backblaze B2
 and Render's managed Postgres/Key Value — all described as code and validated in CI.
 
-> **Status: built and validated, never applied.** No Render, ClickHouse Cloud or Backblaze B2 account
-> was used to produce this. Everything below is checked statically (Terraform validated against the real
-> provider schemas, Blueprints validated against Render's published schema, the release logic unit
-> tested), but a real first deploy will find things a static check can't. The Definition-of-Done
-> sentence "a merge to main deploys to staging automatically" is therefore proven **up to the
-> configuration** (`autoDeployTrigger: checksPass`), not by a live deploy. See "Not yet proven".
+> **Status: staging applied and proven live (Phase 26); production still config-only.** `terraform apply`
+> ran for real against Render, ClickHouse Cloud and Backblaze B2. `GET /health` on the live API reports
+> Postgres, ClickHouse and Redis all `ok`; the frontend server-renders against the live API; and a real
+> commit to `master` triggered a Render deploy with nobody touching a button, proving the Definition-of-Done
+> sentence "a merge to main deploys to staging automatically" for real, not just by configuration. Two real
+> bugs were caught by the first live `terraform plan`/`apply` that no static check could have found (a
+> stale Postgres plan-id format; a ClickHouse Cloud field the provider requires but `validate` doesn't
+> check) — see the Phase 26 changelog entry in SPEC.md. Production has still never been applied. See "Not
+> yet proven" for what staging itself still hasn't exercised.
 
 ## What lives where
 
@@ -174,15 +177,20 @@ provisioned its datasource from the environment and the dashboard, and queried P
 
 ## Not yet proven (be honest with yourself before relying on this)
 
-- **No live deploy has happened.** Expect first-deploy surprises (Flowforge's Render deploy found three
-  that no static check could).
-- **Deployed metrics are simulated, not proven on Render.** The scrape path is verified with the real
-  images against Render-style DNS names, but not against Render itself. The assumptions that only a real
-  deploy can confirm: that `fromService … property: host` yields the name the `-discovery` hostname is
-  built from, that a private service's `PORT` decides which port Render routes to, and that a persistent
-  disk mounts writable for the root user. Tempo isn't deployed at all.
+- **Production has never been applied.** Only staging was; expect it to have its own first-deploy
+  surprises even though staging's are now fixed (Flowforge's prod Render deploy found three that staging
+  testing hadn't).
+- **Deployed metrics were not exercised this round.** The API/frontend/Grafana health checks that were
+  run don't touch Prometheus at all. The scrape path is verified with the real images against
+  Render-style DNS names (Phase 24/25, locally) and the Blueprint's `fromService`/`-discovery` wiring is
+  believed correct by construction, but nobody has confirmed live Render data actually reaches the
+  dashboard. Tempo isn't deployed at all.
+- **Object storage connectivity wasn't directly exercised.** `/health` checks Postgres, ClickHouse and
+  Redis, not S3/B2 -- the worker's archive-write path (which is what actually proves the B2 credentials
+  and bucket work end-to-end) hasn't been run against the live deployment.
 - **Frontend env vars** (`NEXT_PUBLIC_API_URL`, `API_INTERNAL_URL`) can't be composed by a Blueprint, so
-  they're filled by hand once per environment.
+  they're filled by hand once per environment -- confirmed for real this round: Render didn't even
+  auto-redeploy the frontend after the env var was corrected, a manual deploy trigger was needed.
 - **No image signing / SBOM.** The image scan (Trivy) and dependency audits are now blocking gates — see
   `docs/THREAT_MODEL.md` for what that costs (a newly published advisory can turn CI red on its own).
 - **Rollback is tested against a fake Render client and Render's documented API**, not a real service:

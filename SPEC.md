@@ -1775,6 +1775,57 @@ clean.
 -- the other recommended-default fork answer. Suppression's bounded-TTL trade-off (above) is unresolved by
 design, not an oversight.
 
+### 6.24 A real staging deploy mechanism (Phase 26)
+
+Not a numbered phase in the original roadmap: after Phase 25 the user asked for a Phase 26, and the one
+substantive item every phase since 23 had flagged as still open was Phase 23's deploy half -- applied
+nowhere, validated only statically. This phase closed that, for staging.
+
+**A real, free account per provider, found by direct verification, not assumption.** Render and
+ClickHouse Cloud both confirmed no card required to sign up (checked against their own sign-up flows).
+AWS does require one just to create an account, which the user explicitly ruled out, so the object-storage
+provider changed: Backblaze B2 replaces AWS S3 (`infra/terraform/main.tf`) -- the same S3-compatible API
+`pulse/repositories/object_storage.py` already speaks (no app code changed), confirmed card-free directly
+on Backblaze's own sign-up page. B2 has no Terraform-reachable IAM-equivalent API, so unlike AWS's
+`aws_iam_user`/`aws_iam_access_key`, the bucket and its scoped Application Key are created once by hand;
+five `s3_*` variables carry those values through the same `TF_VAR_*` mechanism as every other credential.
+The `aws` provider and every `aws_*` resource are gone from the stack entirely -- a new test
+(`test_object_storage_is_backblaze_b2_not_aws_and_needs_no_aws_provider`) guards against it drifting back.
+
+**Two real "first-deploy surprise" bugs, caught by an actual `terraform plan`/`apply`, not by any static
+check** -- exactly what `docs/DEPLOYMENT.md` had predicted a static check couldn't find: (1)
+`staging.tfvars`/`prod.tfvars` used a hyphenated Postgres plan id (`basic-256mb`); Render's current
+flexible plan ids use an underscore, and the hyphenated style is a *legacy* instance type no longer
+accepted for a newly created database -- found by reading the provider's docs before ever applying, so it
+never cost a failed apply. (2) The ClickHouse Cloud provider rejects `idle_scaling = true` unless
+`idle_timeout_minutes` is also set -- a real provider-side validation `terraform validate` cannot see
+(it never calls ClickHouse's API); found by a live `plan` and fixed with the provider's own minimum (5
+minutes), so a mostly-idle staging service idles as aggressively as possible.
+
+**Staging was applied for real and the deploy mechanism proven end to end**, not just by configuration:
+`terraform apply` created all 10 resources (ClickHouse Cloud service, Render Postgres, Render Key Value,
+two Render env groups, five generated secrets) against the real APIs; the Render Blueprint deployed all 8
+services to `live`; `GET /health` on the live API reported Postgres, ClickHouse and Redis all `ok`,
+meaning `python -m pulse.migrate` (the API's `preDeployCommand`) genuinely ran and every connection string
+Terraform wrote actually works. The frontend's `API_INTERNAL_URL` couldn't be predicted (Render assigns
+it only once the service exists, confirming that specific "not yet proven" claim from Phase 23 was
+correct) -- filled in for real once known, which also surfaced that **Render does not always auto-redeploy
+on an env var change alone**; a deploy had to be triggered explicitly. Once redeployed, the frontend
+server-rendered real content against the live API. Finally, the literal Definition-of-Done sentence --
+"a merge to main deploys to staging automatically" -- was proven with an actual commit: pushed to
+`master`, CI went green, and Render deployed it with `trigger: new_commit` and nobody touching a deploy
+button, confirmed via the Render API (deploy history, not a screenshot).
+
+**Deliberately not exercised this round** (see `docs/DEPLOYMENT.md`'s "Not yet proven", kept honest rather
+than declared done because it wasn't checked): Prometheus/Grafana's live scrape path against real Render
+DNS (the health checks run didn't touch Prometheus at all); the worker's archive-write path against the
+real B2 bucket (only Postgres/ClickHouse/Redis connectivity was confirmed by `/health`); production, which
+was never applied. **Staging was applied as a bounded proof, by design** (confirmed with the user first),
+not a decision to run it indefinitely: `terraform destroy` removed all 10 Terraform-managed resources
+(verified empty afterward against the real Render and ClickHouse Cloud APIs, not just a "destroy complete"
+message) and the 8 Render Blueprint services were deleted directly. The B2 bucket and the Render/ClickHouse
+API keys were left in place (not Terraform-managed, cost nothing idle) for a future re-run.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -1901,8 +1952,19 @@ rule scrubbed two already-archived events' emails; a subsequent deletion removed
 rollup and archive; two events racing the deletion (one before it completed, one right after) were both
 dropped by the worker rather than reappearing, confirmed absent from both ClickHouse and the archive while
 an untouched user's data stayed intact throughout. 28 new backend tests (458 -> 486 passed, 1 skipped); 8
-new frontend tests (150 -> 158 passed). Phase 23's deploy half remains the only item still open across all
-phases.
+new frontend tests (150 -> 158 passed).
+
+> **Superseded by Phase 26 (§6.24):** Phase 23's deploy half is no longer only "validated" -- staging was
+> applied for real and the deploy mechanism proven live.
+
+**Phase 26 — A real staging deploy (post-roadmap; agreed after Phase 25).** ☑ AWS S3 swapped for
+Backblaze B2 (free, no card, confirmed directly); ☑ `terraform apply` created all 10 staging resources
+against the real Render/ClickHouse Cloud/B2 APIs, catching two real provider bugs no static check could
+(a stale Postgres plan-id format; a required-but-unvalidated ClickHouse field); ☑ the Render Blueprint
+deployed all 8 services live; ☑ `/health` confirmed every store connection actually works; ☑ the frontend
+server-rendered against the live API; ☑ a real commit to `master` auto-deployed to staging with nobody
+clicking anything, proving the literal DoD sentence. ◐ Production was never applied. ◐ Prometheus/Grafana's
+live scrape path and the archive's B2 connectivity were not directly exercised this round (see §6.24).
 
 ---
 
@@ -2492,4 +2554,33 @@ phases.
   absent from ClickHouse and the archive, while an untouched user's data and a real 768-entry stale backlog
   from earlier sessions were both handled correctly along the way. 28 new backend tests (458 -> 486 passed, 1
   skipped); 8 new frontend tests (150 -> 158 passed); `npm run build` clean. ruff / ruff format / mypy
-  (`pulse`, strict) clean. Nothing committed yet.
+  (`pulse`, strict) clean. Committed as `83bf674`, tagged `phase-25-complete`, pushed; CI green on the fresh
+  runner.
+- 2026-09-29 — Phase 26 — Added §6.24 and a Phase 26 DoD line. Not in the original roadmap: after Phase 25
+  the user asked for a Phase 26, and the one item every phase since 23 had flagged as still open was Phase
+  23's deploy half. This phase closed it, for staging. (1) **Provider swap:** AWS requires a card just to
+  create an account, which the user ruled out; Render and ClickHouse Cloud were confirmed card-free by
+  checking their own sign-up flows directly. AWS S3 was replaced with Backblaze B2 (same S3-compatible API,
+  no app code changed, confirmed card-free on Backblaze's own page) -- the `aws` provider and every
+  `aws_iam_*`/`aws_s3_bucket` resource are gone from Terraform; a bucket and scoped Application Key are
+  created once by hand instead, since B2 has no IAM-equivalent API a provider could automate. (2) **Two
+  real bugs caught by a live `terraform plan`, neither visible to any static check:** a stale hyphenated
+  Postgres plan id (Render's current format uses an underscore; the old style is a legacy instance type no
+  longer valid for a new database) found by reading the provider's docs before ever applying; a required
+  `idle_timeout_minutes` field the ClickHouse Cloud provider only validates against its live API. (3)
+  **Applied for real:** `terraform apply` created all 10 staging resources against the real Render/
+  ClickHouse Cloud/B2 APIs; the Render Blueprint deployed all 8 services to `live`; `GET /health` on the
+  live API reported Postgres, ClickHouse and Redis all `ok`, confirming migrations ran and every
+  connection string actually works; the frontend server-rendered against the live API once
+  `API_INTERNAL_URL` was filled in by hand (Render does not auto-redeploy on an env var change alone -- a
+  manual deploy trigger was needed, confirming a documented "not yet proven" claim was correct); a real
+  commit to `master` (`f44cfa6`) auto-deployed to staging with nobody touching a button (`trigger:
+  new_commit`, confirmed via the Render API's deploy history), proving the literal DoD sentence. (4)
+  **Torn down as agreed:** staging was a bounded proof, not a decision to run indefinitely (confirmed with
+  the user first, along with the AWS->B2 swap, before any account was created) -- all 8 Blueprint services
+  deleted, `terraform destroy` removed the other 10 resources, and both were verified actually empty
+  against the real APIs afterward, not just a "destroy complete" message. Deliberately not exercised:
+  Prometheus/Grafana's live scrape path, the archive's B2 write path, production. One new backend test
+  (`test_object_storage_is_backblaze_b2_not_aws_and_needs_no_aws_provider`); ruff / ruff format / mypy
+  clean. Committed as `f44cfa6` (no tag -- staging proof, not a phase boundary with new application code);
+  pushed; CI green.
