@@ -8,7 +8,8 @@ output "clickhouse_host" {
 }
 
 output "raw_events_bucket" {
-  value = aws_s3_bucket.raw_events.bucket
+  description = "Not Terraform-created (see main.tf) -- just echoes back the bucket name you supplied."
+  value       = var.s3_bucket
 }
 
 output "observability_env_group_name" {

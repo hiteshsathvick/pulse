@@ -9,10 +9,6 @@ provider "clickhouse" {
   token_secret    = var.clickhouse_token_secret
 }
 
-provider "aws" {
-  region = var.aws_region
-}
-
 locals {
   name = "pulse-${var.environment}"
 
@@ -57,10 +53,6 @@ resource "random_password" "metrics_token" {
   special = false
 }
 
-resource "random_id" "bucket_suffix" {
-  byte_length = 4
-}
-
 # --- Postgres (control plane) -------------------------------------------------
 
 resource "render_postgres" "db" {
@@ -101,6 +93,11 @@ resource "clickhouse_service" "events" {
   min_replica_memory_gb = var.clickhouse_min_replica_memory_gb
   max_replica_memory_gb = var.clickhouse_max_replica_memory_gb
   idle_scaling          = var.environment != "prod"
+  # Required by the provider whenever idle_scaling is true (a real, first-plan
+  # surprise no static check caught -- terraform validate doesn't call
+  # ClickHouse's API). 5 is the provider's own minimum: idle as aggressively
+  # as possible for a non-prod service that mostly sits unused.
+  idle_timeout_minutes = var.environment != "prod" ? 5 : null
 
   ip_access = [
     for cidr in var.clickhouse_ip_allow_list : {
@@ -118,68 +115,21 @@ resource "clickhouse_service" "events" {
 }
 
 # --- Object storage (raw batch archive, Phase 8) -------------------------------
-
-resource "aws_s3_bucket" "raw_events" {
-  bucket        = "${local.name}-raw-events-${random_id.bucket_suffix.hex}"
-  force_destroy = var.environment != "prod"
-}
-
-resource "aws_s3_bucket_public_access_block" "raw_events" {
-  bucket                  = aws_s3_bucket.raw_events.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
-resource "aws_s3_bucket_server_side_encryption_configuration" "raw_events" {
-  bucket = aws_s3_bucket.raw_events.id
-
-  rule {
-    apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
-    }
-  }
-}
-
-resource "aws_s3_bucket_versioning" "raw_events" {
-  bucket = aws_s3_bucket.raw_events.id
-
-  versioning_configuration {
-    status = var.environment == "prod" ? "Enabled" : "Suspended"
-  }
-}
-
-# Least privilege: the archiver only lists, reads and writes objects in this
-# one bucket -- it cannot create or delete buckets, or touch anything else.
-resource "aws_iam_user" "archiver" {
-  name = "${local.name}-archiver"
-}
-
-resource "aws_iam_user_policy" "archiver" {
-  name = "${local.name}-archiver"
-  user = aws_iam_user.archiver.name
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
-        Resource = aws_s3_bucket.raw_events.arn
-      },
-      {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = "${aws_s3_bucket.raw_events.arn}/*"
-      },
-    ]
-  })
-}
-
-resource "aws_iam_access_key" "archiver" {
-  user = aws_iam_user.archiver.name
-}
+#
+# Backblaze B2, not AWS S3: it speaks the same S3 API the app's Minio client
+# already uses (pulse/repositories/object_storage.py -- identical to how the
+# local stack runs SeaweedFS instead of MinIO, Phase 24), and its free tier
+# (10 GB storage, no egress fees) needs no card on file at all, confirmed
+# directly on Backblaze's own sign-up page, unlike AWS.
+#
+# Not Terraform-managed, on purpose: B2's S3-compatible endpoint covers
+# buckets and objects, but not IAM -- there is no API this provider (or any
+# S3-compatible one) can reach to create a least-privilege credential the way
+# aws_iam_user/aws_iam_access_key did. A bucket-scoped "Application Key" is
+# B2's equivalent, created once by hand in the B2 web console (free, no
+# Terraform resource for it exists); see docs/DEPLOYMENT.md. The four
+# `s3_*` variables below are that key's values, supplied the same way as
+# every other provider credential (TF_VAR_*, never committed).
 
 # --- Handoff to Render ---------------------------------------------------------
 # Everything the app reads from its environment that this stack owns, written
@@ -203,11 +153,11 @@ resource "render_env_group" "managed" {
     CLICKHOUSE_DATABASE = { value = "default" }
     CLICKHOUSE_SECURE   = { value = "true" }
 
-    S3_ENDPOINT_URL = { value = "https://s3.${var.aws_region}.amazonaws.com" }
-    S3_ACCESS_KEY   = { value = aws_iam_access_key.archiver.id }
-    S3_SECRET_KEY   = { value = aws_iam_access_key.archiver.secret }
-    S3_BUCKET       = { value = aws_s3_bucket.raw_events.bucket }
-    S3_REGION       = { value = var.aws_region }
+    S3_ENDPOINT_URL = { value = var.s3_endpoint_url }
+    S3_ACCESS_KEY   = { value = var.s3_access_key }
+    S3_SECRET_KEY   = { value = var.s3_secret_key }
+    S3_BUCKET       = { value = var.s3_bucket }
+    S3_REGION       = { value = var.s3_region }
 
     JWT_SECRET      = { value = random_password.jwt_secret.result }
     PII_HASH_SECRET = { value = random_password.pii_hash_secret.result }

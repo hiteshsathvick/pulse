@@ -1,10 +1,10 @@
 # Deployment
 
-Phase 23. Staging and production on Render, with the data services on ClickHouse Cloud, AWS S3 and
-Render's managed Postgres/Key Value — all described as code and validated in CI.
+Phase 23. Staging and production on Render, with the data services on ClickHouse Cloud, Backblaze B2
+and Render's managed Postgres/Key Value — all described as code and validated in CI.
 
-> **Status: built and validated, never applied.** No Render, ClickHouse Cloud or AWS account was
-> used to produce this. Everything below is checked statically (Terraform validated against the real
+> **Status: built and validated, never applied.** No Render, ClickHouse Cloud or Backblaze B2 account
+> was used to produce this. Everything below is checked statically (Terraform validated against the real
 > provider schemas, Blueprints validated against Render's published schema, the release logic unit
 > tested), but a real first deploy will find things a static check can't. The Definition-of-Done
 > sentence "a merge to main deploys to staging automatically" is therefore proven **up to the
@@ -16,7 +16,7 @@ Render's managed Postgres/Key Value — all described as code and validated in C
 |---|---|---|
 | Postgres, Key Value (Redis) | Terraform (`infra/terraform`) | Render provider |
 | ClickHouse | Terraform → ClickHouse Cloud | Render can't host it |
-| Raw-batch archive bucket + least-privilege IAM user | Terraform → AWS S3 | |
+| Raw-batch archive bucket | Backblaze B2, created by hand (Phase 26 -- see below) | Same S3 API the app already speaks; no card on file needed, unlike AWS |
 | Every connection string and generated secret | Terraform → Render **env group** `pulse-<env>-managed` | Nothing pasted by hand, nothing committed |
 | API, 4 workers, frontend | Render Blueprints (`infra/render/{staging,prod}.render.yaml`) | Render's native format |
 | Prometheus + Grafana | Same Blueprints (a private service and a web service) | So the dashboards exist where the app runs; see "Deployed observability" |
@@ -28,8 +28,17 @@ Render's managed Postgres/Key Value — all described as code and validated in C
 
 1. **Accounts and credentials** (as `TF_VAR_*` env vars or CI secrets — never a committed file):
    `render_api_key`, `render_owner_id`, `clickhouse_organization_id`, `clickhouse_token_key`,
-   `clickhouse_token_secret`, plus AWS credentials for the S3 provider.
-2. **Provision each environment** with its own Terraform **workspace** (separate state per
+   `clickhouse_token_secret`, plus five Backblaze B2 values (below) for the object store.
+2. **Create the B2 bucket and its key by hand** — not Terraform: B2's S3-compatible endpoint covers
+   buckets and objects, but not an IAM-equivalent API a provider could call to create a scoped
+   credential. In the [B2 web console](https://www.backblaze.com/cloud-storage) (free, no card): create
+   a bucket (private, name it e.g. `pulse-<env>-raw-events`), then Account → Application Keys → *Add a
+   New Application Key*, scoped to just that bucket with read+write access. That gives you
+   `s3_bucket` (the bucket name), `s3_endpoint_url` (shown alongside the bucket, e.g.
+   `https://s3.us-west-004.backblazeb2.com`), `s3_region` (the same endpoint's region segment, e.g.
+   `us-west-004`), `s3_access_key` (the key's `keyID`) and `s3_secret_key` (the key's
+   `applicationKey`, shown once).
+3. **Provision each environment** with its own Terraform **workspace** (separate state per
    environment — this is what keeps staging and prod from ever sharing a resource):
    ```bash
    cd infra/terraform
@@ -41,12 +50,12 @@ Render's managed Postgres/Key Value — all described as code and validated in C
    with Render's outbound IPs for your region. Configure a **remote state backend** first — state
    contains the generated secrets in plain text and must not live on a laptop (local state files are
    git-ignored, but that is a safety net, not a plan). See "Remote Terraform state" below.
-3. **Create the Blueprints** in Render, one per environment, each pointing at its own file
+4. **Create the Blueprints** in Render, one per environment, each pointing at its own file
    (`infra/render/staging.render.yaml`, `infra/render/prod.render.yaml`). Fill the `sync: false` values
    Render prompts for: `SENTRY_DSN`, `OTEL_EXPORTER_OTLP_ENDPOINT`, and the frontend's
    `NEXT_PUBLIC_API_URL` / `API_INTERNAL_URL`, and Grafana's `GF_SECURITY_ADMIN_PASSWORD` (choose one;
    it is never committed).
-4. **Production gate.** In GitHub: Settings → Environments → `production` → *Required reviewers*.
+5. **Production gate.** In GitHub: Settings → Environments → `production` → *Required reviewers*.
    Add repository secret `RENDER_API_KEY` and variables `RENDER_PROD_SERVICE_IDS` (space-separated
    `srv-…` ids, **API first**) and `PROD_API_URL`.
 
@@ -89,7 +98,10 @@ in a later release).
 ## Remote Terraform state
 
 Local state is the default and is fine for one person on one machine; anything shared needs a remote
-backend. It is **opt-in and per machine**, so nothing changes for anyone who doesn't use it:
+backend. It is **opt-in and per machine**, so nothing changes for anyone who doesn't use it -- and it is
+the one place this project still touches AWS (Phase 26 moved the app's own object storage to Backblaze
+B2; Terraform's *state* backend is a separate, independent choice, and this section's `aws s3api`/
+`dynamodb` commands are only for anyone who opts into it):
 
 ```bash
 cd infra/terraform

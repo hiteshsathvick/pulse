@@ -82,7 +82,33 @@ variable "clickhouse_ip_allow_list" {
   type        = list(string)
 }
 
-variable "aws_region" {
-  type    = string
-  default = "us-west-2"
+# --- Object storage (Backblaze B2) ---------------------------------------------
+# Not created by Terraform (see main.tf's comment on why) -- these are the
+# bucket and Application Key values from B2's console, supplied via TF_VAR_*
+# like the other provider credentials above, never a committed tfvars file.
+
+variable "s3_endpoint_url" {
+  description = "B2's S3-compatible endpoint for the bucket's region, e.g. https://s3.us-west-004.backblazeb2.com."
+  type        = string
+}
+
+variable "s3_bucket" {
+  type = string
+}
+
+variable "s3_region" {
+  description = "B2's region id for the bucket, e.g. us-west-004 (part of the endpoint hostname)."
+  type        = string
+}
+
+variable "s3_access_key" {
+  description = "The B2 Application Key's keyID."
+  type        = string
+  sensitive   = true
+}
+
+variable "s3_secret_key" {
+  description = "The B2 Application Key's applicationKey."
+  type        = string
+  sensitive   = true
 }

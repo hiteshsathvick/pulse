@@ -290,11 +290,52 @@ def test_prod_clickhouse_cannot_be_opened_to_the_world_by_default() -> None:
     assert "length(var.clickhouse_ip_allow_list) > 0" in (_TERRAFORM / "main.tf").read_text()
 
 
+def test_object_storage_is_backblaze_b2_not_aws_and_needs_no_aws_provider() -> None:
+    """Phase 26: AWS S3 was swapped for Backblaze B2 -- same S3-compatible API
+    the app already speaks (pulse/repositories/object_storage.py), but B2's
+    free tier needs no card on file, confirmed directly on Backblaze's own
+    sign-up page, unlike AWS. The bucket and its Application Key are created
+    once by hand (B2 has no Terraform-reachable IAM-equivalent API), so main.tf
+    should hand the app four plain s3_* variables, not an aws_s3_bucket /
+    aws_iam_* resource -- and the aws provider should be gone entirely, so a
+    real apply never asks for AWS credentials that were never supplied."""
+    # Checked as resource *declarations*, not a bare substring -- this file's
+    # own comments explain the swap away from aws_s3_bucket/aws_iam_*, and a
+    # naive substring check would trip over its own explanation.
+    main_tf = (_TERRAFORM / "main.tf").read_text()
+    assert not re.search(r'resource\s+"aws_s3_bucket"', main_tf)
+    assert not re.search(r'resource\s+"aws_iam_', main_tf)
+    assert not re.search(r'provider\s+"aws"', main_tf)
+    for var in ("s3_endpoint_url", "s3_bucket", "s3_region", "s3_access_key", "s3_secret_key"):
+        assert f"var.{var}" in main_tf, f"main.tf doesn't reference var.{var}"
+
+    versions_tf = (_TERRAFORM / "versions.tf").read_text()
+    assert '"hashicorp/aws"' not in versions_tf
+
+
 def test_terraform_lockfile_is_committed_and_state_is_ignored() -> None:
     assert (_TERRAFORM / ".terraform.lock.hcl").exists()
     gitignore = (_ROOT / ".gitignore").read_text()
     assert "*.tfstate" in gitignore
     assert "infra/terraform/.terraform/" in gitignore
+
+
+@pytest.mark.parametrize("env", _ENVS)
+def test_the_postgres_plan_id_uses_renders_current_underscore_format(env: str) -> None:
+    """A real bug, found by reading Render's provider docs before ever running
+    a real apply: this file used to say `basic-256mb` (a hyphen). Render's
+    flexible plan IDs use an underscore; the hyphenated `Basic-256mb` style is
+    a *legacy* instance type Render's own docs say is "not available for new
+    databases" -- so the hyphenated value would have failed on the very first
+    apply, a first-deploy surprise no earlier static check could catch (no
+    live credentials to ask Render's real API what a valid plan id is).
+    Guards against it drifting back."""
+    text = (_TERRAFORM / f"{env}.tfvars").read_text()
+    match = re.search(r'postgres_plan\s*=\s*"([^"]+)"', text)
+    assert match, f"{env}.tfvars: no postgres_plan found"
+    plan = match.group(1)
+    assert "-" not in plan, f"{env}.tfvars: postgres_plan {plan!r} looks like the old legacy style"
+    assert plan == plan.lower()
 
 
 # --- Workflows -----------------------------------------------------------------

@@ -1541,7 +1541,14 @@ Render's published JSON schema, with a negative control proving the validator ca
 test caught). `infra/terraform/` owns the data services and every secret (Render Postgres and Key Value,
 ClickHouse Cloud, an S3 bucket with a least-privilege IAM user) and writes the connection strings into a Render
 env group the Blueprints pull with `fromGroup` -- nothing committed or pasted; validated against the real
-Render, ClickHouse and AWS provider schemas. `.github/workflows/deploy-prod.yml` is manual-only: it refuses a
+Render, ClickHouse and AWS provider schemas.
+
+> **Superseded by Phase 26 (§6.24):** the object-storage bucket moved from AWS S3 to Backblaze B2 (no
+> card on file needed); the "least-privilege IAM user" above no longer exists -- B2 has no
+> Terraform-reachable IAM-equivalent API, so the bucket and its scoped Application Key are created once
+> by hand instead. The `aws` provider is gone from this stack entirely.
+
+`.github/workflows/deploy-prod.yml` is manual-only: it refuses a
 commit CI hasn't passed, waits on a required-reviewer approval of the `production` GitHub Environment (the
 "one gated click"), then `infra/scripts/render_release.py` releases the **API first** (waiting until it is
 live, migrations applied) and only then the workers and frontend, aborting on any failure or timeout.

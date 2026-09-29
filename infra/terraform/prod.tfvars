@@ -1,6 +1,11 @@
 environment = "prod"
 
-postgres_plan = "basic-1gb"
+# See staging.tfvars: underscore, not hyphen -- the old hyphenated style is a
+# legacy instance type Render no longer accepts for a new database. The exact
+# size suffix here (1gb) is unconfirmed against Render's real API (only
+# basic_256mb was confirmed directly); verify with `terraform plan` before
+# ever applying this file for real.
+postgres_plan = "basic_1gb"
 keyvalue_plan = "standard"
 
 clickhouse_min_replica_memory_gb = 16
