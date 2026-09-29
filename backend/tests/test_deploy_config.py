@@ -675,6 +675,48 @@ def test_the_backend_image_installs_the_debian_security_updates() -> None:
     assert dockerfile.index("apt-get upgrade") < dockerfile.index("pip install")
 
 
+# --- SBOM + signed provenance attestation (Phase 30) -----------------------------
+
+
+def test_both_images_get_an_sbom_generated_and_a_signed_attestation() -> None:
+    """Render builds every service from source itself (runtime: docker in the
+    Blueprints) rather than pulling a pre-built image, so there is nothing to
+    cosign-sign here yet -- the SBOM is the real, independently verifiable
+    artifact this phase adds, and it must exist and be signed for BOTH images,
+    not just the one the vulnerability scan already covers (the frontend image
+    is unscanned -- see docs/THREAT_MODEL.md -- but still gets an SBOM)."""
+    steps = _ci()["jobs"]["build"]["steps"]
+    names = [s.get("name", "") for s in steps]
+
+    for label in ("backend", "frontend"):
+        sbom_step = next(s for s in steps if s.get("name") == f"Generate {label} SBOM (CycloneDX)")
+        assert "--format cyclonedx" in sbom_step["run"]
+        sbom_file = f"{label}-sbom.cdx.json"
+        assert sbom_file in sbom_step["run"]
+
+        attest_step = next(s for s in steps if s.get("name") == f"Attest {label} SBOM provenance")
+        assert attest_step.get("uses", "").startswith("actions/attest-build-provenance@")
+        assert not attest_step.get("continue-on-error")
+        assert attest_step["with"]["subject-path"] == sbom_file
+
+        # The SBOM step must run before the attestation that signs its output,
+        # and both before the upload -- a reordering would sign a stale/missing file.
+        assert names.index(f"Generate {label} SBOM (CycloneDX)") < names.index(
+            f"Attest {label} SBOM provenance"
+        )
+        upload_step = next(s for s in steps if s.get("name") == f"Upload {label} SBOM")
+        assert upload_step["with"]["path"] == sbom_file
+
+
+def test_the_build_job_has_exactly_the_permissions_attestation_needs() -> None:
+    """attest-build-provenance needs id-token (to mint the OIDC token Sigstore
+    signs with) and attestations (to publish the result) -- without both, the
+    step fails outright rather than silently skipping. Nothing broader: this
+    job never needs to write repo contents, issues, or packages."""
+    permissions = _ci()["jobs"]["build"]["permissions"]
+    assert permissions == {"contents": "read", "id-token": "write", "attestations": "write"}
+
+
 @pytest.mark.parametrize("name", ["prometheus.render.Dockerfile", "grafana.render.Dockerfile"])
 def test_the_observability_dockerfiles_only_copy_files_that_exist(name: str) -> None:
     """A Dockerfile whose COPY source has been moved fails only at deploy time."""

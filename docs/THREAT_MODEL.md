@@ -153,6 +153,15 @@ this codebase ever interpolates such a value into SQL, a shell command, or a tru
   `apt-get upgrade`. Not scanned: the frontend image. Observed, not changed: the backend image also
   installs the `dev` extras and copies `tests/` (CI runs the suite inside it), which is more than a
   production image needs.
+- **A signed SBOM exists per build (Phase 30), but attests to CI's image, not Render's.** CI generates a
+  CycloneDX SBOM for the backend and frontend images it builds and signs it keylessly via GitHub's
+  Sigstore-backed attestation (`actions/attest-build-provenance`, OIDC -- no key to manage or leak). This
+  is a real, independently verifiable claim about supply-chain integrity for exactly what CI built and
+  scanned from a given commit. It is **not** a claim about what Render is actually running: Render builds
+  every service from source itself rather than pulling a pre-built image, so the signed artifact and the
+  deployed one are never the same bits, only the same Dockerfile and source. Closing that gap would mean
+  changing the deploy model to pull a pre-built (and then genuinely signable, verifiable-at-deploy-time)
+  image instead -- not done, and a bigger change than this phase's scope.
 - **No Content-Security-Policy or HSTS.** This is a JSON API with no HTML of its own to scope a CSP
   against; HSTS is a deployment-level concern (only meaningful once real TLS termination sits in front of
   this) that's out of this app's own config, not something code here can decide.

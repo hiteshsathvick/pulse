@@ -196,8 +196,15 @@ provisioned its datasource from the environment and the dashboard, and queried P
 - **Frontend env vars** (`NEXT_PUBLIC_API_URL`, `API_INTERNAL_URL`) can't be composed by a Blueprint, so
   they're filled by hand once per environment -- confirmed for real this round: Render didn't even
   auto-redeploy the frontend after the env var was corrected, a manual deploy trigger was needed.
-- **No image signing / SBOM.** The image scan (Trivy) and dependency audits are now blocking gates — see
-  `docs/THREAT_MODEL.md` for what that costs (a newly published advisory can turn CI red on its own).
+- **SBOM + signed provenance attestation exist (Phase 30), but for the CI-built image, not what Render
+  deploys.** CI generates a CycloneDX SBOM for the backend/frontend images it builds and scans, and signs
+  it keylessly (Sigstore via GitHub's OIDC token — `actions/attest-build-provenance`, verifiable with
+  `gh attestation verify <sbom> --owner <org>`). This proves the SBOM genuinely describes what that CI run
+  built and scanned from that commit. It does **not** prove Render is running that exact image: Render
+  builds every service from source itself (`runtime: docker` in the Blueprints), so CI's image is a
+  parallel, unpushed artifact — same Dockerfile and source, but never the literal bits Render deploys. The
+  image scan (Trivy) and dependency audits remain separately blocking gates — see `docs/THREAT_MODEL.md`
+  for what that costs (a newly published advisory can turn CI red on its own).
 - **Rollback is tested against a fake Render client and Render's documented API**, not a real service:
   the endpoints (`GET /services/{id}/deploys`, `POST /services/{id}/rollback`) and status values come from
   Render's API reference. The first real failed release is the first real test. Render's own caveat —

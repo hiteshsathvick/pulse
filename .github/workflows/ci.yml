@@ -379,6 +379,15 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    # Phase 30: id-token/attestations let attest-build-provenance sign an SBOM
+    # keylessly via Sigstore (GitHub's OIDC token, no secret to manage or
+    # leak). contents: read is the default this job otherwise needs anyway --
+    # listed explicitly because setting any `permissions:` block replaces the
+    # repo/org default for every scope, not just the ones named.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -396,6 +405,33 @@ jobs:
             aquasec/trivy:0.57.0 image --severity HIGH,CRITICAL --ignore-unfixed \
             --exit-code 1 --no-progress pulse-backend:ci
 
+      # Phase 30: an SBOM, not a signed *image* -- Render builds every service
+      # from source itself (infra/render/*.render.yaml, runtime: docker) and
+      # never pulls a pre-built image from a registry, so there is no
+      # registry artifact for cosign or similar to sign here yet. The
+      # attestation below proves "this exact SBOM, describing what this CI
+      # run built and scanned from this commit, is unaltered" -- real and
+      # independently verifiable (`gh attestation verify`), but it is not a
+      # claim about the bits Render itself later builds from the same
+      # source. Same Trivy already used for the scan above, in its other
+      # mode -- no new scanning tool added.
+      - name: Generate backend SBOM (CycloneDX)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" \
+            aquasec/trivy:0.57.0 image --format cyclonedx --output /out/backend-sbom.cdx.json \
+            pulse-backend:ci
+
+      - name: Attest backend SBOM provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: backend-sbom.cdx.json
+
+      - name: Upload backend SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-sbom
+          path: backend-sbom.cdx.json
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -410,3 +446,20 @@ jobs:
 
       - name: Build frontend image
         run: docker build -t pulse-frontend:ci frontend
+
+      - name: Generate frontend SBOM (CycloneDX)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" \
+            aquasec/trivy:0.57.0 image --format cyclonedx --output /out/frontend-sbom.cdx.json \
+            pulse-frontend:ci
+
+      - name: Attest frontend SBOM provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: frontend-sbom.cdx.json
+
+      - name: Upload frontend SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-sbom
+          path: frontend-sbom.cdx.json
