@@ -2123,6 +2123,54 @@ exactly the configured backoff, and does not raise; a successful cycle does neit
 `run_cycle_with_retry()` directly via `monkeypatch`, not the real infinite loop. 493 -> 495 passed,
 1 skipped. ruff / ruff format / mypy (`pulse`, strict) clean. No frontend changes.
 
+### 6.31 Deployed metrics + object storage proven live (Phase 33)
+
+Not a numbered phase in the original roadmap: after Phase 32 the user asked to continue, and with the
+free/local-only options largely exhausted by Phases 27-32, this was a real second staging deploy -- the
+same class of thing Phase 26 did, applied again to close the two remaining "not yet proven" claims about
+what a *deployed* Render service actually does versus what's been proven locally or statically.
+
+**Applied clean on the first try**, unlike Phase 26: `terraform apply` created all 10 staging resources
+against the real Render/ClickHouse Cloud APIs and B2 (the same bucket/Application Key from Phase 26/28,
+still in place) with zero new provider surprises -- both real bugs Phase 26 found (the hyphenated Postgres
+plan id, the missing ClickHouse `idle_timeout_minutes`) have been fixed in the committed code since. The
+Blueprint deployed all 8 services to `live`; the frontend's `API_INTERNAL_URL`/`NEXT_PUBLIC_API_URL` were
+filled in and a manual redeploy triggered, same as Phase 26 (still not auto-applied on an env var change
+alone).
+
+**Object storage connectivity from a real deployed Render service, proven for the first time**:
+`GET https://pulse-staging-api.onrender.com/health` reported `"object_storage": "ok"` alongside
+Postgres/ClickHouse/Redis -- Phase 29's check, running against real B2 from Render's own network for the
+first time ever (every prior run was local SeaweedFS or a host venv with only the S3 credentials pointed
+at B2, per Phase 28). This closes the object-storage half of `docs/DEPLOYMENT.md`'s "not yet proven" list.
+
+**Deployed metrics reaching Grafana, proven with real traffic, not just a scrape-target check**: registered
+a real user/org/project/write-key against the live API and ingested 20 events through the real `/ingest`.
+The Grafana dashboard's `Accepted / sec (API)` panel -- reached by signing into the real deployed Grafana,
+not a local instance -- moved from a flat `0 ops/s` baseline to a real `0.378 ops/s` spike at the exact
+moment the traffic was sent, confirmed with a screenshot showing the spike across four panels (accepted
+rate, the ingest-rate time series, landing delay, and worker batch size) simultaneously. Verified past the
+dashboard too, not stopping at "the graph moved": all 20 events were queried back out of the real
+ClickHouse via the export API, byte-for-byte matching what was sent -- proving the full chain (API ->
+Redis buffer -> worker -> ClickHouse -> Prometheus scrape -> Grafana panel) end to end against real
+deployed infrastructure, the literal thing `docs/DEPLOYMENT.md` had flagged as unconfirmed since Phase 23.
+
+**Credential handoff, same discipline as Phase 26/28**: nothing was persisted from either prior session, so
+the user supplied Render/ClickHouse Cloud/B2 credentials again; the B2 keyID/bucket were reused as-is
+(never revoked), confirming Phase 26's original design choice -- leaving the bucket and its scoped key in
+place after teardown, since they cost nothing idle -- paid off exactly as intended on a second use.
+
+**Torn down again, verified empty independently**, same rigor as Phase 26: all 8 Blueprint services
+deleted, the Blueprint itself deleted (preventing a future push from silently recreating it), `terraform
+destroy` removed the other 10 resources -- then confirmed genuinely empty against the real Render (services,
+Blueprints, Postgres, Key Value all zero) and ClickHouse Cloud (zero services) APIs, not just a "destroy
+complete" message, and the local Terraform state file checked directly too.
+
+**No code changed this phase** -- pure live verification, like Phase 28. Two doc-only updates:
+`docs/DEPLOYMENT.md`'s "Deployed metrics" and "Object storage connectivity" bullets rewritten from "not yet
+proven" to what was actually confirmed, with the specifics (the exact panel, the exact numbers, the exact
+`/health` response) rather than a bare "done."
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2321,6 +2369,16 @@ implementing manual reconnection. Verified by reproducing the exact original fai
 against the fixed worker, confirmed the container's own restart count stayed 0 (the process itself
 survived) and a freshly ingested event was processed normally in the very next log line. 2 new backend
 tests (493 -> 495 passed, 1 skipped); ruff / ruff format / mypy clean. No frontend changes.
+
+**Phase 33 — Deployed metrics + object storage proven live (post-roadmap; agreed after Phase 32).** ☑ a
+second staging apply, clean on the first try (Phase 26's two bugs already fixed); ☑ `/health` on the real
+deployed API reported `object_storage: "ok"` against real B2 from Render's network, the first time ever;
+☑ 20 real events ingested through the live API moved Grafana's `Accepted / sec (API)` panel from `0` to
+`0.378 ops/s` at the exact right moment (screenshotted), and all 20 were queried back out of the real
+ClickHouse byte-for-byte matching what was sent -- proving the full API->Redis->worker->ClickHouse->
+Prometheus->Grafana chain end to end against real infrastructure. Torn down again afterward, verified
+empty against the real Render and ClickHouse Cloud APIs independently, not just trusted. No code changed --
+pure live verification (see §6.31); docs updated to say so precisely.
 
 ---
 
@@ -3098,4 +3156,30 @@ tests (493 -> 495 passed, 1 skipped); ruff / ruff format / mypy clean. No fronte
   head` was re-run -- not a bug in this phase's own change. 2 new backend tests (`test_worker.py`, driving
   `run_cycle_with_retry()` directly via `monkeypatch` rather than the real infinite loop): a simulated
   failure counts and backs off without raising; a success does neither. 493 -> 495 passed, 1 skipped. ruff /
-  ruff format / mypy clean. No frontend changes.
+  ruff format / mypy clean. No frontend changes. Committed as `3d690dd`, pushed; CI green.
+- 2026-09-30 — Phase 33 — Added §6.31 and a Phase 33 DoD line. Not in the original roadmap: after Phase 32
+  the user asked to continue, and with the free/local-only options largely exhausted by Phases 27-32, this
+  was a real second staging deploy -- closing the two remaining "not yet proven" claims about what a
+  *deployed* Render service does, versus what had only been proven locally or statically. **Applied clean
+  on the first try**, unlike Phase 26: all 10 resources against real Render/ClickHouse Cloud/B2, zero new
+  provider surprises (both of Phase 26's original bugs -- the hyphenated Postgres plan id, the missing
+  ClickHouse `idle_timeout_minutes` -- have been fixed in committed code ever since). The Blueprint deployed
+  all 8 services live; the frontend's API URLs were filled in and manually redeployed, same as Phase 26
+  (still not auto-applied on an env var change alone). **Object storage from a real deployed service,
+  proven for the first time**: `GET .../health` on the live API reported `object_storage: "ok"` against
+  real B2 from Render's own network -- every prior check (Phase 28, Phase 29) ran locally or from a host
+  venv. **Deployed metrics proven with real traffic, not just a scrape-target check**: registered a real
+  user/org/project/write-key against the live API, ingested 20 events through the real `/ingest`, and
+  watched the real deployed Grafana's `Accepted / sec (API)` panel move from a flat `0 ops/s` to a real
+  `0.378 ops/s` spike at the exact right moment -- screenshotted across four panels at once (accepted rate,
+  the ingest-rate time series, landing delay, worker batch size). Verified past the dashboard too: all 20
+  events were queried back out of the real ClickHouse via the export API, byte-for-byte matching what was
+  sent -- proving the full API->Redis->worker->ClickHouse->Prometheus->Grafana chain end to end against real
+  infrastructure, unconfirmed since Phase 23. Credentials (Render/ClickHouse Cloud/B2) were supplied fresh
+  by the user, same discipline as Phase 26/28 -- nothing persisted between sessions; the B2 key/bucket left
+  in place after Phase 26's teardown worked exactly as intended on reuse, confirming that design choice.
+  **Torn down again, verified empty independently** against the real Render (services, Blueprints, Postgres,
+  Key Value) and ClickHouse Cloud APIs, not just a "destroy complete" message, plus the local Terraform
+  state file checked directly. No code changed -- pure live verification, like Phase 28; `docs/DEPLOYMENT.md`
+  updated with the specifics (the exact panel, the exact numbers, the exact `/health` response) rather than
+  a bare "done."

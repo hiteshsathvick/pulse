@@ -180,21 +180,18 @@ provisioned its datasource from the environment and the dashboard, and queried P
 - **Production has never been applied.** Only staging was; expect it to have its own first-deploy
   surprises even though staging's are now fixed (Flowforge's prod Render deploy found three that staging
   testing hadn't).
-- **Deployed metrics were not exercised this round.** The API/frontend/Grafana health checks that were
-  run don't touch Prometheus at all. The scrape path is verified with the real images against
-  Render-style DNS names (Phase 24/25, locally) and the Blueprint's `fromService`/`-discovery` wiring is
-  believed correct by construction, but nobody has confirmed live Render data actually reaches the
-  dashboard. Tempo isn't deployed at all.
-- **Object storage connectivity has been proven against the real B2 bucket, but not through a live
-  deployment.** Phase 28 ran the actual worker archive-write path and a PII rule's retroactive archive
-  rewrite (the exact app code, unmodified) against the real `pulse-staging-raw-events` bucket and its
-  Application Key left over from Phase 26 -- both worked, confirmed by reading the object back and seeing
-  the ruled property genuinely hashed. But the app processes that ran were local (host venv, talking to
-  local Postgres/ClickHouse/Redis) with only `S3_*` pointed at real B2. `/health` gained an object-storage
-  check in Phase 29, but only ever against local SeaweedFS -- no deployed Render service has called
-  `/health` with `S3_*` pointed at real B2. The B2 credentials/bucket are proven good; the deployed
-  API/worker actually reaching them from Render, and `/health` reporting on that specific connection, is
-  not.
+- **Deployed metrics were proven live in Phase 33.** A second staging apply (all 10 resources fresh, the
+  same real bugs from Phase 26 already fixed so this one applied clean on the first try) put real traffic
+  through the deployed API -- 20 events ingested via `/ingest` -- and the Grafana dashboard's own
+  `Accepted / sec (API)` panel moved from a flat `0 ops/s` to a real `0.378 ops/s` spike at the same
+  timestamp, confirmed with a screenshot, not just a query. Verified past the dashboard too: all 20 events
+  were queried back out of ClickHouse via the real API's export endpoint, byte-for-byte matching what was
+  sent. Tempo still isn't deployed.
+- **Object storage connectivity from a real deployed Render service is now proven too (Phase 33).**
+  `GET /health` on the live `pulse-staging-api.onrender.com` reported `"object_storage": "ok"` alongside
+  Postgres/ClickHouse/Redis -- the first time Phase 29's check has ever run against a real B2 connection
+  from Render's own network, not local SeaweedFS or a host venv. Combined with Phase 28's earlier proof
+  that the B2 credentials/bucket themselves work, both halves of this gap are now closed.
 - **Frontend env vars** (`NEXT_PUBLIC_API_URL`, `API_INTERNAL_URL`) can't be composed by a Blueprint, so
   they're filled by hand once per environment -- confirmed for real this round: Render didn't even
   auto-redeploy the frontend after the env var was corrected, a manual deploy trigger was needed.
