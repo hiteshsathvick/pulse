@@ -179,7 +179,21 @@ provisioned its datasource from the environment and the dashboard, and queried P
 
 - **Production has never been applied.** Only staging was; expect it to have its own first-deploy
   surprises even though staging's are now fixed (Flowforge's prod Render deploy found three that staging
-  testing hadn't).
+  testing hadn't). **Cost estimated but deliberately not applied (Phase 35)**: `prod.render.yaml` runs 7
+  services on the "standard" compute plan ($25/mo each) and 1 on "starter" ($7/mo) = ~$182/mo; Render
+  Postgres `basic_1gb` with `high_availability_enabled` and Key Value "standard" add roughly another
+  $70/mo -- **~$250-290/mo for Render alone**, verified against Render's own current pricing page. The real
+  unknown is ClickHouse: `main.tf` sets `min/max_replica_memory_gb = 16/32` and `idle_scaling = false` for
+  prod (always-on, unlike staging), but **specifies no replica count or service tier at all** -- that's left
+  to ClickHouse Cloud's own default for a new service, which could plausibly land anywhere from a
+  single-replica ~$430/mo to a multi-AZ "Scale"-tier default (ClickHouse's own pricing calculator defaults
+  new estimates to 3 replicas) north of ~$1,300/mo -- a swing this session couldn't resolve without either
+  creating the real resource or checking ClickHouse Cloud's console by hand. **Total plausible range:
+  ~$680-$1,600+/month, ongoing, not torn down afterward like every staging round.** Given that spread, the
+  user chose to hold off rather than apply and find out. Before ever applying this file for real: either
+  confirm the actual replica count ClickHouse Cloud will provision (dashboard or a support question) or
+  reduce `clickhouse_min_replica_memory_gb`/`max_replica_memory_gb` in `prod.tfvars` first to cap the
+  worst case.
 - **Deployed metrics were proven live in Phase 33.** A second staging apply (all 10 resources fresh, the
   same real bugs from Phase 26 already fixed so this one applied clean on the first try) put real traffic
   through the deployed API -- 20 events ingested via `/ingest` -- and the Grafana dashboard's own

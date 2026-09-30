@@ -2219,6 +2219,24 @@ been applied at all.
 -- pure live verification, like Phase 28 and Phase 33. `docs/DEPLOYMENT.md`'s rollback bullet rewritten
 from "not yet proven" to what was actually confirmed.
 
+### 6.33 Production cost estimated, deliberately not applied (Phase 35)
+
+Not a numbered phase in the original roadmap: after Phase 34 the last genuinely open item was production
+itself, and the user chose to apply it for real. Real, current pricing research (Render's and ClickHouse
+Cloud's own pricing pages, not third-party summaries) surfaced a real blocker before any resource was
+touched: `prod.render.yaml`'s Render services price out to a well-defined ~$250-290/mo, but `main.tf`'s
+`clickhouse_service.events` for prod sets `min/max_replica_memory_gb` and `idle_scaling = false`
+(always-on, unlike staging) **without specifying any replica count or service tier at all** -- a real
+config gap this session found, not previously flagged in `docs/DEPLOYMENT.md`. Left to ClickHouse Cloud's
+own default, that swings the plausible total from roughly $680/mo (single replica) to $1,600+/mo (the
+multi-AZ "Scale"-tier default ClickHouse's own calculator assumes) -- a spread wide enough that applying
+blind and finding out felt like the wrong call. **Presented the range and the specific uncertainty to the
+user; they chose to hold off** rather than apply-and-see or pre-shrink the ClickHouse sizing. No Terraform
+command was run against prod, no resource was created -- pure research, recorded in
+`docs/DEPLOYMENT.md`'s production bullet so a future attempt doesn't have to re-derive it, including the
+two concrete ways to resolve the uncertainty before ever applying for real (confirm the actual replica
+count ClickHouse Cloud provisions, or reduce `prod.tfvars`'s memory range to cap the worst case first).
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2439,6 +2457,15 @@ to its previous good deploy, confirmed independently via deploy history, not jus
 workflow itself, which remains unexercised; production has still never been applied. Torn down and
 independently reverified empty afterward. No code changed -- pure live verification (see §6.32); docs
 updated to say so precisely.
+
+**Phase 35 — Production cost estimated, deliberately not applied (post-roadmap; agreed after Phase 34).**
+☑ real, current pricing research against Render's and ClickHouse Cloud's own pages (not third-party
+summaries); ☑ a real, previously-unflagged config gap found: `main.tf`'s prod `clickhouse_service` sets no
+replica count or tier at all, leaving a ~$680-$1,600+/mo swing depending on what ClickHouse Cloud defaults
+to. ◐ Presented the range and the specific uncertainty to the user, who chose to hold off rather than
+apply blind. No Terraform command run against prod; no resource created; no code changed. Recorded in
+`docs/DEPLOYMENT.md`'s production bullet, including the two concrete next steps before ever applying for
+real (see §6.33).
 
 ---
 
@@ -3271,4 +3298,18 @@ updated to say so precisely.
   required-reviewer `production` Environment) -- that trigger path remains unexercised, and production has
   still never been applied at all. No code changed -- the worker-breaking commit lived only on a disposable,
   unmerged, now-deleted branch; `docs/DEPLOYMENT.md`'s rollback bullet rewritten from "not yet proven" to
-  what was actually confirmed.
+  what was actually confirmed. Committed as `73e5a80` (docs only), pushed; CI green.
+- 2026-09-30 — Phase 35 — Added §6.33 and a Phase 35 DoD line. Not in the original roadmap: after Phase 34
+  the last genuinely open item was production itself, and the user chose to apply it for real. Real
+  pricing research (Render's and ClickHouse Cloud's own pricing pages) surfaced a real blocker before any
+  resource was touched: `prod.render.yaml`'s Render services price out to a well-defined ~$250-290/mo, but
+  `main.tf`'s prod `clickhouse_service` sets `min/max_replica_memory_gb` and `idle_scaling = false`
+  (always-on) **without specifying any replica count or service tier at all** -- a real config gap this
+  session found, not previously flagged anywhere. Left to ClickHouse Cloud's own default, the plausible
+  total swings from roughly $680/mo (single replica) to $1,600+/mo (the multi-AZ "Scale"-tier default
+  ClickHouse's own calculator assumes) -- wide enough that applying blind and finding out felt like the
+  wrong call. Presented the range and the specific uncertainty to the user; **they chose to hold off**
+  rather than apply-and-see or pre-shrink the ClickHouse sizing first. No Terraform command was run against
+  prod, no resource was created -- pure research, recorded in `docs/DEPLOYMENT.md`'s production bullet
+  (including the two concrete ways to resolve the uncertainty before ever applying for real) so a future
+  attempt doesn't have to re-derive it from scratch.
