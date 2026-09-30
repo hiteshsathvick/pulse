@@ -2171,6 +2171,54 @@ complete" message, and the local Terraform state file checked directly too.
 proven" to what was actually confirmed, with the specifics (the exact panel, the exact numbers, the exact
 `/health` response) rather than a bare "done."
 
+### 6.32 Rollback proven against a real service (Phase 34)
+
+Not a numbered phase in the original roadmap: after Phase 33 the user asked to continue, and with the
+free/local-only options exhausted, the next open item was the last major "not yet proven" claim:
+`docs/DEPLOYMENT.md` had said rollback was "tested against a fake Render client," never a real one.
+
+**A third staging deploy** -- applied clean again, zero new provider surprises, using the same B2
+bucket/Application Key from Phase 26/28/33 (confirming, a third time, that leaving them in place after
+teardown costs nothing and just works on reuse).
+
+**A real, deterministic failure, engineered carefully to test rollback and not just "release fails."**
+Releasing a commit broken at the *build* level would fail the API's own deploy first, and per
+`render_release.py`'s design (API released and waited on alone before any other service is even
+triggered), nothing would ever have gone live to roll back -- a real but shallow test. Instead, only
+`pulse/worker/main.py`'s `__main__` entrypoint was broken (an unconditional `raise`, confirmed first that
+nothing else imports this module, so the API's own `uvicorn pulse.main:app` entrypoint is untouched) on a
+disposable branch, pushed and never merged. This makes the *build* succeed for both services (same
+Dockerfile, same image) while the *worker's start command* crashes immediately -- so the API deploys and
+goes live normally, and only the worker's deploy fails, which is exactly the shape that exercises the
+"a service that went live during a failed release gets rolled back even though its own deploy succeeded"
+branch of the rollback logic, not the simpler "first service failed, nothing to roll back" one.
+
+**Ran the real script against real service ids** (`RENDER_API_KEY=... python render_release.py <bad-sha>
+<api-id> <worker-id>`, the exact invocation `deploy-prod.yml` uses) and confirmed, independently of the
+script's own report: the worker's deploy for the bad commit came back `update_failed` from Render's real
+API; the API's deploy of the same bad commit had gone `live` and was then genuinely rolled back -- its
+deploy history shows the bad-commit deploy `deactivated` and a *new* deploy entry (the rollback itself,
+Render creates one rather than reactivating the old one) back on the original good commit, `live`; the
+worker, whose bad deploy never went live, was correctly left untouched on its own still-live good deploy
+the whole time -- both services end up consistent on the same commit, not just "not broken."
+
+**Cleaned up carefully**: the disposable branch was deleted both remotely and locally (`git branch -D`,
+since it was intentionally never merged and the safety check correctly flagged that); staging was torn
+down the same way as every prior round -- 8 Blueprint services deleted, the Blueprint itself deleted (this
+time named "PULSE" rather than "pulse-staging," just whatever name was typed at creation, no functional
+difference), `terraform destroy` removed the other 10 resources, and everything was independently
+reverified empty against the real Render and ClickHouse Cloud APIs plus the local Terraform state file, not
+just trusted.
+
+**Still not proven**: this ran `render_release.py` directly against staging service ids, not through the
+real gated `deploy-prod.yml` workflow itself -- the production-only trigger path (manual `workflow_dispatch`,
+the required-reviewer `production` GitHub Environment) remains unexercised, and production has still never
+been applied at all.
+
+**No code changed** (the worker-breaking commit lived only on a disposable, unmerged, now-deleted branch)
+-- pure live verification, like Phase 28 and Phase 33. `docs/DEPLOYMENT.md`'s rollback bullet rewritten
+from "not yet proven" to what was actually confirmed.
+
 ---
 
 ## 7. Per-phase authoritative detail
@@ -2379,6 +2427,18 @@ ClickHouse byte-for-byte matching what was sent -- proving the full API->Redis->
 Prometheus->Grafana chain end to end against real infrastructure. Torn down again afterward, verified
 empty against the real Render and ClickHouse Cloud APIs independently, not just trusted. No code changed --
 pure live verification (see §6.31); docs updated to say so precisely.
+
+**Phase 34 — Rollback proven against a real service (post-roadmap; agreed after Phase 33).** ☑ a third
+staging deploy; ☑ a real broken commit (only the worker entrypoint, on a disposable never-merged branch, so
+the API's own deploy would succeed and go live -- the shape that actually exercises "roll back a service
+whose own deploy succeeded" rather than "first service failed, nothing to roll back") released with the
+real `render_release.py` against real service ids; ☑ the worker's deploy genuinely `update_failed` on
+Render's own API, and the API service -- which HAD gone live on the bad commit -- was correctly rolled back
+to its previous good deploy, confirmed independently via deploy history, not just the script's own report.
+◐ Ran directly against staging service ids, not through the real gated `deploy-prod.yml` production
+workflow itself, which remains unexercised; production has still never been applied. Torn down and
+independently reverified empty afterward. No code changed -- pure live verification (see §6.32); docs
+updated to say so precisely.
 
 ---
 
@@ -3182,4 +3242,33 @@ pure live verification (see §6.31); docs updated to say so precisely.
   Key Value) and ClickHouse Cloud APIs, not just a "destroy complete" message, plus the local Terraform
   state file checked directly. No code changed -- pure live verification, like Phase 28; `docs/DEPLOYMENT.md`
   updated with the specifics (the exact panel, the exact numbers, the exact `/health` response) rather than
-  a bare "done."
+  a bare "done." Committed as `e1ded5b` (docs only), pushed; CI green.
+- 2026-09-30 — Phase 34 — Added §6.32 and a Phase 34 DoD line. Not in the original roadmap: after Phase 33
+  the user asked to continue, and with the free/local-only options exhausted, the next open item was the
+  last major "not yet proven" claim: rollback had only ever been tested against a fake Render client. **A
+  third staging deploy**, applied clean again, same B2 bucket/key from Phase 26/28/33 reused without
+  incident a third time. **A real, deterministic failure engineered carefully to test rollback specifically,
+  not just "a release fails"**: a build-level failure would fail the API's own deploy first, and per
+  `render_release.py`'s own design nothing would ever have gone live to roll back -- a real but shallow
+  test. Instead only `pulse/worker/main.py`'s `__main__` entrypoint was broken (an unconditional `raise`,
+  confirmed first that nothing else imports this module) on a disposable branch, pushed and never merged --
+  same Dockerfile/image for both services, so the build succeeds either way, but the worker's *start
+  command* crashes immediately while the API's does not. This makes the API deploy and go live normally
+  while only the worker's deploy fails, exercising the "a service that went live during a failed release
+  gets rolled back even though its own deploy succeeded" branch specifically. **Ran the real script against
+  real service ids** (`RENDER_API_KEY=... python render_release.py <bad-sha> <api-id> <worker-id>`, the
+  exact invocation `deploy-prod.yml` uses) and confirmed independently of the script's own report: the
+  worker's bad-commit deploy came back `update_failed` from Render's real API; the API's bad-commit deploy
+  had gone `live` and was genuinely rolled back -- its deploy history shows that deploy `deactivated` and a
+  *new* deploy entry (Render creates a fresh one for a rollback, not a reactivation) back on the original
+  good commit, `live`; the worker, whose bad deploy never went live, was correctly left untouched on its own
+  still-live good deploy throughout -- both services end up consistent on the same commit. Cleaned up
+  carefully: the disposable branch deleted both remotely and locally (`git branch -D`, since it was
+  intentionally never merged and the safety check correctly flagged that); staging torn down the same way as
+  every prior round and independently reverified empty against the real Render and ClickHouse Cloud APIs
+  plus the local Terraform state file. **Still not proven**: this ran the script directly against staging
+  service ids, not through the real gated `deploy-prod.yml` workflow itself (manual dispatch, the
+  required-reviewer `production` Environment) -- that trigger path remains unexercised, and production has
+  still never been applied at all. No code changed -- the worker-breaking commit lived only on a disposable,
+  unmerged, now-deleted branch; `docs/DEPLOYMENT.md`'s rollback bullet rewritten from "not yet proven" to
+  what was actually confirmed.

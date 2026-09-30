@@ -204,8 +204,14 @@ provisioned its datasource from the environment and the dashboard, and queried P
   parallel, unpushed artifact — same Dockerfile and source, but never the literal bits Render deploys. The
   image scan (Trivy) and dependency audits remain separately blocking gates — see `docs/THREAT_MODEL.md`
   for what that costs (a newly published advisory can turn CI red on its own).
-- **Rollback is tested against a fake Render client and Render's documented API**, not a real service:
-  the endpoints (`GET /services/{id}/deploys`, `POST /services/{id}/rollback`) and status values come from
-  Render's API reference. The first real failed release is the first real test. Render's own caveat —
-  a rollback does not disable auto-deploy, so an auto-deploy could restore what was rolled back — does not
-  apply here: rollback only runs in the production workflow, and production never auto-deploys.
+- **Rollback was proven against a real service in Phase 34.** A third staging deploy, plus a real broken
+  commit (the worker's entrypoint deliberately made to crash on start, pushed to a disposable branch and
+  never merged) released with `infra/scripts/render_release.py`'s actual `HttpRenderClient` against real
+  service ids. The worker's deploy genuinely came back `update_failed` from Render's own API; the API
+  service (which HAD deployed the bad commit successfully) was correctly rolled back to its previous live
+  deploy, confirmed independently by re-querying deploy history directly, not just trusting the script's own
+  report. Still not proven: this ran through `render_release.py` directly against staging service ids, not
+  through the real gated `deploy-prod.yml` workflow -- the production-only trigger path (manual dispatch,
+  required-reviewer environment) itself remains unexercised. Render's own caveat — a rollback does not
+  disable auto-deploy, so an auto-deploy could restore what was rolled back — does not apply here: rollback
+  only runs in the production workflow, and production never auto-deploys.
